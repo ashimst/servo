@@ -14,6 +14,7 @@ Servo is an ultra-low-latency desktop automation engine built around a three-tie
 
 * [`SERVO_ARCHITECTURE_V1.md`](SERVO_ARCHITECTURE_V1.md) — Baseline architecture specification and Architectural Decision Records (ADRs).
 * [`SERVO_ARCHITECTURE_V2.md`](SERVO_ARCHITECTURE_V2.md) — Voice ingestion, transparent HUD overlay, and dual FastMCP/REST protocols.
+* [`SERVO_ARCHITECTURE_V3.md`](SERVO_ARCHITECTURE_V3.md) — System 1 / System 2 Cognitive Handoff Architecture, Structured Tool Calling, and Action/Element Alias Mapping.
 * [`SERVO_HARDENING_NOTES.md`](SERVO_HARDENING_NOTES.md) — Safety verification, confirmation gates, and edge-case handling.
 
 ---
