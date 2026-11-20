@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Servo Test Harness Window</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        .row { margin-bottom: 15px; }
+        input[type="text"] { width: 300px; padding: 8px; }
+        button { padding: 8px 16px; cursor: pointer; }
+        #canvas-area { border: 2px dashed #666; background: #fafafa; }
+        #status-banner { padding: 10px; background: #e0f2fe; display: none; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Servo Test Fixture</h1>
+    
+    <div class="row">
+        <label for="username-input">User Name:</label>
+        <input type="text" id="username-input" placeholder="Enter username...">
+    </div>
+
+    <div class="row">
+        <button id="submit-btn" onclick="handleSubmit()">Submit Form</button>
+        <button id="clear-btn" onclick="document.getElementById('username-input').value = ''">Clear</button>
+    </div>
+
+    <div id="status-banner">Form submitted successfully!</div>
+
+    <h3>Canvas Flat Pixel Surface (Mirage Visual Fallback Test):</h3>
+    <canvas id="canvas-area" width="400" height="150"></canvas>
+
+    <script>
+        function handleSubmit() {
+            var banner = document.getElementById('status-banner');
+            banner.style.display = 'block';
+        }
+
+        // Draw custom flat visual button inside canvas (where UIA has no accessibility nodes)
+        var ctx = document.getElementById('canvas-area').getContext('2d');
+        ctx.fillStyle = '#2563eb';
+        ctx.fillRect(50, 40, 140, 40);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '16px sans-serif';
+        ctx.fillText('Canvas Button', 65, 65);
+    </script>
+</body>
+</html>
