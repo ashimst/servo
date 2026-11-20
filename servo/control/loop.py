@@ -145,6 +145,11 @@ class ServoControlLoop:
         partial = scene.find_by_label(hint)
         if len(partial) == 1:
             return partial[0]
+        # Role-based fallback for text editing if generic hint is used and no exact label matched
+        if q in ("editor", "text editor", "text", "document", "input", "body", "textarea", "edit"):
+            edits = [el for el in scene.elements.values() if el.role in ("Edit", "Document")]
+            if len(edits) == 1:
+                return edits[0]
         return None
 
     # --------------------------------------------------------------- main entry

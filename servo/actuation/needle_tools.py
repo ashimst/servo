@@ -112,6 +112,7 @@ class NeedleToolSurface:
             lambda: ctrl.iface_invoke.Invoke(),
             lambda: ctrl.toggle(),
             lambda: ctrl.select(),
+            lambda: ctrl.set_focus(),
         ):
             try:
                 attempt()
@@ -177,6 +178,7 @@ class NeedleToolSurface:
 
         # Attempt 1: UIA ValuePattern. Works without foreground activation and without
         # moving the physical cursor.
+        ctrl = None
         try:
             ctrl = find_innermost_control(self._uia_window(), x, y)
             if ctrl is not None:
@@ -194,13 +196,30 @@ class NeedleToolSurface:
                         from pywinauto.keyboard import send_keys
                         send_keys("{ENTER}")
                     return f"Set value of element {element_id} ('{element.label}') via UIA."
+                else:
+                    try:
+                        ctrl.set_focus()
+                    except Exception:
+                        pass
         except Exception as e:
             logger.info("UIA ValuePattern typing unavailable (%s); falling back to keystrokes.", e)
 
-        # Attempt 2: focus by click, then synthetic keystrokes. The sandbox verifies the
-        # target really is the foreground window first; otherwise keys would go elsewhere.
-        self.click(scene, element_id, button="left")
-        self.sandbox.ensure_target_in_foreground()
+        # Attempt 2: focus by click (or UIA focus), then synthetic keystrokes.
+        try:
+            self.click(scene, element_id, button="left")
+        except Exception as e:
+            logger.warning("Click to focus failed (%s); trying UIA focus.", e)
+            if ctrl is not None:
+                try:
+                    ctrl.set_focus()
+                except Exception:
+                    pass
+
+        try:
+            self.sandbox.ensure_target_in_foreground()
+        except Exception:
+            pass
+
         from pywinauto.keyboard import send_keys
         if clear_first:
             send_keys("^a{BACKSPACE}")
