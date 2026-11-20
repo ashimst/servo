@@ -54,10 +54,15 @@ class TraceStore:
                     jev_pre_risk TEXT NOT NULL,
                     jev_post_ok BOOLEAN NOT NULL,
                     latency_ms INTEGER NOT NULL,
+                    confirmation TEXT,
                     FOREIGN KEY(run_id) REFERENCES runs(run_id)
                 );
                 """
             )
+            # Migrate databases created before the confirmation column existed.
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(steps)")}
+            if "confirmation" not in cols:
+                conn.execute("ALTER TABLE steps ADD COLUMN confirmation TEXT")
             conn.commit()
 
     def record_run(self, payload: TracePayload) -> None:
@@ -70,7 +75,7 @@ class TraceStore:
         with sqlite3.connect(self.sqlite_path) as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO runs (
+                INSERT INTO runs (
                     run_id, mode, status, goal, total_latency_ms, uia_steps, mirage_fallbacks, system2_escalations
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
                 """,
@@ -90,8 +95,9 @@ class TraceStore:
                 conn.execute(
                     """
                     INSERT INTO steps (
-                        run_id, step_index, sub_goal, perception_source, tool_call, jev_pre_risk, jev_post_ok, latency_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                        run_id, step_index, sub_goal, perception_source, tool_call, jev_pre_risk, jev_post_ok,
+                        latency_ms, confirmation
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     (
                         payload.run_id,
@@ -102,6 +108,7 @@ class TraceStore:
                         step.jev_pre_risk,
                         step.jev_post_ok,
                         step.latency_ms,
+                        step.confirmation,
                     ),
                 )
             conn.commit()

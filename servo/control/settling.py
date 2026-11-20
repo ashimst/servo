@@ -21,16 +21,25 @@ class SettlingEngine:
         max_poll_ms: int | None = None,
         poll_interval_ms: int | None = None,
     ) -> None:
-        self.base_delay_ms = base_delay_ms or settings.settling_base_ms
-        self.max_poll_ms = max_poll_ms or settings.settling_max_ms
-        self.poll_interval_ms = poll_interval_ms or settings.settling_poll_interval_ms
+        # `is not None` rather than `or`: an explicit 0 (e.g. no base delay in tests or
+        # harness runs) is a valid setting and must not silently become the default.
+        self.base_delay_ms = settings.settling_base_ms if base_delay_ms is None else base_delay_ms
+        self.max_poll_ms = settings.settling_max_ms if max_poll_ms is None else max_poll_ms
+        self.poll_interval_ms = (
+            settings.settling_poll_interval_ms if poll_interval_ms is None else poll_interval_ms
+        )
 
     def settle_and_diff(
         self,
         before_scene: SceneIndex,
         sensor_fn: Callable[[], SceneIndex],
     ) -> tuple[SceneIndex, SceneDelta]:
-        """Wait base delay, then poll until a SceneDelta is observed or max timeout expires."""
+        """Wait base delay, then poll until a SceneDelta is observed or max timeout expires.
+
+        Scenes flagged with ``sense_error`` never count as a change (see
+        SceneDelta.compute_diff), so a transient sensing failure keeps polling rather
+        than ending the wait with a false "UI changed".
+        """
         # Baseline delay (e.g. 100ms)
         time.sleep(self.base_delay_ms / 1000.0)
 

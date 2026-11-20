@@ -7,12 +7,14 @@ Invoked automatically when UIA controls are sparse (< 3 elements) or post-action
 from __future__ import annotations
 
 import io
-import sys
-from typing import Dict, Optional, Tuple
+import logging
+from typing import Dict, Optional
 from PIL import Image, ImageGrab
 
 from servo.perception.viewport import ViewportTransform
 from servo.perception.scene_index import SceneIndex, SceneElement
+
+logger = logging.getLogger(__name__)
 
 
 class MirageSensor:
@@ -36,7 +38,10 @@ class MirageSensor:
             return None
 
     def sense(self, window_title: str = "Target Window") -> SceneIndex:
-        """Perform visual pass via Cactus Mirage or synthetic fallback and produce SceneIndex."""
+        """Perform a visual pass via Cactus Mirage and produce a SceneIndex.
+
+        Returns an empty scene with ``sense_error`` set when Mirage is unavailable.
+        """
         self.viewport.refresh()
         img = self.capture_window_image()
         elements_map: Dict[int, SceneElement] = {}
@@ -72,30 +77,19 @@ class MirageSensor:
                                 center_screen=center,
                             )
                         cactus_available = True
-        except Exception:
+        except ImportError:
+            cactus_available = False
+        except Exception as e:
+            logger.warning("Cactus Mirage visual pass failed: %s", e)
             cactus_available = False
 
-        # 2. Synthetic heuristic fallback if cactus is not present or yielded 0 elements
-        if not elements_map:
-            # Provide standard visual grid regions for testing and canvas fallback
-            b = self.viewport.bounds
-            regions = [
-                ("Visual Area Center", "Canvas", 400, 400, 600, 600),
-                ("Visual Action Button", "Button", 800, 850, 950, 950),
-                ("Visual Input Field", "Edit", 200, 100, 800, 200),
-            ]
-            for idx, (label, role, nx1, ny1, nx2, ny2) in enumerate(regions):
-                sx1, sy1 = self.viewport.norm_to_screen(nx1, ny1)
-                sx2, sy2 = self.viewport.norm_to_screen(nx2, ny2)
-                elements_map[idx] = SceneElement(
-                    element_id=idx,
-                    label=label,
-                    role=role,
-                    bbox_screen=(sx1, sy1, sx2, sy2),
-                    bbox_norm=(nx1, ny1, nx2, ny2),
-                    center_screen=((sx1 + sx2) // 2, (sy1 + sy2) // 2),
-                    is_keyboard_focusable=role == "Edit",
-                )
+        # No synthetic fallback. The previous version invented three fixed regions
+        # ("Visual Area Center", ...) when Mirage was unavailable, and the control loop
+        # then physically clicked them as if they were real controls. An empty,
+        # error-flagged scene makes the loop fail and escalate instead.
+        sense_error = None
+        if not cactus_available:
+            sense_error = "Cactus Mirage is unavailable or failed; no visual detections."
 
         b = self.viewport.bounds
         return SceneIndex(
@@ -109,4 +103,5 @@ class MirageSensor:
                 "height": b.height,
             },
             elements=elements_map,
+            sense_error=sense_error,
         )

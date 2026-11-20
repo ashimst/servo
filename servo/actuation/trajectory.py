@@ -44,13 +44,17 @@ class CursorTrajectory:
 
     @classmethod
     def check_failsafe(cls, start_pos: Tuple[int, int] | None = None) -> None:
-        """Check if physical cursor has been slammed to top-left corner (0, 0) during movement to abort."""
+        """Abort if the physical cursor is in the top-left corner (0, 0).
+
+        Any cursor in the corner aborts, matching the common PyAutoGUI convention. The
+        old rule only fired if the cursor *moved* into the corner mid-trajectory, which
+        could never happen in fast_mode (one instantaneous jump) and ignored an operator
+        who parked the cursor there before the action started.
+        """
         try:
             cur_x, cur_y = cls.get_cursor_pos()
-            # Only trigger failsafe if cursor moved into (0, 0) from an active starting position
             if cur_x <= 2 and cur_y <= 2:
-                if start_pos is not None and (start_pos[0] > 10 or start_pos[1] > 10):
-                    raise FailsafeException("Emergency Failsafe Triggered: Operator slammed cursor to corner (0, 0).")
+                raise FailsafeException("Emergency Failsafe Triggered: cursor is in the top-left corner (0, 0).")
         except FailsafeException:
             raise
         except Exception:
@@ -61,13 +65,16 @@ class CursorTrajectory:
         """Move cursor from current position to target along cubic ease-out trajectory."""
         start_x, start_y = cls.get_cursor_pos()
 
+        # The corner-slam failsafe is checked before every movement, including fast_mode.
+        # Previously fast_mode skipped it entirely, so the operator's only physical
+        # abort did nothing in the mode most likely to run unattended.
+        if enable_failsafe:
+            cls.check_failsafe(start_pos=(start_x, start_y))
+
         # In fast_mode or non-windows, snap directly
         if fast_mode or sys.platform != "win32":
             cls.set_cursor_pos(target_x, target_y)
             return
-
-        if enable_failsafe:
-            cls.check_failsafe(start_pos=(start_x, start_y))
 
         dx = target_x - start_x
         dy = target_y - start_y

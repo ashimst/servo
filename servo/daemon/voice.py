@@ -1,108 +1,91 @@
 """Cactus Whistle (16.9 MB) Voice Ingestion Pipeline.
 
-See ADR-13 in SERVO_ARCHITECTURE_V2.md.
+See ADR-13 in SERVO_ARCHITECTURE_V2.md and SERVO_HARDENING_NOTES.md.
 Transcribes local audio clips and dispatches voice commands into the Servo reflex arc.
 """
 
 from __future__ import annotations
 
-import io
+import logging
 import os
-import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from servo.daemon.worker import worker, TaskJob
+logger = logging.getLogger(__name__)
+
+
+class VoiceUnavailableError(RuntimeError):
+    """Raised when no speech-to-text backend is available or transcription failed."""
+
+
+def _extract_text(res: object) -> str:
+    if isinstance(res, dict) and isinstance(res.get("text"), str):
+        return res["text"].strip()
+    if isinstance(res, str):
+        return res.strip()
+    raise VoiceUnavailableError(f"Unexpected transcription result type: {type(res).__name__}")
 
 
 class VoiceIngestionManager:
     """Manages audio transcription and voice task dispatch."""
 
-    def __init__(self) -> None:
-        pass
-
     def transcribe_audio(self, audio_bytes_or_path: bytes | str | Path) -> str:
-        """Transcribe audio clip using Cactus Whistle (16.9 MB) with synthetic fallback."""
-        # 1. Attempt Cactus Whistle if cactus-compute is installed
+        """Transcribe an audio clip using Cactus Whistle.
+
+        There is no synthetic fallback. The previous version returned a hard-coded
+        command ("Click search settings and type bluetooth") or a phrase built from the
+        file name when Whistle was missing, and that invented text was then executed
+        on the user's desktop.
+        """
         try:
             import cactus  # type: ignore
-            if hasattr(cactus, "transcribe"):
-                if isinstance(audio_bytes_or_path, (bytes, bytearray)):
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                        tmp.write(audio_bytes_or_path)
-                        tmp_path = tmp.name
+        except ImportError as e:
+            raise VoiceUnavailableError("Cactus Whistle is not installed (pip install servo[cactus]).") from e
+        if not hasattr(cactus, "transcribe"):
+            raise VoiceUnavailableError("Installed cactus package has no 'transcribe' function.")
+
+        try:
+            if isinstance(audio_bytes_or_path, (bytes, bytearray)):
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(audio_bytes_or_path)
+                    tmp_path = tmp.name
+                try:
+                    text = _extract_text(cactus.transcribe(tmp_path))
+                finally:
                     try:
-                        res = cactus.transcribe(tmp_path)
-                        if isinstance(res, dict) and "text" in res:
-                            return res["text"].strip()
-                        elif isinstance(res, str):
-                            return res.strip()
-                    finally:
-                        try:
-                            os.remove(tmp_path)
-                        except Exception:
-                            pass
-                else:
-                    res = cactus.transcribe(str(audio_bytes_or_path))
-                    if isinstance(res, dict) and "text" in res:
-                        return res["text"].strip()
-                    elif isinstance(res, str):
-                        return res.strip()
-        except Exception:
-            pass
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+            else:
+                path = Path(audio_bytes_or_path)
+                if not path.is_file():
+                    raise VoiceUnavailableError(f"Audio file not found: {path}")
+                text = _extract_text(cactus.transcribe(str(path)))
+        except VoiceUnavailableError:
+            raise
+        except Exception as e:
+            raise VoiceUnavailableError(f"Transcription failed: {e}") from e
 
-        # 2. Heuristic synthetic fallback for testing / offline operation
-        if isinstance(audio_bytes_or_path, (str, Path)):
-            name = Path(audio_bytes_or_path).stem.replace("_", " ")
-            return f"Execute command from audio clip {name}"
-
-        return "Click search settings and type bluetooth"
+        if not text:
+            raise VoiceUnavailableError("Transcription was empty.")
+        return text
 
     def ingest_voice_task(
         self,
         audio_data: bytes | str | Path,
         hwnd: Optional[int] = None,
-        mode: str = "assistant",
+        mode: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Transcribe audio and immediately dispatch to the Servo automation worker."""
-        t0 = time.perf_counter()
+        """Transcribe audio and run it as a goal through the same planner path as /task."""
+        from servo.daemon.tasks import run_goal, validate_target_hwnd
+
+        # Validate the target before spending time on transcription.
+        validate_target_hwnd(hwnd)
         transcribed_goal = self.transcribe_audio(audio_data)
-
-        target_hwnd = hwnd
-        if target_hwnd is None and sys.platform == "win32":
-            import ctypes
-            target_hwnd = ctypes.windll.user32.GetForegroundWindow()
-
-        if not target_hwnd:
-            return {
-                "success": False,
-                "transcription": transcribed_goal,
-                "error": "No active target window found for voice command.",
-            }
-
-        job = TaskJob(
-            job_id=f"voice_{int(time.time() * 1000)}",
-            action_type="execute_subgoal",
-            hwnd=target_hwnd,
-            params={
-                "step_index": 1,
-                "sub_goal": transcribed_goal,
-                "target_label_hint": transcribed_goal,
-                "action_type": "type" if "type" in transcribed_goal.lower() else "click",
-            },
-        )
-        result = worker.submit_job(job, timeout=15.0)
-        elapsed_ms = int((time.perf_counter() - t0) * 1000)
-
-        return {
-            "success": result.success,
-            "transcription": transcribed_goal,
-            "latency_ms": elapsed_ms,
-            "data": result.data,
-            "error": result.error,
-        }
+        result = run_goal(goal=transcribed_goal, hwnd=hwnd, mode=mode)
+        result["transcription"] = transcribed_goal
+        return result
 
 
 voice_manager = VoiceIngestionManager()

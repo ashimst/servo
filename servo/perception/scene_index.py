@@ -6,6 +6,7 @@ See ADR-02 in SERVO_ARCHITECTURE_V1.md.
 from __future__ import annotations
 
 import time
+from collections import Counter
 from typing import Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field
 
@@ -30,6 +31,9 @@ class SceneIndex(BaseModel):
     timestamp: float = Field(default_factory=time.time)
     viewport: Dict[str, float | int] = Field(default_factory=dict)
     elements: Dict[int, SceneElement] = Field(default_factory=dict)
+    # Set when sensing failed (COM error, window gone). An errored scene is NOT a
+    # valid observation: it must never be diffed as though the UI changed.
+    sense_error: Optional[str] = None
 
     def get_by_id(self, element_id: int) -> Optional[SceneElement]:
         return self.elements.get(element_id)
@@ -49,6 +53,21 @@ class SceneIndex(BaseModel):
         return matches
 
 
+def _keyed_values(scene: SceneIndex) -> Dict[str, Optional[str]]:
+    """Map each valued element to a stable key: its label, plus '#n' for the nth element
+    carrying the same label in document order."""
+    seen: Counter = Counter()
+    out: Dict[str, Optional[str]] = {}
+    for el in sorted(scene.elements.values(), key=lambda e: e.element_id):
+        seen[el.label] += 1
+        n = seen[el.label]
+        if el.value is None:
+            continue
+        key = el.label if n == 1 else f"{el.label}#{n}"
+        out[key] = el.value
+    return out
+
+
 class SceneDelta(BaseModel):
     """Structured diff between two consecutive scene snapshots."""
     has_changed: bool = False
@@ -61,19 +80,28 @@ class SceneDelta(BaseModel):
 
     @classmethod
     def compute_diff(cls, before: SceneIndex, after: SceneIndex) -> SceneDelta:
-        """Compute semantic differential between before and after scenes."""
+        """Compute semantic differential between before and after scenes.
+
+        Labels are compared as multisets and values are keyed by (role, label, occurrence),
+        so two controls sharing a label (e.g. two "OK" buttons, or several unnamed edits)
+        no longer collapse into one entry and hide changes.
+        """
+        if before.sense_error or after.sense_error:
+            # One side is not a real observation; report "no observed change" so the
+            # caller does not mistake a sensing failure for a successful transition.
+            return cls(old_title=before.window_title, new_title=after.window_title)
+
         title_changed = before.window_title != after.window_title
 
-        before_labels = {el.label for el in before.elements.values() if el.label}
-        after_labels = {el.label for el in after.elements.values() if el.label}
+        before_labels = Counter(el.label for el in before.elements.values() if el.label)
+        after_labels = Counter(el.label for el in after.elements.values() if el.label)
 
-        added = sorted(list(after_labels - before_labels))
-        removed = sorted(list(before_labels - after_labels))
+        added = sorted((after_labels - before_labels).elements())
+        removed = sorted((before_labels - after_labels).elements())
 
         value_changes: Dict[str, Dict[str, str]] = {}
-        # Map label -> value for elements that have values
-        before_vals = {el.label: el.value for el in before.elements.values() if el.value is not None}
-        after_vals = {el.label: el.value for el in after.elements.values() if el.value is not None}
+        before_vals = _keyed_values(before)
+        after_vals = _keyed_values(after)
 
         for label, new_val in after_vals.items():
             if label in before_vals and before_vals[label] != new_val:

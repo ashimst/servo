@@ -2,61 +2,51 @@
 
 from __future__ import annotations
 
-import json
-import httpx
 from typing import List, Optional
+
+import httpx
+
 from servo.config import settings
 from servo.perception.scene_index import SceneIndex
-from servo.planner.base import SubGoal, EscalationContext
+from servo.planner.base import (
+    EscalationContext,
+    PlannerError,
+    SubGoal,
+    build_planning_prompt,
+    parse_subgoals,
+)
 
 
 class GeminiPlanner:
     """System 2 planner connecting to Google Gemini API."""
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.0-flash") -> None:
+    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.0-flash", timeout_seconds: float = 60.0) -> None:
         self.api_key = api_key or settings.gemini_api_key
         self.model = model
+        self.timeout_seconds = timeout_seconds
 
     def decompose(self, goal: str, initial_scene: SceneIndex) -> List[SubGoal]:
-        labels = [el.label for el in initial_scene.elements.values() if el.label]
-        prompt = (
-            f"Decompose goal into JSON array of sub-goals with keys: "
-            f"step_index, instruction, target_element_hint, action_type, text_to_type, expected_outcome.\n"
-            f"Goal: {goal}\nElements: {labels[:25]}"
-        )
+        if not self.api_key:
+            raise PlannerError("SERVO_GEMINI_API_KEY is not set.")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        # Key goes in a header, not the query string, so it doesn't end up in
+        # httpx/proxy request logs or exception messages that include the URL.
+        headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
+        payload = {
+            "contents": [{"parts": [{"text": build_planning_prompt(goal, initial_scene)}]}],
+            "generationConfig": {"response_mime_type": "application/json"},
+        }
         try:
-            if not self.api_key:
-                raise ValueError("Missing Gemini API Key")
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"response_mime_type": "application/json"},
-            }
-            with httpx.Client(timeout=10.0) as client:
-                res = client.post(url, json=payload)
-                if res.status_code == 200:
-                    raw_json = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    items = json.loads(raw_json)
-                    return [SubGoal(**item) for item in items]
-        except Exception:
-            pass
-
-        return [
-            SubGoal(
-                step_index=1,
-                instruction=goal,
-                target_element_hint=labels[0] if labels else None,
-                action_type="click",
-                expected_outcome="Executed step",
-            )
-        ]
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                res = client.post(url, headers=headers, json=payload)
+            res.raise_for_status()
+            text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except httpx.HTTPError as e:
+            raise PlannerError(f"Gemini planner request failed: {e.__class__.__name__}") from e
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            raise PlannerError(f"Unexpected Gemini response shape: {e}") from e
+        return parse_subgoals(text or "")
 
     def recover(self, context: EscalationContext) -> List[SubGoal]:
-        return [
-            SubGoal(
-                step_index=context.failed_subgoal.step_index + 1,
-                instruction=f"Alternative approach for {context.failed_subgoal.instruction}",
-                target_element_hint=context.failed_subgoal.target_element_hint,
-                action_type="click",
-            )
-        ]
+        """No automatic recovery; see OpenAICompatPlanner.recover."""
+        return []

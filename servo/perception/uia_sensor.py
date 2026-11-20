@@ -6,10 +6,13 @@ See ADR-01 and Section 2.1 in SERVO_ARCHITECTURE_V1.md.
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import List, Optional
 from servo.perception.viewport import ViewportTransform
 from servo.perception.scene_index import SceneIndex, SceneElement
+
+logger = logging.getLogger(__name__)
 
 # Whitelisted interactive control roles for UIA filtering
 INTERACTIVE_CONTROL_TYPES = {
@@ -40,6 +43,7 @@ class UIASensor:
         self.viewport.refresh()
         elements_map = {}
         window_title = "Unknown Window"
+        sense_error: Optional[str] = None
 
         if sys.platform != "win32":
             return SceneIndex(
@@ -87,7 +91,7 @@ class UIASensor:
 
                     # Extract value if available (e.g. Edit controls)
                     value: Optional[str] = None
-                    if role == "Edit":
+                    if role in ("Edit", "Document", "ComboBox"):
                         try:
                             value = ctrl.iface_value.CurrentValue if hasattr(ctrl, "iface_value") else ctrl.window_text()
                         except Exception:
@@ -114,8 +118,11 @@ class UIASensor:
                     continue
 
         except Exception as e:
-            # If pywinauto fails or window closes, return empty index with source note
-            window_title = f"Error: {e}"
+            # Previously the error text was written into window_title, which made the
+            # next diff report "title changed" and the post-action gate count a COM
+            # failure as a successful UI transition. Flag it explicitly instead.
+            logger.warning("UIA sensing failed for HWND %s: %s", self.hwnd, e)
+            sense_error = str(e) or e.__class__.__name__
 
         b = self.viewport.bounds
         return SceneIndex(
@@ -131,4 +138,5 @@ class UIASensor:
                 "client_height": b.client_height,
             },
             elements=elements_map,
+            sense_error=sense_error,
         )

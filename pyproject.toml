@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "servo"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-First, Closed-Loop Neuro-Symbolic Desktop Control Runtime"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,7 +21,6 @@ dependencies = [
     "Pillow>=9.5.0",
     "fastapi>=0.100.0",
     "uvicorn>=0.22.0",
-    "pytest>=7.0.0",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +30,9 @@ mcp = [
 cactus = [
     "cactus-compute>=0.1.0",
 ]
+anthropic = [
+    "anthropic>=2.12.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -38,6 +40,12 @@ dev = [
 
 [project.scripts]
 servo = "servo.daemon.server:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "desktop: drives the real Windows desktop (launches apps, moves the mouse); opt in with -m desktop",
+]
+addopts = "-m 'not desktop'"
 
 [tool.setuptools.packages.find]
 where = ["."]

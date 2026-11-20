@@ -40,3 +40,17 @@ def test_hud_svg_generation():
     assert "[1] Bluetooth" in svg
     # Highlight color for element 1
     assert "#10b981" in svg
+
+
+def test_hud_svg_escapes_labels():
+    hud = ServoHUDOverlay()
+    scene = SceneIndex(
+        hwnd=1, window_title="x", source="uia",
+        elements={0: SceneElement(
+            element_id=0, label='<script>alert(1)</script>', role="Button",
+            bbox_screen=(0, 0, 9, 9), bbox_norm=(0, 0, 9, 9), center_screen=(4, 4),
+        )},
+    )
+    svg = hud.generate_svg_overlay(scene)
+    assert "<script>" not in svg
+    assert "&lt;script&gt;" in svg

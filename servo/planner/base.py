@@ -1,13 +1,26 @@
 """System 2 Planner Protocol and data models.
 
-See ADR-10 and Section 5.4 in SERVO_ARCHITECTURE_V1.md.
+See ADR-10 and Section 5.4 in SERVO_ARCHITECTURE_V1.md, and SERVO_HARDENING_NOTES.md.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Protocol
-from pydantic import BaseModel, Field
+import json
+import re
+from typing import Any, List, Optional, Protocol
+
+from pydantic import BaseModel, Field, ValidationError
+
 from servo.perception.scene_index import SceneIndex
+
+
+class PlannerError(Exception):
+    """Raised when a planner cannot produce a valid plan.
+
+    Planners must raise rather than invent a plan: the previous adapters returned
+    "click the first label in the window" on any failure (bad key, network error,
+    unparsable JSON), which the daemon then executed for real.
+    """
 
 
 class SubGoal(BaseModel):
@@ -15,7 +28,7 @@ class SubGoal(BaseModel):
     step_index: int
     instruction: str
     target_element_hint: Optional[str] = None
-    action_type: str = "click"  # click, type, hotkey, scroll, wait
+    action_type: str = "click"  # the control loop currently executes: click, type
     text_to_type: str = ""
     expected_outcome: str = ""
 
@@ -39,9 +52,54 @@ class PlannerBackend(Protocol):
     """Pluggable protocol for System 2 macro setpoint decomposition and failure recovery."""
 
     def decompose(self, goal: str, initial_scene: SceneIndex) -> List[SubGoal]:
-        """Decompose a high-level goal into an ordered sequence of sub-goals."""
+        """Decompose a high-level goal into an ordered sequence of sub-goals. Raises PlannerError."""
         ...
 
     def recover(self, context: EscalationContext) -> List[SubGoal]:
-        """Generate replacement sub-goals after local 2-step recovery ladder fails."""
+        """Return replacement sub-goals after a failure, or [] to stop and report."""
         ...
+
+
+PLANNING_INSTRUCTIONS = (
+    "You are the Servo System 2 planner for Windows desktop automation. "
+    "Decompose the goal into 1-6 atomic UI sub-goals. Each sub-goal targets exactly one "
+    "element from the list of available element labels, copied verbatim into "
+    "'target_element_hint'. Supported action_type values: 'click' and 'type' "
+    "('type' requires non-empty 'text_to_type'). If the goal cannot be achieved with the "
+    "listed elements, return an empty array. Respond ONLY with a JSON array of objects with "
+    "keys: step_index, instruction, target_element_hint, action_type, text_to_type, expected_outcome."
+)
+
+
+def build_planning_prompt(goal: str, scene: SceneIndex, max_labels: int = 60) -> str:
+    labels = [el.label for el in scene.elements.values() if el.label]
+    return (
+        f"{PLANNING_INSTRUCTIONS}\n\n"
+        f"Window title: {scene.window_title}\n"
+        f"Available element labels: {json.dumps(labels[:max_labels])}\n"
+        f"Goal: {goal}"
+    )
+
+
+_FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*\n?|\n?```\s*$")
+
+
+def parse_subgoals(raw: str) -> List[SubGoal]:
+    """Parse and validate a model's JSON plan. Raises PlannerError on anything invalid."""
+    text = _FENCE_RE.sub("", raw.strip()).strip()
+    try:
+        data: Any = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise PlannerError(f"Planner returned non-JSON output: {e}") from e
+    if isinstance(data, dict):
+        # Accept {"sub_goals": [...]} / {"steps": [...]} wrappers some models produce.
+        data = data.get("sub_goals", data.get("steps"))
+    if not isinstance(data, list):
+        raise PlannerError("Planner output is not a JSON array of sub-goals.")
+    try:
+        subgoals = [SubGoal(**item) for item in data]
+    except (TypeError, ValidationError) as e:
+        raise PlannerError(f"Planner returned malformed sub-goals: {e}") from e
+    if not subgoals:
+        raise PlannerError("Planner could not decompose the goal with the elements on screen.")
+    return subgoals

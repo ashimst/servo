@@ -86,3 +86,28 @@ def test_scene_delta_computation():
     assert "Bluetooth Devices" in delta.added_labels
     assert "Search" in delta.value_changes
     assert delta.value_changes["Search"]["new_value"] == "Bluetooth"
+
+
+def test_scene_delta_with_duplicate_labels():
+    def el(i, value):
+        return SceneElement(
+            element_id=i, label="Name", role="Edit",
+            bbox_screen=(0, i * 20, 10, i * 20 + 10), bbox_norm=(0, 0, 10, 10),
+            center_screen=(5, i * 20 + 5), value=value,
+        )
+
+    before = SceneIndex(hwnd=1, window_title="Form", source="uia", elements={0: el(0, ""), 1: el(1, "")})
+    after = SceneIndex(hwnd=1, window_title="Form", source="uia", elements={0: el(0, ""), 1: el(1, "Ada")})
+    delta = SceneDelta.compute_diff(before, after)
+    assert delta.has_changed is True
+    assert delta.value_changes["Name#2"]["new_value"] == "Ada"
+
+    # A third "Name" field appearing is an addition even though the label already existed.
+    after2 = SceneIndex(hwnd=1, window_title="Form", source="uia", elements={0: el(0, ""), 1: el(1, ""), 2: el(2, "")})
+    assert SceneDelta.compute_diff(before, after2).added_labels == ["Name"]
+
+
+def test_scene_delta_ignores_sensing_errors():
+    ok = SceneIndex(hwnd=1, window_title="App", source="uia")
+    err = SceneIndex(hwnd=1, window_title="Unknown Window", source="uia", sense_error="COM error")
+    assert SceneDelta.compute_diff(ok, err).has_changed is False

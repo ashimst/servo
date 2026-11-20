@@ -95,8 +95,10 @@ class ServoConfig(BaseSettings):
     # Kinematics: fast_mode skips trajectory interpolation for CI throughput
     fast_mode: bool = False
 
-    # Jev / Kev Decision Model endpoint (TypeSafe System One contract)
-    jev_url: str = "http://localhost:8000/v1/systemone"
+    # Jev / Kev Decision Model endpoint (TypeSafe System One contract).
+    # Empty by default: the old default (localhost:8000) was Servo's own daemon port,
+    # so disabling the heuristic fallback made the gate POST to Servo itself.
+    jev_url: str = ""
     jev_timeout_seconds: float = 2.0
     use_heuristic_jev_fallback: bool = True
 
@@ -118,7 +120,22 @@ class ServoConfig(BaseSettings):
     openai_base_url: str = "http://localhost:11434/v1"
     openai_model: str = "qwen2.5-coder:7b"
     anthropic_api_key: str = ""
+    anthropic_model: str = "claude-opus-5-5"
     gemini_api_key: str = ""
+
+    # Local REST API bearer token. If empty, a random token is generated on first
+    # start and stored in ~/.servo/api_token (see servo.daemon.auth).
+    api_token: str = ""
+
+    # Assistant-mode confirmation for medium/high-risk actions:
+    #   'dialog' - native Yes/No dialog on the automated desktop (default No, times out to No)
+    #   'deny'   - refuse all such actions (unattended / headless deployments)
+    confirmation_channel: Literal["dialog", "deny"] = "dialog"
+    confirmation_timeout_seconds: float = 60.0
+
+    # Upper bound for a whole /task run (planning + all sub-goals) on the worker thread.
+    # Generous because a human may be answering confirmation dialogs during the run.
+    task_timeout_seconds: float = 300.0
 
 
 # Auto-initialize DPI awareness on import

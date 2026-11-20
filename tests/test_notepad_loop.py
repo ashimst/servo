@@ -15,6 +15,7 @@ from servo.actuation.needle_tools import NeedleToolSurface
 from servo.perception.scene_index import SceneDelta
 
 
+@pytest.mark.desktop
 @pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows 10/11 environment")
 def test_notepad_reflex_arc():
     """Launch Notepad, sense UI with UIA, type text using Needle 3, and verify buffer."""
@@ -63,11 +64,14 @@ def test_notepad_reflex_arc():
         delta = SceneDelta.compute_diff(scene, post_scene)
         assert delta is not None
 
-        # 5. TEST MIRAGE FALLBACK SENSOR on the same window
+        assert test_string in (post_edit.value or "") or delta.has_changed
+
+        # 5. MIRAGE FALLBACK SENSOR: real detections, or an error-flagged empty scene
+        # when Cactus is not installed (never synthetic regions).
         mirage = MirageSensor(hwnd)
         mirage_scene = mirage.sense(window_title="Notepad")
         assert mirage_scene.source == "mirage"
-        assert len(mirage_scene.elements) > 0
+        assert len(mirage_scene.elements) > 0 or mirage_scene.sense_error
 
     finally:
         # Cleanly close notepad window without saving

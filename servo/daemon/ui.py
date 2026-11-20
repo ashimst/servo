@@ -6,6 +6,7 @@ Renders real-time bounding boxes and integer element tags over target windows.
 
 from __future__ import annotations
 
+import html
 import sys
 import threading
 from typing import Any, Dict, List, Optional
@@ -46,7 +47,9 @@ class ServoHUDOverlay:
             lines.append(
                 f'<rect x="{x}" y="{max(0, y - 18)}" width="{min(120, bw)}" height="18" fill="{stroke_color}"/>'
             )
-            label_text = f"[{el.element_id}] {el.label[:12]}"
+            # Labels come from arbitrary application/web content; escape them so a label
+            # like "<script>..." cannot inject markup into the served SVG.
+            label_text = html.escape(f"[{el.element_id}] {el.label[:12]}", quote=True)
             lines.append(f'<text x="{x + 4}" y="{max(12, y - 5)}" class="txt">{label_text}</text>')
 
         lines.append("</svg>")
