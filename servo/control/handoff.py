@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel
 
 from servo.actuation.alias_mapping import (
@@ -19,6 +20,7 @@ from servo.actuation.alias_mapping import (
     CanonicalAction,
     CanonicalActionType,
 )
+from servo.control.confirmation import ConfirmationCallback
 from servo.control.loop import ExecutionResult, ServoControlLoop
 from servo.perception import windows
 from servo.perception.scene_index import SceneIndex
@@ -34,15 +36,24 @@ from servo.planner.tool_calling import (
 logger = logging.getLogger("servo.control.handoff")
 
 
+def _to_str_or_none(val: Any) -> Optional[str]:
+    if val is None or hasattr(val, "_mock_name") or hasattr(val, "return_value"):
+        return None
+    return str(val) if not isinstance(val, str) else val
+
+
 class StepExecutionReport(BaseModel):
     step_index: int
     action_type: str
-    target: Optional[str]
+    target: Optional[str] = None
     description: str
     success: bool
     latency_ms: int
     error: Optional[str] = None
     attempts_used: int = 1
+    perception_source: Optional[str] = None
+    jev_risk: Optional[str] = None
+    confirmation: Optional[str] = None
 
 
 class PlanExecutionSummary(BaseModel):
@@ -54,6 +65,7 @@ class PlanExecutionSummary(BaseModel):
     step_reports: List[StepExecutionReport]
     active_hwnd: Optional[int] = None
     active_title: str = ""
+    aborted: bool = False
 
 
 # Event callback types for streaming execution UI
@@ -70,6 +82,9 @@ class SystemHandoffCoordinator:
         self,
         target_hwnd: Optional[int] = None,
         fast_mode: bool = False,
+        confirmation_callback: Optional[ConfirmationCallback] = None,
+        should_abort: Optional[Union[Callable[[], bool], threading.Event]] = None,
+        mode: Optional[Literal["assistant", "harness"]] = None,
         on_plan_start: Optional[OnPlanStartFn] = None,
         on_step_start: Optional[OnStepStartFn] = None,
         on_step_progress: Optional[OnStepProgressFn] = None,
@@ -77,33 +92,87 @@ class SystemHandoffCoordinator:
     ) -> None:
         self.target_hwnd = target_hwnd
         self.fast_mode = fast_mode
+        self.confirmation_callback = confirmation_callback
+        if isinstance(should_abort, threading.Event):
+            self.should_abort: Optional[Callable[[], bool]] = should_abort.is_set
+        else:
+            self.should_abort = should_abort
+        self.mode = mode
         self.on_plan_start = on_plan_start
         self.on_step_start = on_step_start
         self.on_step_progress = on_step_progress
         self.on_plan_complete = on_plan_complete
 
-    def execute_plan(self, plan: MacroPlan, app_launcher: Optional[Callable[[str], Tuple[Optional[int], str]]] = None) -> PlanExecutionSummary:
-        """Progressively dispatch System 2 plan steps through the System 1 reflex arc."""
-        t_start = time.perf_counter()
-        reports: List[StepExecutionReport] = []
-        overall_success = True
-
+    def _emit_plan_start(self, plan: MacroPlan) -> None:
         if self.on_plan_start:
             try:
                 self.on_plan_start(plan)
             except Exception as e:
                 logger.warning("Error in on_plan_start callback: %s", e)
 
+    def _emit_step_start(self, step: PlanStep) -> None:
+        if self.on_step_start:
+            try:
+                self.on_step_start(step)
+            except Exception as e:
+                logger.warning("Error in on_step_start callback: %s", e)
+
+    def _emit_step_progress(self, step: PlanStep, report: StepExecutionReport) -> None:
+        if self.on_step_progress:
+            try:
+                self.on_step_progress(step, report)
+            except Exception as e:
+                logger.warning("Error in on_step_progress callback: %s", e)
+
+    def _emit_plan_complete(self, summary: PlanExecutionSummary) -> None:
+        if self.on_plan_complete:
+            try:
+                self.on_plan_complete(summary)
+            except Exception as e:
+                logger.warning("Error in on_plan_complete callback: %s", e)
+
+    def execute_plan(
+        self,
+        plan: MacroPlan,
+        app_launcher: Optional[Callable[[str], Tuple[Optional[int], str]]] = None,
+    ) -> PlanExecutionSummary:
+        """Progressively dispatch System 2 plan steps through the System 1 reflex arc."""
+        t_start = time.perf_counter()
+        reports: List[StepExecutionReport] = []
+        overall_success = True
+        plan_aborted = False
+
+        self._emit_plan_start(plan)
+
         current_hwnd = self.target_hwnd
-        current_title = windows.get_window_title(current_hwnd) if (current_hwnd and windows.is_window(current_hwnd)) else ""
+        current_title = (
+            windows.get_window_title(current_hwnd)
+            if (current_hwnd and windows.is_window(current_hwnd))
+            else ""
+        )
 
         for step in plan.steps:
             step_t0 = time.perf_counter()
-            if self.on_step_start:
-                try:
-                    self.on_step_start(step)
-                except Exception as e:
-                    logger.warning("Error in on_step_start callback: %s", e)
+
+            # 0. Check abort condition before starting step
+            if self.should_abort and self.should_abort():
+                logger.info("Plan execution aborted before step %s", step.step_index)
+                plan_aborted = True
+                overall_success = False
+                rep = StepExecutionReport(
+                    step_index=step.step_index,
+                    action_type=step.tool_name,
+                    target=step.arguments.get("target"),
+                    description="Execution aborted by user or caller timeout.",
+                    success=False,
+                    latency_ms=int((time.perf_counter() - step_t0) * 1000),
+                    error="Execution cancelled by user or caller timeout.",
+                )
+                reports.append(rep)
+                self._emit_step_progress(step, rep)
+                break
+
+            self._emit_step_start(step)
 
             # Ensure we have a CanonicalAction for this step
             action = step.canonical_action
@@ -123,8 +192,7 @@ class SystemHandoffCoordinator:
                     )
                     reports.append(rep)
                     overall_success = False
-                    if self.on_step_progress:
-                        self.on_step_progress(step, rep)
+                    self._emit_step_progress(step, rep)
                     break
 
             # 1. Handle Application Launching / Switching
@@ -162,8 +230,7 @@ class SystemHandoffCoordinator:
                     overall_success = False
 
                 reports.append(rep)
-                if self.on_step_progress:
-                    self.on_step_progress(step, rep)
+                self._emit_step_progress(step, rep)
                 if not rep.success:
                     break
                 continue
@@ -205,37 +272,46 @@ class SystemHandoffCoordinator:
                         latency_ms=step_latency,
                     )
                 reports.append(rep)
-                if self.on_step_progress:
-                    self.on_step_progress(step, rep)
+                self._emit_step_progress(step, rep)
                 continue
 
-            # 3. Handle Explicit Wait
-            if action.action_type == CanonicalActionType.WAIT:
-                wait_sec = action.duration_seconds or 0.5
-                time.sleep(wait_sec)
-                step_latency = int((time.perf_counter() - step_t0) * 1000)
-                rep = StepExecutionReport(
-                    step_index=step.step_index,
-                    action_type=action.action_type.value,
-                    target=None,
-                    description=f"Paused for {wait_sec}s",
-                    success=True,
-                    latency_ms=step_latency,
-                )
-                reports.append(rep)
-                if self.on_step_progress:
-                    self.on_step_progress(step, rep)
-                continue
-
-            # 4. Handle System 1 Control Loop (Clicks, Typing, Hotkeys)
+            # 3. Handle System 1 Control Loop (Clicks, Typing, Hotkeys, Invoke, Scroll, Wait)
             # Ensure target window exists
             if not current_hwnd or not windows.is_window(current_hwnd):
-                # Fallback to foreground window
                 fg = windows.get_foreground_window()
                 if fg and windows.is_window(fg):
                     current_hwnd = fg
                     current_title = windows.get_window_title(fg)
                     self.target_hwnd = fg
+                elif action.action_type == CanonicalActionType.WAIT:
+                    # WAIT fallback when no window is active
+                    wait_sec = action.duration_seconds or 0.5
+                    slice_sec = 0.05
+                    elapsed = 0.0
+                    while elapsed < wait_sec:
+                        if self.should_abort and self.should_abort():
+                            break
+                        chunk = min(slice_sec, wait_sec - elapsed)
+                        time.sleep(chunk)
+                        elapsed += chunk
+
+                    aborted = bool(self.should_abort and self.should_abort())
+                    rep = StepExecutionReport(
+                        step_index=step.step_index,
+                        action_type=action.action_type.value,
+                        target=None,
+                        description="Execution aborted during wait" if aborted else f"Paused for {wait_sec}s",
+                        success=not aborted,
+                        latency_ms=int((time.perf_counter() - step_t0) * 1000),
+                        error="Execution cancelled by user or caller timeout." if aborted else None,
+                    )
+                    reports.append(rep)
+                    self._emit_step_progress(step, rep)
+                    if aborted:
+                        plan_aborted = True
+                        overall_success = False
+                        break
+                    continue
                 else:
                     rep = StepExecutionReport(
                         step_index=step.step_index,
@@ -248,8 +324,7 @@ class SystemHandoffCoordinator:
                     )
                     reports.append(rep)
                     overall_success = False
-                    if self.on_step_progress:
-                        self.on_step_progress(step, rep)
+                    self._emit_step_progress(step, rep)
                     break
 
             # Bring target window to foreground
@@ -258,16 +333,36 @@ class SystemHandoffCoordinator:
                 ctypes.windll.user32.SetForegroundWindow(current_hwnd)
                 time.sleep(0.1)
 
-            loop = ServoControlLoop(hwnd=current_hwnd, fast_mode=self.fast_mode)
+            loop = ServoControlLoop(
+                hwnd=current_hwnd,
+                fast_mode=self.fast_mode,
+                confirmation_callback=self.confirmation_callback,
+                should_abort=self.should_abort,
+                mode=self.mode,
+            )
 
-            if action.action_type in (CanonicalActionType.CLICK, CanonicalActionType.DOUBLE_CLICK, CanonicalActionType.RIGHT_CLICK):
+            # Action routing through loop.execute_subgoal
+            if action.action_type in (
+                CanonicalActionType.CLICK,
+                CanonicalActionType.DOUBLE_CLICK,
+                CanonicalActionType.RIGHT_CLICK,
+            ):
+                btn = action.button
+                if action.action_type == CanonicalActionType.DOUBLE_CLICK:
+                    btn = "double"
+                elif action.action_type == CanonicalActionType.RIGHT_CLICK:
+                    btn = "right"
+
+                act_verb = action.action_type.value.replace("_", " ").capitalize()
                 res = loop.execute_subgoal(
                     step_index=step.step_index,
-                    sub_goal=step.rationale or f"Click '{action.target}'",
+                    sub_goal=step.rationale or f"{act_verb} '{action.target}'",
                     target_label_hint=action.target or "",
-                    action_type="click",
-                    expected_outcome=f"Clicked {action.target}",
+                    action_type=action.action_type.value,
+                    button=btn,
+                    expected_outcome=f"{act_verb} {action.target}",
                 )
+
             elif action.action_type == CanonicalActionType.TYPE:
                 res = loop.execute_subgoal(
                     step_index=step.step_index,
@@ -275,49 +370,97 @@ class SystemHandoffCoordinator:
                     target_label_hint=action.target or "editor",
                     action_type="type",
                     text_to_type=action.text,
-                    expected_outcome=f"Typed text",
-                )
-            elif action.action_type == CanonicalActionType.HOTKEY:
-                # Hotkey execution via needle tools
-                try:
-                    tool_res = loop.tools.hotkey(action.keys)
-                    res = ExecutionResult(
-                        success=True,
-                        attempts_used=1,
-                        final_scene=loop.uia_sensor.sense(),
-                        step_log=loop._fail(
-                            loop.uia_sensor.sense(), step.step_index, "hotkey", "uia",
-                            f"hotkey({action.keys})", ""
-                        ).step_log,
-                    )
-                    res.step_log.error = None
-                    res.step_log.latency_ms = int((time.perf_counter() - step_t0) * 1000)
-                except Exception as e:
-                    res = loop._fail(
-                        loop.uia_sensor.sense(), step.step_index, "hotkey", "uia",
-                        f"hotkey({action.keys})", str(e)
-                    )
-            else:
-                res = loop._fail(
-                    loop.uia_sensor.sense(), step.step_index, "unknown", "none",
-                    step.tool_name, f"Unsupported action type: {action.action_type}"
+                    clear_first=action.clear_first,
+                    press_enter=action.press_enter,
+                    expected_outcome="Typed text",
                 )
 
-            step_latency = res.step_log.latency_ms or int((time.perf_counter() - step_t0) * 1000)
+            elif action.action_type == CanonicalActionType.HOTKEY:
+                keys_str = "+".join(action.keys)
+                res = loop.execute_subgoal(
+                    step_index=step.step_index,
+                    sub_goal=step.rationale or f"Hotkey {keys_str}",
+                    target_label_hint=action.target or "",
+                    action_type="hotkey",
+                    keys=action.keys,
+                    expected_outcome=f"Dispatched hotkey {keys_str}",
+                )
+
+            elif action.action_type == CanonicalActionType.INVOKE:
+                res = loop.execute_subgoal(
+                    step_index=step.step_index,
+                    sub_goal=step.rationale or f"Invoke '{action.target}'",
+                    target_label_hint=action.target or "",
+                    action_type="invoke",
+                    expected_outcome=f"Invoked {action.target}",
+                )
+
+            elif action.action_type == CanonicalActionType.SCROLL:
+                direction = step.arguments.get("direction", "down")
+                amount = int(step.arguments.get("amount", 3))
+                res = loop.execute_subgoal(
+                    step_index=step.step_index,
+                    sub_goal=step.rationale or f"Scroll {direction} on '{action.target}'",
+                    target_label_hint=action.target or "",
+                    action_type="scroll",
+                    direction=direction,
+                    amount=amount,
+                    scroll_amount=amount,
+                    expected_outcome=f"Scrolled {direction}",
+                )
+
+            elif action.action_type == CanonicalActionType.WAIT:
+                wait_sec = action.duration_seconds or 0.5
+                res = loop.execute_subgoal(
+                    step_index=step.step_index,
+                    sub_goal=step.rationale or f"Wait {wait_sec}s",
+                    target_label_hint="",
+                    action_type="wait",
+                    duration_seconds=wait_sec,
+                    expected_outcome=f"Waited {wait_sec}s",
+                )
+
+            else:
+                res = loop._fail(
+                    loop.uia_sensor.sense(),
+                    step.step_index,
+                    "unknown",
+                    "none",
+                    step.tool_name,
+                    f"Unsupported action type: {action.action_type}",
+                )
+
+            step_log = getattr(res, "step_log", None)
+            log_latency = getattr(step_log, "latency_ms", None) if step_log else None
+            step_latency = log_latency if isinstance(log_latency, int) else int((time.perf_counter() - step_t0) * 1000)
+
+            raw_err = getattr(step_log, "error", None) if step_log else None
+            err_str = _to_str_or_none(raw_err)
+            is_aborted = (
+                bool(err_str and "cancelled" in err_str.lower())
+                or bool(self.should_abort and self.should_abort())
+            )
+            if is_aborted:
+                plan_aborted = True
+
+            attempts = getattr(res, "attempts_used", 1)
+            attempts_int = attempts if isinstance(attempts, int) else 1
+
             rep = StepExecutionReport(
                 step_index=step.step_index,
                 action_type=action.action_type.value,
                 target=action.target,
                 description=step.rationale or action.description,
-                success=res.success,
+                success=bool(res.success),
                 latency_ms=step_latency,
-                error=res.step_log.error if not res.success else None,
-                attempts_used=res.attempts_used,
+                error=err_str if not res.success else None,
+                attempts_used=attempts_int,
+                perception_source=_to_str_or_none(getattr(step_log, "perception_source", None)),
+                jev_risk=_to_str_or_none(getattr(step_log, "jev_pre_risk", None)),
+                confirmation=_to_str_or_none(getattr(step_log, "confirmation", None)),
             )
             reports.append(rep)
-
-            if self.on_step_progress:
-                self.on_step_progress(step, rep)
+            self._emit_step_progress(step, rep)
 
             if not res.success:
                 overall_success = False
@@ -333,12 +476,8 @@ class SystemHandoffCoordinator:
             step_reports=reports,
             active_hwnd=current_hwnd,
             active_title=current_title,
+            aborted=plan_aborted,
         )
 
-        if self.on_plan_complete:
-            try:
-                self.on_plan_complete(summary)
-            except Exception as e:
-                logger.warning("Error in on_plan_complete callback: %s", e)
-
+        self._emit_plan_complete(summary)
         return summary

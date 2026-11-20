@@ -9,18 +9,23 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from pydantic import BaseModel, Field
 
 from servo.perception.scene_index import SceneElement, SceneIndex
+from servo.actuation.sandboxing import normalize_keys
+from servo.actuation.needle_tools import NeedleToolSurface
 
 
 class CanonicalActionType(str, Enum):
     CLICK = "click"
     DOUBLE_CLICK = "double_click"
     RIGHT_CLICK = "right_click"
+    INVOKE = "invoke"
     TYPE = "type"
     HOTKEY = "hotkey"
+    SCROLL = "scroll"
+    DRAG = "drag"
     LAUNCH = "launch"
     CLOSE = "close"
     WAIT = "wait"
@@ -54,6 +59,17 @@ ACTION_ALIAS_MAP: Dict[str, CanonicalActionType] = {
     "activate": CanonicalActionType.CLICK,
     "click_element": CanonicalActionType.CLICK,
     "button_click": CanonicalActionType.CLICK,
+
+    # Invoke / Pattern activation family
+    "invoke": CanonicalActionType.INVOKE,
+    "uia_invoke": CanonicalActionType.INVOKE,
+    "element_invoke": CanonicalActionType.INVOKE,
+    "pattern_invoke": CanonicalActionType.INVOKE,
+    "trigger": CanonicalActionType.INVOKE,
+    "invoke_element": CanonicalActionType.INVOKE,
+    "activate_element": CanonicalActionType.INVOKE,
+    "pattern_activate": CanonicalActionType.INVOKE,
+    "uia_activate": CanonicalActionType.INVOKE,
 
     # Double click family
     "double_click": CanonicalActionType.DOUBLE_CLICK,
@@ -89,6 +105,18 @@ ACTION_ALIAS_MAP: Dict[str, CanonicalActionType] = {
     "send_hotkey": CanonicalActionType.HOTKEY,
     "press_keys": CanonicalActionType.HOTKEY,
     "key": CanonicalActionType.HOTKEY,
+
+    # Scroll family
+    "scroll": CanonicalActionType.SCROLL,
+    "scroll_down": CanonicalActionType.SCROLL,
+    "scroll_up": CanonicalActionType.SCROLL,
+    "wheel": CanonicalActionType.SCROLL,
+    "mouse_wheel": CanonicalActionType.SCROLL,
+
+    # Drag family
+    "drag": CanonicalActionType.DRAG,
+    "drag_drop": CanonicalActionType.DRAG,
+    "drag_and_drop": CanonicalActionType.DRAG,
 
     # App lifecycle family
     "launch": CanonicalActionType.LAUNCH,
@@ -148,28 +176,42 @@ class AliasMapper:
         raw_action: str,
         target: Optional[str] = None,
         text: str = "",
-        keys: Optional[List[str]] = None,
+        keys: Optional[Any] = None,
         app_name: Optional[str] = None,
         button: str = "left",
         clear_first: bool = False,
         press_enter: bool = False,
         duration_seconds: float = 0.0,
+        prefer_invoke: bool = False,
         **extra_kwargs: Any,
     ) -> CanonicalAction:
         """Translate a raw action name and kwargs into a CanonicalAction."""
-        norm_name = raw_action.strip().lower().replace("-", "_").replace(" ", "_")
+        norm_name = re.sub(r"[\s\-_]+", "_", raw_action.strip().lower())
         canon_type = ACTION_ALIAS_MAP.get(norm_name)
+
+        # Support "activate" routing to INVOKE if prefer_invoke or uia requested
+        if norm_name == "activate":
+            if prefer_invoke or extra_kwargs.get("prefer_invoke") or extra_kwargs.get("uia") or extra_kwargs.get("use_invoke"):
+                canon_type = CanonicalActionType.INVOKE
+            else:
+                canon_type = CanonicalActionType.CLICK
 
         if canon_type is None:
             # Check prefixes
             if norm_name.startswith("click"):
                 canon_type = CanonicalActionType.CLICK
+            elif norm_name.startswith("invoke"):
+                canon_type = CanonicalActionType.INVOKE
             elif norm_name.startswith("type") or norm_name.startswith("write"):
                 canon_type = CanonicalActionType.TYPE
             elif norm_name.startswith("open") or norm_name.startswith("launch"):
                 canon_type = CanonicalActionType.LAUNCH
             elif norm_name.startswith("close"):
                 canon_type = CanonicalActionType.CLOSE
+            elif norm_name.startswith("scroll"):
+                canon_type = CanonicalActionType.SCROLL
+            elif norm_name.startswith("drag"):
+                canon_type = CanonicalActionType.DRAG
             else:
                 raise ValueError(
                     f"Unknown action alias '{raw_action}'. Available types: "
@@ -182,10 +224,103 @@ class AliasMapper:
         elif canon_type == CanonicalActionType.RIGHT_CLICK:
             btn = "right"
 
-        # Hotkey normalizations
-        hotkeys = keys or []
-        if isinstance(hotkeys, str):
-            hotkeys = [k.strip() for k in re.split(r"[\+\s,]+", hotkeys) if k.strip()]
+        # Parameter synonym mapping
+        # text: value, content, input
+        if not text:
+            for text_key in ("value", "content", "input"):
+                if text_key in extra_kwargs and extra_kwargs[text_key] is not None:
+                    text = str(extra_kwargs[text_key])
+                    break
+
+        # target: element, control, label, selector, target_hint, target_element
+        if target is None or (isinstance(target, str) and not target.strip()):
+            for target_key in ("element", "control", "label", "selector", "target_hint", "target_element"):
+                if target_key in extra_kwargs and extra_kwargs[target_key] is not None:
+                    target = extra_kwargs[target_key]
+                    break
+
+        if target is not None:
+            target = str(target).strip()
+            if not target:
+                target = None
+
+        # app_name: app, application, process
+        if app_name is None or (isinstance(app_name, str) and not app_name.strip()):
+            for app_key in ("app", "application", "process"):
+                if app_key in extra_kwargs and extra_kwargs[app_key] is not None:
+                    app_name = extra_kwargs[app_key]
+                    break
+
+        # keys: key, shortcut, combo, key_combo
+        if not keys:
+            for keys_key in ("key", "shortcut", "combo", "key_combo"):
+                if keys_key in extra_kwargs and extra_kwargs[keys_key] is not None:
+                    keys = extra_kwargs[keys_key]
+                    break
+
+        # duration_seconds: seconds, duration, sleep_seconds, time
+        dur_raw: Any = duration_seconds
+        if dur_raw == 0.0 or dur_raw is None:
+            for dur_key in ("seconds", "duration", "sleep_seconds", "time"):
+                if dur_key in extra_kwargs and extra_kwargs[dur_key] is not None:
+                    dur_raw = extra_kwargs[dur_key]
+                    break
+
+        dur_float = 0.0
+        if dur_raw is not None:
+            try:
+                dur_float = float(dur_raw)
+            except (ValueError, TypeError):
+                if canon_type == CanonicalActionType.WAIT:
+                    raise ValueError("Action 'wait' requires a numeric 'duration_seconds' parameter.")
+                dur_float = 0.0
+        duration_seconds = dur_float
+
+        # Hotkey normalizations and validation
+        hotkeys: List[str] = []
+        if keys is not None:
+            if isinstance(keys, str):
+                hotkeys = [k.strip() for k in re.split(r"[\+\s,\-]+", keys) if k.strip()]
+            elif isinstance(keys, Iterable):
+                for k in keys:
+                    if not isinstance(k, str):
+                        raise ValueError("Action 'hotkey' keys parameter must contain string key names.")
+                    sk = k.strip()
+                    if sk:
+                        hotkeys.append(sk)
+            else:
+                raise ValueError("Action 'hotkey' keys parameter must be a string or iterable of strings.")
+        try:
+            hotkeys = normalize_keys(hotkeys)
+        except Exception as e:
+            raise ValueError(f"Failed to normalize keys: {e}") from e
+
+        # Parameter validation
+        if canon_type == CanonicalActionType.TYPE:
+            if not text:
+                raise ValueError("Action 'type' requires a non-empty 'text' parameter.")
+        elif canon_type == CanonicalActionType.HOTKEY:
+            if not hotkeys:
+                raise ValueError("Action 'hotkey' requires a non-empty 'keys' parameter.")
+        elif canon_type in (
+            CanonicalActionType.CLICK,
+            CanonicalActionType.DOUBLE_CLICK,
+            CanonicalActionType.RIGHT_CLICK,
+            CanonicalActionType.INVOKE,
+        ):
+            if not target or not target.strip():
+                raise ValueError(f"Action '{canon_type.value}' requires a non-empty 'target' parameter.")
+        elif canon_type == CanonicalActionType.LAUNCH:
+            if not app_name or not str(app_name).strip():
+                if target and str(target).strip():
+                    app_name = str(target).strip()
+                else:
+                    raise ValueError("Action 'launch' requires an 'app_name' parameter.")
+            else:
+                app_name = str(app_name).strip()
+        elif canon_type == CanonicalActionType.WAIT:
+            if duration_seconds < 0:
+                raise ValueError("Action 'wait' requires a non-negative 'duration_seconds' parameter.")
 
         desc = f"{canon_type.value}"
         if target:
@@ -209,6 +344,67 @@ class AliasMapper:
             duration_seconds=duration_seconds,
             description=desc,
         )
+
+    @staticmethod
+    def map_to_needle_tool(
+        action: CanonicalAction,
+        tools: NeedleToolSurface,
+        scene: SceneIndex,
+        element_id: Optional[int] = None,
+    ) -> Tuple[Callable[[], str], str]:
+        """Deterministically resolve a CanonicalAction to an executable callable on NeedleToolSurface and description."""
+        action_type = action.action_type
+        if action_type in (CanonicalActionType.CLICK, CanonicalActionType.DOUBLE_CLICK, CanonicalActionType.RIGHT_CLICK):
+            if element_id is None:
+                raise ValueError(f"Action '{action_type.value}' requires an element_id.")
+            button = action.button
+            if action_type == CanonicalActionType.DOUBLE_CLICK:
+                button = "double"
+            elif action_type == CanonicalActionType.RIGHT_CLICK:
+                button = "right"
+            call = lambda eid=element_id, b=button: tools.click(scene, eid, button=b)
+            sig = f"click({element_id}, button='{button}')"
+            return call, sig
+
+        elif action_type == CanonicalActionType.INVOKE:
+            if element_id is None:
+                raise ValueError("Action 'invoke' requires an element_id.")
+            call = lambda eid=element_id: tools.invoke(scene, eid)
+            sig = f"invoke({element_id})"
+            return call, sig
+
+        elif action_type == CanonicalActionType.TYPE:
+            if element_id is None:
+                raise ValueError("Action 'type' requires an element_id.")
+            call = lambda eid=element_id, t=action.text, pe=action.press_enter, cf=action.clear_first: tools.type_text(
+                scene, eid, text=t, press_enter=pe, clear_first=cf
+            )
+            sig = f"type_text({element_id}, text={action.text!r})"
+            return call, sig
+
+        elif action_type == CanonicalActionType.HOTKEY:
+            call = lambda k=list(action.keys): tools.hotkey(k)
+            sig = f"hotkey({action.keys})"
+            return call, sig
+
+        elif action_type == CanonicalActionType.SCROLL:
+            if element_id is None:
+                raise ValueError("Action 'scroll' requires an element_id.")
+            direction = "down"
+            amount = 3
+            call = lambda eid=element_id, d=direction, a=amount: tools.scroll(scene, eid, direction=d, amount=a)
+            sig = f"scroll({element_id}, direction='{direction}', amount={amount})"
+            return call, sig
+
+        elif action_type == CanonicalActionType.WAIT:
+            call = lambda d=action.duration_seconds: tools.wait(d)
+            sig = f"wait({action.duration_seconds})"
+            return call, sig
+
+        else:
+            raise ValueError(
+                f"Action type '{action_type.value}' cannot be dispatched directly to NeedleToolSurface."
+            )
 
     @staticmethod
     def resolve_element(

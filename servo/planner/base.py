@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, List, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
 
 from pydantic import BaseModel, Field, ValidationError
 
+from servo.actuation.alias_mapping import CanonicalAction
 from servo.perception.scene_index import SceneIndex
+
+if TYPE_CHECKING:
+    from servo.planner.tool_calling import MacroPlan, PlanStep
 
 
 class PlannerError(Exception):
@@ -31,12 +35,78 @@ class SubGoal(BaseModel):
     action_type: str = "click"  # the control loop currently executes: click, type
     text_to_type: str = ""
     expected_outcome: str = ""
+    tool_name: str = "click_element"
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    canonical_action: Optional[CanonicalAction] = None
+
+    @classmethod
+    def from_plan_step(cls, step: PlanStep) -> SubGoal:
+        """Convert a System 2 PlanStep into a SubGoal for control loop execution."""
+        tool = getattr(step, "tool_name", "click_element")
+        args = dict(getattr(step, "arguments", {}) or {})
+        canon = getattr(step, "canonical_action", None)
+        rationale = getattr(step, "rationale", "")
+
+        target = None
+        text = ""
+        action_type = "click"
+
+        if canon is not None:
+            action_type = canon.action_type.value if hasattr(canon.action_type, "value") else str(canon.action_type)
+            target = canon.target or canon.app_name
+            text = canon.text or ""
+        else:
+            if tool in ("click_element", "click", "double_click", "right_click", "invoke"):
+                action_type = "click" if tool == "click_element" else tool
+                target = args.get("target") or args.get("target_element_hint")
+            elif tool in ("type_text", "type"):
+                action_type = "type"
+                target = args.get("target") or args.get("target_element_hint")
+                text = args.get("text") or args.get("text_to_type", "")
+            elif tool in ("launch_app", "launch"):
+                action_type = "launch"
+                target = args.get("app_name") or args.get("target")
+            elif tool in ("close_window", "close"):
+                action_type = "close"
+                target = args.get("app_name") or args.get("target")
+            elif tool in ("send_hotkey", "hotkey"):
+                action_type = "hotkey"
+            elif tool == "wait":
+                action_type = "wait"
+            else:
+                action_type = tool
+                target = args.get("target")
+                text = args.get("text", "")
+
+        instruction = rationale or f"{tool}({args})"
+        expected_outcome = f"Completed {tool}"
+
+        return cls(
+            step_index=getattr(step, "step_index", 1),
+            instruction=instruction,
+            target_element_hint=target,
+            action_type=action_type,
+            text_to_type=text,
+            expected_outcome=expected_outcome,
+            tool_name=tool,
+            arguments=args,
+            canonical_action=canon,
+        )
 
 
 class Plan(BaseModel):
     """Complete decomposed macro plan for a user goal."""
     goal: str
     sub_goals: List[SubGoal] = Field(default_factory=list)
+
+    @classmethod
+    def from_macro_plan(cls, macro_plan: MacroPlan) -> Plan:
+        """Convert a System 2 MacroPlan into a Plan."""
+        steps = getattr(macro_plan, "steps", [])
+        return cls(
+            goal=getattr(macro_plan, "goal", ""),
+            sub_goals=[SubGoal.from_plan_step(step) for step in steps],
+        )
 
 
 class EscalationContext(BaseModel):

@@ -19,6 +19,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
+try:
+    import tkinter as tk
+    from tkinter import ttk
+except ImportError:
+    tk = None  # type: ignore
+    ttk = None  # type: ignore
+
 from servo.actuation.alias_mapping import AliasMapper, CanonicalAction, CanonicalActionType
 from servo.config import settings
 from servo.control.handoff import PlanExecutionSummary, StepExecutionReport, SystemHandoffCoordinator
@@ -118,45 +125,88 @@ def resolve_default_user_name() -> str:
 class CopilotBrain:
     """Conversational intelligence and System 2 Macro Planner for Servo Copilot."""
 
-    def __init__(self, user_name: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        user_name: Optional[str] = None,
+        planner_provider: Optional[str] = None,
+    ) -> None:
         self.user_name = user_name or resolve_default_user_name()
+        self.planner_provider = planner_provider
         self.history: List[Dict[str, str]] = []
         self.active_hwnd: Optional[int] = None
         self.active_title: str = ""
 
     def query_llm_for_plan(self, prompt: str, scene: Optional[SceneIndex] = None) -> Optional[MacroPlan]:
-        """Attempt to generate a structured tool plan using configured LLM endpoints."""
-        base_url = settings.openai_base_url.rstrip("/")
-        api_key = settings.openai_api_key
-        model = settings.openai_model or "llama3"
-
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        user_content = build_tool_planning_prompt(prompt, scene=scene, user_name=self.user_name)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT_TEMPLATE},
-            {"role": "user", "content": user_content},
-        ]
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.1,
-            "max_tokens": 500,
-        }
-
+        """Attempt to generate a structured tool plan using configured System 2 LLM planner."""
         try:
-            with httpx.Client(timeout=4.0) as client:
-                res = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
-                if res.status_code == 200:
-                    data = res.json()
-                    content = data["choices"][0]["message"]["content"]
-                    plan = parse_llm_tool_plan(content, goal=prompt)
-                    if plan.steps:
-                        return plan
+            from servo.planner import get_planner
+
+            planner = get_planner(self.planner_provider)
+            if hasattr(planner, "decompose_macro"):
+                plan = planner.decompose_macro(prompt, initial_scene=scene)
+                if plan and plan.steps:
+                    if self.user_name and self.user_name != "User":
+                        for step in plan.steps:
+                            if step.arguments.get("text") in ("User", "my name", "my username"):
+                                step.arguments["text"] = self.user_name
+                                if step.canonical_action:
+                                    step.canonical_action.text = self.user_name
+                    return plan
+            elif hasattr(planner, "decompose"):
+                subgoals = list(planner.decompose(prompt, scene or SceneIndex(hwnd=0, window_title="", source="uia")))
+                if subgoals:
+                    steps = []
+                    for sg in subgoals:
+                        tool_name = (
+                            "type_text" if sg.action_type == "type"
+                            else ("click_element" if sg.action_type == "click"
+                            else (sg.tool_name if sg.tool_name and sg.tool_name != "click_element" else sg.action_type))
+                        )
+                        arguments = dict(sg.arguments) if sg.arguments else {}
+                        if sg.action_type == "type":
+                            if sg.target_element_hint and "target" not in arguments:
+                                arguments["target"] = sg.target_element_hint
+                            if sg.text_to_type and "text" not in arguments:
+                                arguments["text"] = sg.text_to_type
+                        elif sg.action_type == "click":
+                            if sg.target_element_hint and "target" not in arguments:
+                                arguments["target"] = sg.target_element_hint
+                        else:
+                            if sg.target_element_hint and "target" not in arguments:
+                                arguments["target"] = sg.target_element_hint
+                            if sg.text_to_type and "text" not in arguments:
+                                arguments["text"] = sg.text_to_type
+
+                        canon = sg.canonical_action
+                        if canon is None:
+                            try:
+                                canon = AliasMapper.canonicalize_action(raw_action=tool_name, **arguments)
+                            except Exception:
+                                canon = None
+
+                        steps.append(
+                            PlanStep(
+                                step_index=sg.step_index,
+                                tool_name=tool_name,
+                                arguments=arguments,
+                                rationale=sg.instruction,
+                                canonical_action=canon,
+                            )
+                        )
+                    plan = MacroPlan(goal=prompt, steps=steps)
+                    if self.user_name:
+                        for step in plan.steps:
+                            if step.arguments.get("text") in ("User", "my name", "my username"):
+                                step.arguments["text"] = self.user_name
+                                if step.canonical_action:
+                                    step.canonical_action.text = self.user_name
+                    return plan
         except Exception as e:
-            logger.debug("LLM endpoint not reachable (%s); falling back to intent parser.", e)
+            logger.debug(
+                "System 2 planner query failed (%s: %s); falling back to deterministic intent parser.",
+                e.__class__.__name__,
+                e,
+            )
         return None
 
     def query_llm_for_chat(self, prompt: str) -> Optional[str]:
@@ -285,6 +335,12 @@ class CopilotBrain:
 
     def _parse_deterministic_plan(self, p: str) -> Optional[MacroPlan]:
         """Deterministic System 2 plan decomposition for offline and edge execution."""
+        from servo.planner.tool_calling import parse_deterministic_intent
+
+        parsed = parse_deterministic_intent(p, user_name=self.user_name)
+        if parsed and parsed.steps:
+            return parsed
+
         p_strip = p.strip()
         steps: List[PlanStep] = []
 
@@ -407,14 +463,28 @@ class DesktopCopilotApp:
     """Floating On-Screen Desktop Copilot Chat Widget with System 1/2 Handoff."""
 
     def __init__(self) -> None:
-        import tkinter as tk
-        from tkinter import ttk
+        global tk, ttk
+        if tk is None or "tkinter" in sys.modules:
+            try:
+                import tkinter as tk
+                from tkinter import ttk
+            except ImportError:
+                pass
+
+        if tk is None:
+            raise RuntimeError(
+                "Tkinter is required to run the DesktopCopilotApp UI. "
+                "Please ensure Tkinter is installed in your Python environment."
+            )
 
         worker.start()
 
         self.brain = CopilotBrain()
         self.current_target_hwnd: Optional[int] = None
         self.current_target_title: str = ""
+        self._abort_requested = threading.Event()
+        self._abort_lock = threading.Lock()
+        self._is_executing = False
 
         self.root = tk.Tk()
         self.root.title("Servo Copilot")
@@ -439,7 +509,10 @@ class DesktopCopilotApp:
         self.bot_bubble_color = "#334155"
 
         self.root.configure(bg=self.bg_color)
+        self.stop_btn: Optional[tk.Button] = None
+        self.send_btn: Optional[tk.Button] = None
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
         import tkinter as tk
@@ -547,7 +620,24 @@ class DesktopCopilotApp:
         self.entry.bind("<Return>", lambda e: self._on_enter())
         self.entry.focus_set()
 
-        send_btn = tk.Button(
+        self.stop_btn = tk.Button(
+            input_frame,
+            text="⏹",
+            font=("Segoe UI", 11, "bold"),
+            bg="#475569",
+            fg="#cbd5e1",
+            activebackground="#ef4444",
+            activeforeground="#fff",
+            bd=0,
+            padx=10,
+            pady=6,
+            cursor="hand2",
+            state=tk.DISABLED,
+            command=self._on_stop,
+        )
+        self.stop_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=10)
+
+        self.send_btn = tk.Button(
             input_frame,
             text="➤",
             font=("Segoe UI", 11, "bold"),
@@ -561,42 +651,161 @@ class DesktopCopilotApp:
             cursor="hand2",
             command=self._on_enter,
         )
-        send_btn.pack(side=tk.RIGHT, padx=(0, 10), pady=10)
+        self.send_btn.pack(side=tk.RIGHT, padx=(0, 6), pady=10)
 
     def _set_status(self, text: str, color: str) -> None:
-        self.status_pill.config(text=text, fg=color)
+        def _apply():
+            try:
+                if self.status_pill:
+                    self.status_pill.config(text=text, fg=color)
+            except Exception:
+                pass
+
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _apply()
+            else:
+                self.root.after(0, _apply)
+        except Exception:
+            pass
+
+    def _set_status_if_idle(self, text: str, color: str) -> None:
+        try:
+            if not self._is_executing:
+                self._set_status(text, color)
+        except Exception:
+            pass
+
+    def _update_input_controls(self, is_executing: bool) -> None:
+        if tk is None:
+            return
+
+        def _update():
+            try:
+                if is_executing:
+                    if self.send_btn:
+                        self.send_btn.config(state=tk.DISABLED, bg="#475569")
+                    if self.stop_btn:
+                        self.stop_btn.config(state=tk.NORMAL, bg="#ef4444", fg="#ffffff")
+                    if self.entry:
+                        self.entry.config(state=tk.DISABLED)
+                else:
+                    if self.send_btn:
+                        self.send_btn.config(state=tk.NORMAL, bg=self.accent_color)
+                    if self.stop_btn:
+                        self.stop_btn.config(state=tk.DISABLED, bg="#475569", fg="#cbd5e1")
+                    if self.entry:
+                        self.entry.config(state=tk.NORMAL)
+                        self.entry.focus_set()
+            except Exception:
+                pass
+
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _update()
+            else:
+                self.root.after(0, _update)
+        except Exception:
+            pass
+
+    def _on_stop(self) -> None:
+        """Request immediate cancellation of active execution."""
+        with self._abort_lock:
+            already_aborted = self._abort_requested.is_set()
+            self._abort_requested.set()
+        self._set_status("● Cancelled", "#ef4444")
+        if not already_aborted:
+            self._add_message("assistant", "🛑 Cancellation requested by user...")
+
+        def _disable_stop():
+            try:
+                if self.stop_btn and tk is not None:
+                    self.stop_btn.config(state=tk.DISABLED)
+            except Exception:
+                pass
+
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _disable_stop()
+            else:
+                self.root.after(0, _disable_stop)
+        except Exception:
+            pass
+
+    def _on_abort(self) -> None:
+        self._on_stop()
+
+    def stop(self) -> None:
+        self._on_stop()
+
+    def cancel_execution(self) -> None:
+        self._on_stop()
+
+    def _on_close(self) -> None:
+        """Ensure active execution is aborted when window is closed."""
+        if self._is_executing:
+            self._abort_requested.set()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def _update_target_banner(self, title: str, hwnd: Optional[int]) -> None:
-        if hwnd:
-            self.target_banner.config(text=f"🎯 Target: {title} (HWND {hwnd})", fg="#38bdf8")
-        else:
-            self.target_banner.config(text="🎯 No active target locked", fg="#94a3b8")
+        def _apply():
+            try:
+                if self.target_banner:
+                    if hwnd:
+                        self.target_banner.config(text=f"🎯 Target: {title} (HWND {hwnd})", fg="#38bdf8")
+                    else:
+                        self.target_banner.config(text="🎯 No active target locked", fg="#94a3b8")
+            except Exception:
+                pass
+
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _apply()
+            else:
+                self.root.after(0, _apply)
+        except Exception:
+            pass
 
     def _add_message(self, role: str, text: str) -> None:
-        import tkinter as tk
+        def _apply():
+            if tk is None:
+                return
+            try:
+                is_user = role == "user"
+                frame = tk.Frame(self.scrollable_frame, bg=self.bg_color)
+                frame.pack(fill=tk.X, pady=4, anchor="e" if is_user else "w")
 
-        is_user = role == "user"
-        frame = tk.Frame(self.scrollable_frame, bg=self.bg_color)
-        frame.pack(fill=tk.X, pady=4, anchor="e" if is_user else "w")
+                bubble_bg = self.user_bubble_color if is_user else self.bot_bubble_color
+                fg_color = "#ffffff"
 
-        bubble_bg = self.user_bubble_color if is_user else self.bot_bubble_color
-        fg_color = "#ffffff"
+                bubble = tk.Label(
+                    frame,
+                    text=text,
+                    font=("Segoe UI", 9),
+                    bg=bubble_bg,
+                    fg=fg_color,
+                    wraplength=260,
+                    justify=tk.LEFT,
+                    padx=10,
+                    pady=8,
+                )
+                bubble.pack(side=tk.RIGHT if is_user else tk.LEFT, padx=5)
 
-        bubble = tk.Label(
-            frame,
-            text=text,
-            font=("Segoe UI", 9),
-            bg=bubble_bg,
-            fg=fg_color,
-            wraplength=260,
-            justify=tk.LEFT,
-            padx=10,
-            pady=8,
-        )
-        bubble.pack(side=tk.RIGHT if is_user else tk.LEFT, padx=5)
+                self.root.update_idletasks()
+                self.chat_canvas.yview_moveto(1.0)
+            except Exception:
+                pass
 
-        self.root.update_idletasks()
-        self.chat_canvas.yview_moveto(1.0)
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _apply()
+            else:
+                self.root.after(0, _apply)
+        except Exception:
+            pass
 
     def _on_enter(self) -> None:
         text = self.entry.get().strip()
@@ -606,10 +815,24 @@ class DesktopCopilotApp:
         self._send_prompt(text)
 
     def _send_prompt(self, prompt: str) -> None:
+        if self._is_executing:
+            return
+
+        with self._abort_lock:
+            self._abort_requested.clear()
+        self._is_executing = True
+        self._update_input_controls(is_executing=True)
+
         self._add_message("user", prompt)
         self._set_status("● Planning...", "#f59e0b")
 
         def _worker():
+            if sys.platform == "win32":
+                try:
+                    import pythoncom
+                    pythoncom.CoInitialize()
+                except Exception:
+                    pass
             try:
                 # SENSE active scene if window is attached
                 scene = None
@@ -620,36 +843,81 @@ class DesktopCopilotApp:
                     except Exception:
                         scene = None
 
+                if self._abort_requested.is_set():
+                    self._set_status("● Cancelled", "#ef4444")
+                    self._add_message("assistant", "🛑 Plan generation cancelled by user.")
+                    return
+
                 reply, plan = self.brain.process_message(prompt, scene=scene)
                 if reply:
-                    self.root.after(0, lambda: self._add_message("assistant", reply))
+                    self._add_message("assistant", reply)
+
+                if self._abort_requested.is_set():
+                    self._set_status("● Cancelled", "#ef4444")
+                    self._add_message("assistant", "🛑 Execution cancelled by user before starting.")
+                    return
 
                 if plan:
                     self._execute_handoff_plan(plan)
             except Exception as e:
-                self.root.after(0, lambda: self._add_message("assistant", f"❌ Error: {e}"))
+                self._set_status("● Error", "#ef4444")
+                self._add_message("assistant", f"❌ Error: {e}")
             finally:
-                self.root.after(0, lambda: self._set_status("● Ready", "#34d399"))
+                if sys.platform == "win32":
+                    try:
+                        import pythoncom
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
+                self._is_executing = False
+                self._update_input_controls(is_executing=False)
+                try:
+                    self.root.after(3500, lambda: self._set_status_if_idle("● Ready", "#34d399"))
+                except Exception:
+                    pass
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _execute_handoff_plan(self, plan: MacroPlan) -> None:
         """Execute a System 2 plan using the SystemHandoffCoordinator."""
+        total_steps = len(plan.steps)
+
+        def on_plan_start(p: MacroPlan) -> None:
+            self._set_status(f"● Running (0/{total_steps})...", "#38bdf8")
+
         def on_step_start(step: PlanStep) -> None:
-            self.root.after(0, lambda: self._set_status(f"● Step {step.step_index}: {step.tool_name}...", "#38bdf8"))
+            self._set_status(f"● Step {step.step_index}: {step.tool_name}...", "#38bdf8")
 
         def on_step_progress(step: PlanStep, report: StepExecutionReport) -> None:
+            source_tag = f" [{report.perception_source.upper()}]" if report.perception_source else ""
             if report.success:
-                msg = f"  ✅ Step {step.step_index}: {report.description} ({report.latency_ms}ms)"
+                msg = f"  ✅ Step {step.step_index}: {report.description} ({report.latency_ms}ms){source_tag}"
+            elif "cancelled" in (report.error or "").lower() or self._abort_requested.is_set():
+                msg = f"  🛑 Step {step.step_index} interrupted: {report.error}"
             else:
                 msg = f"  ⚠️ Step {step.step_index} failed: {report.error} ({report.latency_ms}ms)"
-            self.root.after(0, lambda: self._add_message("assistant", msg))
+            self._add_message("assistant", msg)
+
+        def on_plan_complete(summary: PlanExecutionSummary) -> None:
+            if summary.aborted:
+                self._set_status("● Cancelled", "#ef4444")
+                final_msg = f"🛑 Execution aborted by user ({summary.completed_steps}/{summary.total_steps} steps completed)."
+            elif summary.success:
+                self._set_status("● Completed", "#10b981")
+                final_msg = f"🎉 Plan completed successfully ({summary.completed_steps}/{summary.total_steps} steps in {summary.total_latency_ms}ms)!"
+            else:
+                self._set_status("● Error", "#ef4444")
+                final_msg = f"⚠️ Plan stopped: completed {summary.completed_steps}/{summary.total_steps} steps."
+            self._add_message("assistant", final_msg)
 
         coordinator = SystemHandoffCoordinator(
             target_hwnd=self.current_target_hwnd,
             fast_mode=False,
+            should_abort=self._abort_requested,
+            on_plan_start=on_plan_start,
             on_step_start=on_step_start,
             on_step_progress=on_step_progress,
+            on_plan_complete=on_plan_complete,
         )
 
         summary = coordinator.execute_plan(plan, app_launcher=launch_or_focus_app)
@@ -659,13 +927,14 @@ class DesktopCopilotApp:
             self.current_target_title = summary.active_title
             self.brain.active_hwnd = summary.active_hwnd
             self.brain.active_title = summary.active_title
-            self.root.after(0, lambda: self._update_target_banner(summary.active_title, summary.active_hwnd))
+            self._update_target_banner(summary.active_title, summary.active_hwnd)
 
-        if summary.success:
-            final_msg = f"🎉 Plan completed successfully ({summary.completed_steps}/{summary.total_steps} steps in {summary.total_latency_ms}ms)!"
-        else:
-            final_msg = f"⚠️ Plan stopped: completed {summary.completed_steps}/{summary.total_steps} steps."
-        self.root.after(0, lambda: self._add_message("assistant", final_msg))
+        # Telemetry: Persist execution run and step traces to TraceStore (SQLite + JSONL)
+        try:
+            from servo.daemon.tasks import record_plan_trace
+            record_plan_trace(summary, mode="assistant")
+        except Exception as te:
+            logger.debug("Failed to record copilot telemetry trace: %s", te)
 
     def run(self) -> None:
         try:

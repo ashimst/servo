@@ -11,29 +11,41 @@ action from the one that was gated and approved.
 from __future__ import annotations
 
 import logging
+import re
 import time
-from typing import Callable, Literal, Optional
+from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel
 
-from servo.config import settings
-from servo.perception.uia_sensor import UIASensor
-from servo.perception.mirage_sensor import MirageSensor
-from servo.perception.scene_index import SceneElement, SceneIndex
+from servo.actuation.alias_mapping import ACTION_ALIAS_MAP, AliasMapper, CanonicalActionType
 from servo.actuation.needle_tools import ActuationError, NeedleToolSurface
 from servo.actuation.sandboxing import (
     FailsafeException,
     SandboxViolationException,
     check_target_allowed,
+    normalize_keys,
 )
+from servo.config import settings
 from servo.control.confirmation import ConfirmationCallback, ConfirmationRequest
-from servo.control.jev_gate import JevGate
+from servo.control.jev_gate import JevGate, PostTransitionResult
 from servo.control.settling import SettlingEngine
 from servo.perception import windows
+from servo.perception.mirage_sensor import MirageSensor
+from servo.perception.scene_index import SceneElement, SceneIndex
+from servo.perception.uia_sensor import UIASensor
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_ACTIONS = ("click", "type")
+SUPPORTED_ACTIONS = (
+    "click",
+    "double_click",
+    "right_click",
+    "invoke",
+    "type",
+    "hotkey",
+    "scroll",
+    "wait",
+)
 
 class StepLog(BaseModel):
     """Detailed log record of a single step execution."""
@@ -128,29 +140,30 @@ class ServoControlLoop:
         )
 
     @staticmethod
-    def resolve_target(scene: SceneIndex, hint: str) -> Optional[SceneElement]:
+    def resolve_target(
+        scene: SceneIndex,
+        hint: Optional[str],
+        action_type: Union[str, CanonicalActionType] = "click",
+    ) -> Optional[SceneElement]:
         """Resolve a label hint to exactly one element, or None.
 
-        Prefers an exact (case-insensitive) label match, then a unique substring match.
-        Never falls back to an arbitrary element: the old "use the first element"
-        fallback turned every unmatched hint into a click on whatever control UIA
-        happened to enumerate first.
+        Delegates to AliasMapper.resolve_element while maintaining backwards compatibility.
         """
-        if not hint or not hint.strip():
+        if not hint or not str(hint).strip():
+            if action_type in ("type", CanonicalActionType.TYPE):
+                el, _ = AliasMapper.resolve_element(scene, "", action_type=CanonicalActionType.TYPE)
+                return el
             return None
-        q = hint.strip().lower()
-        exact = [el for el in scene.elements.values() if el.label.strip().lower() == q]
-        if exact:
-            return exact[0]
-        partial = scene.find_by_label(hint)
-        if len(partial) == 1:
-            return partial[0]
-        # Role-based fallback for text editing if generic hint is used and no exact label matched
-        if q in ("editor", "text editor", "text", "document", "input", "body", "textarea", "edit"):
-            edits = [el for el in scene.elements.values() if el.role in ("Edit", "Document")]
-            if len(edits) == 1:
-                return edits[0]
-        return None
+
+        canon_type = CanonicalActionType.CLICK
+        if isinstance(action_type, CanonicalActionType):
+            canon_type = action_type
+        elif isinstance(action_type, str):
+            norm = re.sub(r"[\s\-_]+", "_", action_type.strip().lower())
+            canon_type = ACTION_ALIAS_MAP.get(norm, CanonicalActionType.CLICK)
+
+        el, _ = AliasMapper.resolve_element(scene, hint, action_type=canon_type)
+        return el
 
     # --------------------------------------------------------------- main entry
 
@@ -158,27 +171,92 @@ class ServoControlLoop:
         self,
         step_index: int,
         sub_goal: str,
-        target_label_hint: str,
+        target_label_hint: str = "",
         action_type: str = "click",
         text_to_type: str = "",
         expected_outcome: str = "",
+        button: Literal["left", "right", "double"] = "left",
+        clear_first: bool = False,
+        press_enter: bool = False,
+        keys: Optional[Union[List[str], str]] = None,
+        direction: Literal["up", "down"] = "down",
+        scroll_amount: int = 3,
+        duration_seconds: float = 0.0,
+        **kwargs: Any,
     ) -> ExecutionResult:
         """Execute a sub-goal through the closed-loop recovery ladder."""
         t_start = time.perf_counter()
-        tool_desc = f"{action_type}('{target_label_hint}')"
 
-        if action_type not in SUPPORTED_ACTIONS:
-            # Previously any unknown action ("hotkey", "scroll", ...) fell through to a click.
+        # Parameter synonym resolution from kwargs
+        if "amount" in kwargs and scroll_amount == 3:
+            try:
+                scroll_amount = int(kwargs["amount"])
+            except (ValueError, TypeError):
+                pass
+        if "scroll_direction" in kwargs and direction == "down":
+            direction = kwargs["scroll_direction"]
+        if "seconds" in kwargs and duration_seconds == 0.0:
+            try:
+                duration_seconds = float(kwargs["seconds"])
+            except (ValueError, TypeError):
+                pass
+
+        # Normalize action_type
+        raw_action = action_type.value if hasattr(action_type, "value") else str(action_type)
+        norm_key = re.sub(r"[\s\-_]+", "_", raw_action.strip().lower())
+        canon = ACTION_ALIAS_MAP.get(norm_key)
+        normalized_action = canon.value if canon is not None else norm_key
+
+        # Button resolution
+        act_button = button
+        if normalized_action == "double_click":
+            act_button = "double"
+        elif normalized_action == "right_click":
+            act_button = "right"
+
+        tool_desc = f"{normalized_action}('{target_label_hint}')"
+
+        if normalized_action not in SUPPORTED_ACTIONS:
             return self._fail(
                 SceneIndex(hwnd=self.hwnd, window_title="", source="uia"),
                 step_index, sub_goal, "none", tool_desc,
                 f"Unsupported action_type '{action_type}'. Supported: {', '.join(SUPPORTED_ACTIONS)}.",
             )
-        if action_type == "type" and not text_to_type:
+
+        # Action-specific parameter validation
+        if normalized_action == "type" and not text_to_type:
             return self._fail(
                 SceneIndex(hwnd=self.hwnd, window_title="", source="uia"),
                 step_index, sub_goal, "none", tool_desc,
                 "action_type 'type' requires non-empty text_to_type.",
+            )
+
+        normalized_keys: List[str] = []
+        if normalized_action == "hotkey":
+            if not keys:
+                return self._fail(
+                    SceneIndex(hwnd=self.hwnd, window_title="", source="uia"),
+                    step_index, sub_goal, "none", tool_desc,
+                    "action_type 'hotkey' requires non-empty keys.",
+                )
+            if isinstance(keys, str):
+                normalized_keys = [k.strip() for k in re.split(r"[\+\s,\-]+", keys) if k.strip()]
+            else:
+                normalized_keys = list(keys)
+            try:
+                normalized_keys = normalize_keys(normalized_keys)
+            except Exception as e:
+                return self._fail(
+                    SceneIndex(hwnd=self.hwnd, window_title="", source="uia"),
+                    step_index, sub_goal, "none", tool_desc,
+                    f"Invalid hotkey specification: {e}",
+                )
+
+        if normalized_action == "wait" and duration_seconds < 0:
+            return self._fail(
+                SceneIndex(hwnd=self.hwnd, window_title="", source="uia"),
+                step_index, sub_goal, "none", tool_desc,
+                "action_type 'wait' requires non-negative duration_seconds.",
             )
 
         try:
@@ -189,16 +267,56 @@ class ServoControlLoop:
                 step_index, sub_goal, "none", tool_desc, str(e), escalate=False,
             )
 
-        # ATTEMPT 1: UIA. Used whenever it can resolve the target, regardless of how
-        # many controls the window has (the old "< 3 controls => skip UIA" rule sent
-        # small dialogs straight to the visual fallback).
+        canon_type = canon or CanonicalActionType.CLICK
+
+        # Non-targeted actions: wait, or hotkey without target hint
+        requires_target = normalized_action in ("click", "double_click", "right_click", "invoke", "scroll", "type")
+        if not requires_target or (normalized_action == "hotkey" and not target_label_hint):
+            uia_scene = self.uia_sensor.sense()
+            res = self._run_reflex_pass(
+                scene=uia_scene,
+                target_el=None,
+                step_index=step_index,
+                sub_goal=sub_goal,
+                action_type=normalized_action,
+                text_to_type=text_to_type,
+                expected_outcome=expected_outcome,
+                perception_source="uia",
+                sensor_fn=self.uia_sensor.sense,
+                button=act_button,
+                clear_first=clear_first,
+                press_enter=press_enter,
+                keys=normalized_keys,
+                direction=direction,
+                scroll_amount=scroll_amount,
+                duration_seconds=duration_seconds,
+            )
+            res.attempts_used = 1
+            return self._finalize(res, t_start)
+
+        # ATTEMPT 1: UIA
         uia_scene = self.uia_sensor.sense()
+        uia_diag: Optional[str] = None
         if not uia_scene.sense_error:
-            target = self.resolve_target(uia_scene, target_label_hint)
+            target, uia_diag = AliasMapper.resolve_element(uia_scene, target_label_hint, action_type=canon_type)
             if target is not None:
                 res = self._run_reflex_pass(
-                    uia_scene, target, step_index, sub_goal, action_type, text_to_type,
-                    expected_outcome, "uia", self.uia_sensor.sense,
+                    scene=uia_scene,
+                    target_el=target,
+                    step_index=step_index,
+                    sub_goal=sub_goal,
+                    action_type=normalized_action,
+                    text_to_type=text_to_type,
+                    expected_outcome=expected_outcome,
+                    perception_source="uia",
+                    sensor_fn=self.uia_sensor.sense,
+                    button=act_button,
+                    clear_first=clear_first,
+                    press_enter=press_enter,
+                    keys=normalized_keys,
+                    direction=direction,
+                    scroll_amount=scroll_amount,
+                    duration_seconds=duration_seconds,
                 )
                 res.attempts_used = 1
                 return self._finalize(res, t_start)
@@ -206,24 +324,41 @@ class ServoControlLoop:
         # ATTEMPT 2: Mirage visual fallback, only reached when nothing has been actuated.
         mirage_sense = lambda: self.mirage_sensor.sense(window_title=uia_scene.window_title)  # noqa: E731
         mirage_scene = mirage_sense()
-        target = None if mirage_scene.sense_error else self.resolve_target(mirage_scene, target_label_hint)
-        if target is not None:
-            res = self._run_reflex_pass(
-                mirage_scene, target, step_index, sub_goal, action_type, text_to_type,
-                expected_outcome, "mirage", mirage_sense,
-            )
-            res.attempts_used = 2
-            return self._finalize(res, t_start)
+        mirage_diag: Optional[str] = None
+        if not mirage_scene.sense_error:
+            target, mirage_diag = AliasMapper.resolve_element(mirage_scene, target_label_hint, action_type=canon_type)
+            if target is not None:
+                res = self._run_reflex_pass(
+                    scene=mirage_scene,
+                    target_el=target,
+                    step_index=step_index,
+                    sub_goal=sub_goal,
+                    action_type=normalized_action,
+                    text_to_type=text_to_type,
+                    expected_outcome=expected_outcome,
+                    perception_source="mirage",
+                    sensor_fn=mirage_sense,
+                    button=act_button,
+                    clear_first=clear_first,
+                    press_enter=press_enter,
+                    keys=normalized_keys,
+                    direction=direction,
+                    scroll_amount=scroll_amount,
+                    duration_seconds=duration_seconds,
+                )
+                res.attempts_used = 2
+                return self._finalize(res, t_start)
 
         reasons = []
         if uia_scene.sense_error:
             reasons.append(f"UIA failed: {uia_scene.sense_error}")
         else:
-            reasons.append(f"UIA found no unique element matching '{target_label_hint}'")
-        reasons.append(
-            f"Mirage failed: {mirage_scene.sense_error}" if mirage_scene.sense_error
-            else f"Mirage found no unique element matching '{target_label_hint}'"
-        )
+            reasons.append(uia_diag or f"UIA found no unique element matching '{target_label_hint}'")
+        if mirage_scene.sense_error:
+            reasons.append(f"Mirage failed: {mirage_scene.sense_error}")
+        else:
+            reasons.append(mirage_diag or f"Mirage found no unique element matching '{target_label_hint}'")
+
         res = self._fail(
             uia_scene, step_index, sub_goal, "hybrid", tool_desc, "; ".join(reasons),
         )
@@ -237,7 +372,7 @@ class ServoControlLoop:
     def _run_reflex_pass(
         self,
         scene: SceneIndex,
-        target_el: SceneElement,
+        target_el: Optional[SceneElement],
         step_index: int,
         sub_goal: str,
         action_type: str,
@@ -245,16 +380,38 @@ class ServoControlLoop:
         expected_outcome: str,
         perception_source: str,
         sensor_fn: Callable[[], SceneIndex],
+        button: str = "left",
+        clear_first: bool = False,
+        press_enter: bool = False,
+        keys: Optional[List[str]] = None,
+        direction: str = "down",
+        scroll_amount: int = 3,
+        duration_seconds: float = 0.0,
     ) -> ExecutionResult:
         """Single pass: pre-risk gate, actuation, settling, and post-verify."""
-        tool_call_repr = (
-            f"type_text(element_id={target_el.element_id}, text={text_to_type!r})"
-            if action_type == "type"
-            else f"click(element_id={target_el.element_id})"
-        )
+        eid = target_el.element_id if target_el is not None else 0
+        if action_type == "type":
+            tool_call_repr = f"type_text(element_id={eid}, text={text_to_type!r})"
+        elif action_type in ("click", "double_click", "right_click"):
+            if button != "left":
+                tool_call_repr = f"click(element_id={eid}, button={button!r})"
+            else:
+                tool_call_repr = f"click(element_id={eid})"
+        elif action_type == "invoke":
+            tool_call_repr = f"invoke(element_id={eid})"
+        elif action_type == "hotkey":
+            tool_call_repr = f"hotkey(keys={keys})"
+        elif action_type == "scroll":
+            tool_call_repr = f"scroll(element_id={eid}, direction={direction!r}, amount={scroll_amount})"
+        elif action_type == "wait":
+            tool_call_repr = f"wait(duration_seconds={duration_seconds})"
+        else:
+            tool_call_repr = f"{action_type}()"
+
+        element_label = target_el.label if target_el is not None else scene.window_title
 
         # 1. Jev Pre-Action Risk Gate
-        pre_risk = self.jev.evaluate_pre_risk(sub_goal, tool_call_repr, target_el.label)
+        pre_risk = self.jev.evaluate_pre_risk(sub_goal, tool_call_repr, element_label)
 
         if not pre_risk.scope_valid:
             return self._fail(
@@ -271,7 +428,7 @@ class ServoControlLoop:
                 request = ConfirmationRequest(
                     sub_goal=sub_goal,
                     tool_call=tool_call_repr,
-                    element_label=target_el.label,
+                    element_label=element_label,
                     risk_level=pre_risk.risk_level,
                     reason=pre_risk.reason,
                     hwnd=self.hwnd,
@@ -309,9 +466,32 @@ class ServoControlLoop:
         # 3. Actuate (exactly once)
         try:
             if action_type == "type":
-                self.tools.type_text(scene, target_el.element_id, text_to_type)
+                if target_el is None:
+                    raise ActuationError("Action 'type' requires a target element.")
+                self.tools.type_text(
+                    scene, target_el.element_id, text_to_type,
+                    press_enter=press_enter, clear_first=clear_first,
+                )
+            elif action_type in ("click", "double_click", "right_click"):
+                if target_el is None:
+                    raise ActuationError(f"Action '{action_type}' requires a target element.")
+                self.tools.click(scene, target_el.element_id, button=button)
+            elif action_type == "invoke":
+                if target_el is None:
+                    raise ActuationError("Action 'invoke' requires a target element.")
+                self.tools.invoke(scene, target_el.element_id)
+            elif action_type == "hotkey":
+                if not keys:
+                    raise ActuationError("Action 'hotkey' requires non-empty keys.")
+                self.tools.hotkey(keys)
+            elif action_type == "scroll":
+                if target_el is None:
+                    raise ActuationError("Action 'scroll' requires a target element.")
+                self.tools.scroll(scene, target_el.element_id, direction=direction, amount=scroll_amount)
+            elif action_type == "wait":
+                self.tools.wait(duration_seconds)
             else:
-                self.tools.click(scene, target_el.element_id, button="left")
+                raise ActuationError(f"Unsupported action_type '{action_type}'.")
         except FailsafeException:
             raise  # operator abort must propagate and stop the whole plan
         except (ActuationError, SandboxViolationException) as e:
@@ -328,9 +508,16 @@ class ServoControlLoop:
         post_scene, delta = self.settling.settle_and_diff(scene, sensor_fn)
 
         # 5. Jev Post-Action Verification Gate
-        post_eval = self.jev.evaluate_post_transition(
-            sub_goal, delta, expected_outcome, typed_text=text_to_type if action_type == "type" else "",
-        )
+        if action_type == "wait":
+            post_eval = PostTransitionResult(
+                transition_ok=True,
+                confidence=1.0,
+                explanation=f"Wait of {duration_seconds}s completed.",
+            )
+        else:
+            post_eval = self.jev.evaluate_post_transition(
+                sub_goal, delta, expected_outcome, typed_text=text_to_type if action_type == "type" else "",
+            )
 
         return ExecutionResult(
             success=post_eval.transition_ok,

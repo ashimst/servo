@@ -20,14 +20,14 @@ def get_planner(provider: Optional[str] = None) -> PlannerBackend:
     """Instantiate the planner selected by ``provider`` or SERVO_PLANNER_PROVIDER."""
     from servo.config import settings
 
-    name = provider or settings.planner_provider
-    if name == "openai":
+    name = (provider or settings.planner_provider or "").lower().strip()
+    if name in ("openai", "openai_compat", "ollama"):
         return OpenAICompatPlanner()
-    if name == "anthropic":
+    if name in ("anthropic", "claude"):
         return AnthropicPlanner()
-    if name == "gemini":
+    if name in ("gemini", "google"):
         return GeminiPlanner()
-    if name == "passthrough":
+    if name in ("passthrough", "mcp"):
         return PassthroughPlanner()
     raise PlannerError(f"Unknown planner provider '{name}'.")
 

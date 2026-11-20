@@ -122,6 +122,7 @@ class ServoConfig(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-opus-5-5"
     gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.0-flash"
 
     # Local REST API bearer token. If empty, a random token is generated on first
     # start and stored in ~/.servo/api_token (see servo.daemon.auth).

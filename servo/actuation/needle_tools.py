@@ -162,6 +162,22 @@ class NeedleToolSurface:
         )
 
     @tool_decorator
+    def invoke(self, scene: SceneIndex, element_id: int) -> str:
+        """Activate the target element through UIA control patterns without physical mouse input."""
+        element, x, y = self._resolve(scene, element_id)
+
+        if sys.platform != "win32":
+            raise ActuationError("UIA invocation is only supported on Windows.")
+
+        if self._uia_invoke(x, y):
+            return f"Invoked element {element_id} ('{element.label}') via UIA pattern."
+
+        raise ActuationError(
+            f"Could not invoke element {element_id} ('{element.label}'): no supported UIA pattern found "
+            "(InvokePattern, TogglePattern, SelectionItemPattern, or SetFocus)."
+        )
+
+    @tool_decorator
     def type_text(
         self,
         scene: SceneIndex,
