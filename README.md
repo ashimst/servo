@@ -48,7 +48,26 @@ Optional extras:
 
 ## How to Run
 
-### 1. Run as a Model Context Protocol (MCP) Server
+### 1. Floating On-Screen Desktop Copilot (Recommended)
+
+Launch the always-on-top on-screen chat companion docked to your screen:
+
+```powershell
+servo --copilot
+```
+*(or run `python -m servo.daemon.copilot`)*
+
+The Copilot stays floating on top of your windows (like a screen-share HUD companion). You can naturally chat with it to execute desktop tasks end-to-end:
+* *"open notepad and write hello world"*
+* *"open calculator and click 7"*
+* *"write 'urgent meeting' into search"*
+* *"click Save"*
+
+It automatically launches or focuses the application, extracts the UI control tree, plans the actions, and drives the mouse and keyboard via the verified closed-loop reflex arc.
+
+---
+
+### 2. Run as a Model Context Protocol (MCP) Server
 
 Connect your favorite coding agent (Cursor, Claude Desktop, Antigravity) directly to Servo over stdio:
 
