@@ -1,30 +1,35 @@
-"""FastAPI REST/WebSocket and FastMCP unified daemon server.
+"""FastAPI REST/WebSocket and FastMCP unified daemon server (Servo v2).
 
-See ADR-12 and Section 6 in SERVO_ARCHITECTURE_V1.md.
-Exposes MCP tools (run_task, assert_ui_state, get_scene_index) and REST endpoints.
+See ADR-12, ADR-13, ADR-14, ADR-15 in SERVO_ARCHITECTURE_V2.md.
+Exposes MCP tools, REST endpoints, Whistle voice ingestion, and HUD overlays.
 """
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import sys
 import time
 import uuid
 from typing import Any, AsyncIterator, Dict, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from servo.config import settings, get_hardware_profile
 from servo.daemon.worker import worker, TaskJob
+from servo.daemon.voice import voice_manager
+from servo.daemon.ui import hud_overlay
 from servo.telemetry.store import TraceStore
 from servo.telemetry.models import TracePayload, StepTrace, RunMetrics
+from servo.perception.scene_index import SceneIndex
 
 # Initialize FastMCP Server
 try:
     from fastmcp import FastMCP
     mcp = FastMCP(
         "Servo Desktop Control Runtime",
-        instructions="Servo: Local-First, Closed-Loop Neuro-Symbolic Desktop Control Runtime for Windows 10/11.",
+        instructions="Servo v2: Local-First, Closed-Loop Neuro-Symbolic Desktop Control Runtime for Windows 10/11.",
     )
 except ImportError:
     mcp = None
@@ -42,8 +47,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="Servo Desktop Control Runtime",
-    version="0.1.0",
+    title="Servo Desktop Control Runtime v2",
+    version="0.2.0",
     description="Local-First, Closed-Loop Neuro-Symbolic Desktop Control Runtime",
     lifespan=lifespan,
 )
@@ -54,6 +59,12 @@ class TaskRequest(BaseModel):
     hwnd: Optional[int] = None
     mode: str = "assistant"
     fast_mode: bool = False
+
+
+class VoiceDataRequest(BaseModel):
+    audio_b64: str
+    hwnd: Optional[int] = None
+    mode: str = "assistant"
 
 
 # =============================================================================
@@ -177,6 +188,14 @@ if mcp is not None:
         except Exception as e:
             return {"matched": False, "error": str(e)}
 
+    @mcp.tool()
+    def voice_task_tool(audio_path: str, hwnd: Optional[int] = None) -> Dict[str, Any]:
+        """Ingest an audio command using Cactus Whistle and run through Servo."""
+        try:
+            return voice_manager.ingest_voice_task(audio_data=audio_path, hwnd=hwnd)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
 
 # =============================================================================
 # FastAPI REST Endpoints (for Web UI, trays, and local dashboards)
@@ -188,7 +207,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "healthy",
         "service": "servo",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "hardware": get_hardware_profile(),
         "config": {
             "mode": settings.mode,
@@ -225,6 +244,28 @@ def run_task(req: TaskRequest) -> Dict[str, Any]:
 def get_traces(limit: int = 50) -> Dict[str, Any]:
     """Retrieve recent automation traces from SQLite."""
     return {"runs": trace_store.list_runs(limit=limit)}
+
+
+@app.post("/voice/task")
+def voice_task(req: VoiceDataRequest) -> Dict[str, Any]:
+    """Ingest base64-encoded audio, transcribe via Whistle, and execute."""
+    try:
+        audio_bytes = base64.b64decode(req.audio_b64)
+        return voice_manager.ingest_voice_task(audio_data=audio_bytes, hwnd=req.hwnd, mode=req.mode)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/hud/overlay")
+def get_hud_overlay(hwnd: Optional[int] = None, highlight_id: Optional[int] = None) -> Response:
+    """Return real-time SVG overlay for visual grounding of detected elements."""
+    try:
+        scene_data = execute_sense_scene(hwnd=hwnd)
+        scene = SceneIndex(**scene_data)
+        svg_content = hud_overlay.generate_svg_overlay(scene, highlight_id=highlight_id)
+        return Response(content=svg_content, media_type="image/svg+xml")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def main() -> None:
