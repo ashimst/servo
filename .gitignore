@@ -1,13 +1,38 @@
+# Virtual environments
 .venv/
+env/
+venv/
+ENV/
+
+# Python cache and byte-compiled files
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Pytest & Coverage
 .pytest_cache/
+.coverage
+htmlcov/
+
+# Servo Runtime Traces & Local Data
 *.sqlite
 *.sqlite3
 *.jsonl
-~/.servo/
-dist/
-build/
-*.egg-info/
+.servo/
+traces/
+
+# Windows & OS Artifacts
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor Artifacts
+.vscode/
+.idea/
+*.swp
+*.swo

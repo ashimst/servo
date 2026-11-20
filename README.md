@@ -1,54 +1,133 @@
 # Servo
 
-**Local-First, Closed-Loop Neuro-Symbolic Desktop Control Runtime for Windows 10/11**
+**Local-First, Closed-Loop Neuro-Symbolic Desktop Control Runtime for Windows 10 & 11**
 
-Servo is a low-latency, sub-70MB desktop automation runtime built around a three-tier cybernetic servomechanism:
-1. **System 2 (Pluggable Setpoint Planner):** Decomposes high-level instructions into sub-goals without handling raw screenshots or pixel coordinates.
-2. **Safety Comparator (Jev Gate):** Non-autoregressive decision model validating pre-action risk and post-action UI state transitions.
-3. **System 1 Reflex Arc (UIA + Mirage + Needle 3):** High-frequency, deterministic perception and kinematics running on CPU.
+Servo is an ultra-low-latency desktop automation engine built around a three-tier cybernetic servomechanism:
 
-## Architecture
+1. **System 2 (Setpoint Planner):** Breaks high-level user instructions into atomic sub-goals without needing raw screenshots or pixel coordinates. Supports OpenAI-compatible endpoints, Anthropic Claude, Google Gemini, and direct MCP callers.
+2. **Safety Comparator (Jev Gate):** Non-autoregressive decision model validating pre-action risk levels (`low`, `medium`, `high`) and verifying post-action UI transitions.
+3. **System 1 Reflex Arc (UIA + Mirage + Needle 3):** High-frequency, deterministic perception and kinematics running on CPU within a strict memory budget.
 
-- [SERVO_ARCHITECTURE_V1.md](SERVO_ARCHITECTURE_V1.md): core architecture and decision records
-- [SERVO_ARCHITECTURE_V2.md](SERVO_ARCHITECTURE_V2.md): voice, HUD overlay, MCP + REST surfaces
-- [SERVO_HARDENING_NOTES.md](SERVO_HARDENING_NOTES.md): v0.2 safety/correctness fixes, the reasons for them, and breaking changes
+---
 
-## Installation
+## Architecture Specifications
 
-```bash
+* [`SERVO_ARCHITECTURE_V1.md`](SERVO_ARCHITECTURE_V1.md) — Baseline architecture specification and Architectural Decision Records (ADRs).
+* [`SERVO_ARCHITECTURE_V2.md`](SERVO_ARCHITECTURE_V2.md) — Voice ingestion, transparent HUD overlay, and dual FastMCP/REST protocols.
+* [`SERVO_HARDENING_NOTES.md`](SERVO_HARDENING_NOTES.md) — Safety verification, confirmation gates, and edge-case handling.
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+* **Operating System:** Windows 10 or Windows 11 (64-bit)
+* **Python:** Python 3.10 to 3.12
+
+### Installation
+
+Clone the repository and set up a virtual environment:
+
+```powershell
+git clone https://github.com/ashimst/servo.git
+cd servo
+
 python -m venv .venv
-.venv\Scripts\activate
-pip install -e ".[dev,mcp]"          # add ,anthropic or ,cactus as needed
+.\.venv\Scripts\activate
+
+# Install core runtime with MCP support
+pip install -e ".[dev,mcp]"
 ```
 
-## Running
+Optional extras:
+* `pip install -e ".[cactus]"` — Adds local Cactus edge models (Needle, Mirage, Whistle).
+* `pip install -e ".[dev]"` — Installs pytest test runner.
 
-```bash
-servo                 # REST API on 127.0.0.1:8000
-servo --mcp           # MCP server over stdio
+---
+
+## How to Run
+
+### 1. Run as a Model Context Protocol (MCP) Server
+
+Connect your favorite coding agent (Cursor, Claude Desktop, Antigravity) directly to Servo over stdio:
+
+```powershell
+servo --mcp
 ```
 
-The REST API requires `Authorization: Bearer <token>` on every endpoint except `/health`.
-The token is read from `SERVO_API_TOKEN`, or generated on first start and stored in
-`~/.servo/api_token`.
+#### Claude Desktop Configuration (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "servo": {
+      "command": "C:\\Projects\\servo\\.venv\\Scripts\\servo.exe",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
 
-Actions always target an explicit window: call `GET /windows` (or the MCP
-`list_windows_tool`) and pass its `hwnd`.
+Exposed MCP Tools:
+* `list_windows_tool`: Discovers interactive open windows and their `hwnd`.
+* `get_scene_index_tool(hwnd)`: Extracts visible UI elements with normalized integer IDs.
+* `run_task_tool(goal, hwnd, mode)`: Executes an automation step through the closed loop.
+* `assert_ui_state_tool(expected, hwnd)`: Checks UI state against expectations.
 
-Key settings (environment variables, prefix `SERVO_`):
+---
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `SERVO_MODE` | `assistant` | `assistant`: medium/high-risk actions need confirmation. `harness`: no prompts, but only on allowlisted windows |
-| `SERVO_CONFIRMATION_CHANNEL` | `dialog` | `dialog`: Yes/No dialog on the desktop (default No; no answer = No). `deny`: refuse all medium/high-risk actions |
-| `SERVO_CONFIRMATION_TIMEOUT_SECONDS` | `60` | How long the dialog waits before counting as "No" |
-| `SERVO_WHITELISTED_HWNDS` / `SERVO_WHITELISTED_PROCESS_NAMES` | empty | Harness-mode allowlist (JSON list, e.g. `'["notepad.exe"]'`); harness mode refuses to act if both are empty |
-| `SERVO_PLANNER_PROVIDER` | `openai` | `openai` (any OpenAI-compatible endpoint, e.g. Ollama), `anthropic`, `gemini`, `passthrough` |
-| `SERVO_JEV_URL` | empty | Jev/Kev decision model endpoint; heuristic gate is used when empty |
+### 2. Run as a Local REST Server
+
+Launch the FastAPI daemon with local bearer authentication:
+
+```powershell
+servo --port 8000
+```
+
+By default, Servo listens on `127.0.0.1:8000`. On first launch, a bearer token is generated and stored in `~/.servo/api_token`. Pass this token in the header:
+```http
+Authorization: Bearer <your-token>
+```
+
+#### Core Endpoints:
+* `GET /health` — Health check and hardware resource profile (public).
+* `GET /windows` — List active visible windows with HWND and process names.
+* `GET /scene?hwnd=<id>` — Query integer-indexed control tree for a target window.
+* `POST /task` — Execute a goal on a window with safety gating.
+* `GET /hud/overlay?hwnd=<id>` — Returns real-time SVG visual bounding boxes.
+* `GET /traces` — Query SQLite telemetry log of recent runs.
+
+---
+
+## Configuration
+
+Configure runtime options via environment variables (prefix `SERVO_`):
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `SERVO_MODE` | `assistant` | `assistant` (prompts on medium/high risk) or `harness` (autonomous sandboxed CI). |
+| `SERVO_CONFIRMATION_CHANNEL` | `dialog` | `dialog` (desktop Yes/No modal) or `deny` (automatically refuses risky actions). |
+| `SERVO_WHITELISTED_PROCESS_NAMES` | `[]` | JSON array of permitted processes in harness mode (e.g., `'["notepad.exe"]'`). |
+| `SERVO_PLANNER_PROVIDER` | `openai` | System 2 backend: `openai`, `anthropic`, `gemini`, or `passthrough`. |
+| `SERVO_OPENAI_BASE_URL` | `http://localhost:11434/v1` | URL for local Ollama or OpenAI-compatible service. |
+| `SERVO_FAST_MODE` | `false` | When `true`, snaps cursor directly to targets (for automated CI). |
+
+---
 
 ## Running Tests
 
-```bash
-pytest                # unit tests (no real input is sent)
-pytest -m desktop     # end-to-end tests that launch apps and drive the real mouse/keyboard
+Verify the installation against the full test suite:
+
+```powershell
+# Run unit and integration tests (mocked OS events)
+pytest -v
+
+# Run live Windows desktop tests (drives real windows like Notepad)
+pytest -v -m desktop
 ```
+
+---
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
