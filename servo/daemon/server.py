@@ -19,6 +19,16 @@ from servo.daemon.worker import worker, TaskJob
 from servo.telemetry.store import TraceStore
 from servo.telemetry.models import TracePayload, StepTrace, RunMetrics
 
+# Initialize FastMCP Server
+try:
+    from fastmcp import FastMCP
+    mcp = FastMCP(
+        "Servo Desktop Control Runtime",
+        instructions="Servo: Local-First, Closed-Loop Neuro-Symbolic Desktop Control Runtime for Windows 10/11.",
+    )
+except ImportError:
+    mcp = None
+
 
 trace_store = TraceStore()
 
@@ -46,6 +56,132 @@ class TaskRequest(BaseModel):
     fast_mode: bool = False
 
 
+# =============================================================================
+# Core Execution Helper Functions
+# =============================================================================
+
+def execute_sense_scene(hwnd: Optional[int] = None) -> Dict[str, Any]:
+    """Sense target window or active foreground window."""
+    target_hwnd = hwnd
+    if target_hwnd is None and sys.platform == "win32":
+        import ctypes
+        target_hwnd = ctypes.windll.user32.GetForegroundWindow()
+
+    if not target_hwnd:
+        raise ValueError("No active target window found or HWND specified.")
+
+    job = TaskJob(
+        job_id=f"sense_{uuid.uuid4().hex[:8]}",
+        action_type="sense_scene",
+        hwnd=target_hwnd,
+    )
+    result = worker.submit_job(job, timeout=5.0)
+    if not result.success:
+        raise RuntimeError(result.error or "Failed to sense scene.")
+    return result.data or {}
+
+
+def execute_task_goal(
+    goal: str,
+    hwnd: Optional[int] = None,
+    mode: str = "assistant",
+    fast_mode: bool = False,
+) -> Dict[str, Any]:
+    """Run an automation goal through the closed-loop reflex arc."""
+    target_hwnd = hwnd
+    if target_hwnd is None and sys.platform == "win32":
+        import ctypes
+        target_hwnd = ctypes.windll.user32.GetForegroundWindow()
+
+    if not target_hwnd:
+        raise ValueError("No active target window found.")
+
+    t0 = time.perf_counter()
+    job = TaskJob(
+        job_id=f"task_{uuid.uuid4().hex[:8]}",
+        action_type="execute_subgoal",
+        hwnd=target_hwnd,
+        params={
+            "step_index": 1,
+            "sub_goal": goal,
+            "target_label_hint": goal,
+            "action_type": "type" if "type" in goal.lower() or "enter" in goal.lower() else "click",
+            "fast_mode": fast_mode,
+        },
+    )
+    res = worker.submit_job(job, timeout=15.0)
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+    # Persist trace
+    payload = TracePayload(
+        mode=mode,
+        status="passed" if res.success else "failed",
+        goal=goal,
+        metrics=RunMetrics(total_latency_ms=elapsed_ms, uia_steps=1),
+        steps=[
+            StepTrace(
+                step=1,
+                sub_goal=goal,
+                perception_source="uia",
+                tool_call=f"action('{goal}')",
+                jev_pre_risk="low",
+                jev_post_ok=res.success,
+                latency_ms=elapsed_ms,
+            )
+        ],
+    )
+    trace_store.record_run(payload)
+
+    return {
+        "success": res.success,
+        "run_id": payload.run_id,
+        "latency_ms": elapsed_ms,
+        "data": res.data,
+        "error": res.error,
+    }
+
+
+# =============================================================================
+# FastMCP Tools (for external coding agents and MCP clients)
+# =============================================================================
+
+if mcp is not None:
+    @mcp.tool()
+    def run_task_tool(goal: str, mode: str = "assistant", hwnd: Optional[int] = None) -> Dict[str, Any]:
+        """Execute a desktop automation goal through Servo's closed-loop reflex arc."""
+        try:
+            return execute_task_goal(goal=goal, hwnd=hwnd, mode=mode)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @mcp.tool()
+    def get_scene_index_tool(hwnd: Optional[int] = None) -> Dict[str, Any]:
+        """Get the current normalized SceneIndex (element ID map) for a target window."""
+        try:
+            return execute_sense_scene(hwnd=hwnd)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @mcp.tool()
+    def assert_ui_state_tool(expected: str, hwnd: Optional[int] = None) -> Dict[str, Any]:
+        """Assert whether the current window UI reflects the expected label or state."""
+        try:
+            scene_data = execute_sense_scene(hwnd=hwnd)
+            elements = scene_data.get("elements", {})
+            labels = [el.get("label", "") for el in elements.values() if isinstance(el, dict)]
+            matched = any(expected.lower() in l.lower() for l in labels)
+            title = scene_data.get("window_title", "")
+            if expected.lower() in title.lower():
+                matched = True
+            return {"matched": matched, "expected": expected, "found_labels_sample": labels[:10]}
+        except Exception as e:
+            return {"matched": False, "error": str(e)}
+
+
+# =============================================================================
+# FastAPI REST Endpoints (for Web UI, trays, and local dashboards)
+# =============================================================================
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     """Health check endpoint and hardware profile."""
@@ -65,82 +201,54 @@ def health() -> Dict[str, Any]:
 @app.get("/scene")
 def get_scene(hwnd: Optional[int] = None) -> Dict[str, Any]:
     """Query current SceneIndex for the specified or foreground HWND."""
-    target_hwnd = hwnd
-    if target_hwnd is None and sys.platform == "win32":
-        import ctypes
-        target_hwnd = ctypes.windll.user32.GetForegroundWindow()
-
-    if not target_hwnd:
-        raise HTTPException(status_code=400, detail="No active window found or HWND specified.")
-
-    job = TaskJob(
-        job_id=f"sense_{uuid.uuid4().hex[:8]}",
-        action_type="sense_scene",
-        hwnd=target_hwnd,
-    )
-    result = worker.submit_job(job, timeout=5.0)
-    if not result.success:
-        raise HTTPException(status_code=500, detail=result.error or "Failed to sense scene.")
-    return result.data or {}
+    try:
+        return execute_sense_scene(hwnd=hwnd)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/task")
 def run_task(req: TaskRequest) -> Dict[str, Any]:
     """Execute a task goal through Servo closed-loop reflex arc."""
-    target_hwnd = req.hwnd
-    if target_hwnd is None and sys.platform == "win32":
-        import ctypes
-        target_hwnd = ctypes.windll.user32.GetForegroundWindow()
-
-    if not target_hwnd:
-        raise HTTPException(status_code=400, detail="No active target window found.")
-
-    t0 = time.perf_counter()
-    job = TaskJob(
-        job_id=f"task_{uuid.uuid4().hex[:8]}",
-        action_type="execute_subgoal",
-        hwnd=target_hwnd,
-        params={
-            "step_index": 1,
-            "sub_goal": req.goal,
-            "target_label_hint": req.goal,
-            "action_type": "click",
-            "fast_mode": req.fast_mode,
-        },
-    )
-    res = worker.submit_job(job, timeout=15.0)
-    elapsed_ms = int((time.perf_counter() - t0) * 1000)
-
-    # Persist trace
-    payload = TracePayload(
-        mode=req.mode,
-        status="passed" if res.success else "failed",
-        goal=req.goal,
-        metrics=RunMetrics(total_latency_ms=elapsed_ms, uia_steps=1),
-        steps=[
-            StepTrace(
-                step=1,
-                sub_goal=req.goal,
-                perception_source="uia",
-                tool_call=f"action('{req.goal}')",
-                jev_pre_risk="low",
-                jev_post_ok=res.success,
-                latency_ms=elapsed_ms,
-            )
-        ],
-    )
-    trace_store.record_run(payload)
-
-    return {
-        "success": res.success,
-        "run_id": payload.run_id,
-        "latency_ms": elapsed_ms,
-        "data": res.data,
-        "error": res.error,
-    }
+    try:
+        return execute_task_goal(
+            goal=req.goal,
+            hwnd=req.hwnd,
+            mode=req.mode,
+            fast_mode=req.fast_mode,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/traces")
 def get_traces(limit: int = 50) -> Dict[str, Any]:
     """Retrieve recent automation traces from SQLite."""
     return {"runs": trace_store.list_runs(limit=limit)}
+
+
+def main() -> None:
+    """CLI entrypoint for running the Servo daemon or MCP server."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Servo Desktop Control Runtime Daemon")
+    parser.add_argument("--mcp", action="store_true", help="Run as FastMCP server over stdio")
+    parser.add_argument("--port", type=int, default=8000, help="Port for REST server (default: 8000)")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host address (default: 127.0.0.1)")
+    args = parser.parse_args()
+
+    if args.mcp:
+        if mcp is None:
+            print("FastMCP is not installed. Install with: pip install fastmcp")
+            sys.exit(1)
+        worker.start()
+        try:
+            mcp.run()
+        finally:
+            worker.stop()
+    else:
+        import uvicorn
+        uvicorn.run("servo.daemon.server:app", host=args.host, port=args.port, reload=False)
+
+
+if __name__ == "__main__":
+    main()
