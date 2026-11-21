@@ -22,7 +22,7 @@ def test_gui_html_contains_voice_elements():
 
 
 def test_voice_status_endpoint():
-    """Verify /api/voice/status endpoint returns available ASR backend and web speech support."""
+    """Verify /api/voice/status endpoint returns available local ASR backend."""
     session = CopilotSession()
     app = create_app(session)
 
@@ -37,8 +37,7 @@ def test_voice_status_endpoint():
     r = client.get("/api/voice/status", headers={"X-Servo-Token": session.token})
     assert r.status_code == 200
     data = r.json()
-    assert "web_speech_supported" in data
-    assert data["web_speech_supported"] is True
+    assert data.get("local") is True
     assert "backend" in data
     assert "available" in data
 

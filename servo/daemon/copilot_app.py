@@ -487,8 +487,8 @@ def create_app(session: CopilotSession) -> FastAPI:
         available = False
         try:
             import cactus  # type: ignore
-            if hasattr(cactus, "transcribe"):
-                backend = "cactus"
+            if hasattr(cactus, "transcribe") or hasattr(cactus, "Whistle"):
+                backend = "whistle"
                 available = True
         except ImportError:
             pass
@@ -499,20 +499,10 @@ def create_app(session: CopilotSession) -> FastAPI:
                 available = True
             except ImportError:
                 pass
-        if not available:
-            try:
-                import whisper  # type: ignore
-                backend = "whisper"
-                available = True
-            except ImportError:
-                pass
-        if not available and getattr(settings, "openai_api_key", ""):
-            backend = "openai"
-            available = True
         return {
             "available": available,
             "backend": backend,
-            "web_speech_supported": True,
+            "local": True,
         }
 
     @app.post("/api/voice/transcribe")
