@@ -9,12 +9,26 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from servo.config import settings
 
 logger = logging.getLogger(__name__)
+
+_whisper_lock = threading.Lock()
+_cached_whisper_model = None
+
+
+def _get_whisper_model():
+    global _cached_whisper_model
+    if _cached_whisper_model is None:
+        with _whisper_lock:
+            if _cached_whisper_model is None:
+                from faster_whisper import WhisperModel  # type: ignore
+                _cached_whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+    return _cached_whisper_model
 
 
 class VoiceUnavailableError(RuntimeError):
@@ -76,16 +90,15 @@ class VoiceIngestionManager:
         except Exception as e:
             logger.warning("Cactus transcription failed: %s", e)
 
-        # 2. Try faster-whisper or whisper if installed
+        # 2. Try faster-whisper if installed
         try:
-            from faster_whisper import WhisperModel  # type: ignore
-            model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+            model = _get_whisper_model()
             if isinstance(audio_bytes_or_path, (bytes, bytearray)):
                 with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                     tmp.write(audio_bytes_or_path)
                     tmp_path = tmp.name
                 try:
-                    segments, _ = model.transcribe(tmp_path)
+                    segments, _ = model.transcribe(tmp_path, beam_size=1)
                     text = " ".join(s.text for s in segments).strip()
                 finally:
                     try:
@@ -93,13 +106,14 @@ class VoiceIngestionManager:
                     except OSError:
                         pass
             else:
-                segments, _ = model.transcribe(str(audio_bytes_or_path))
+                segments, _ = model.transcribe(str(audio_bytes_or_path), beam_size=1)
                 text = " ".join(s.text for s in segments).strip()
             if text:
                 return text
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("faster-whisper transcription error: %s", e)
 
+        # 3. Try standard whisper if installed
         try:
             import whisper  # type: ignore
             model = whisper.load_model("tiny.en")
@@ -123,7 +137,7 @@ class VoiceIngestionManager:
         except Exception:
             pass
 
-        # 3. Try OpenAI Audio API if API key is configured
+        # 4. Try OpenAI Audio API if API key is configured
         if getattr(settings, "openai_api_key", ""):
             try:
                 import httpx

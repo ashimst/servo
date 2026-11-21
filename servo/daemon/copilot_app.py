@@ -792,9 +792,13 @@ def run_copilot(open_window: bool = True, port: Optional[int] = None) -> None:
         edge = _find_edge()
         if edge:
             profile = Path.home() / ".servo" / "copilot-shell"
+            _ensure_edge_mic_permission(profile, url)
             proc = subprocess.Popen([
                 edge, f"--app={url}", f"--user-data-dir={profile}", "--no-first-run",
                 "--disable-features=Translate",
+                f"--unsafely-treat-insecure-origin-as-secure={url.rstrip('/')}",
+                "--autoplay-policy=no-user-gesture-required",
+                "--enable-features=SpeechRecognition",
             ])
             hwnd = find_window(WINDOW_TITLE)
             if hwnd:
@@ -814,6 +818,31 @@ def run_copilot(open_window: bool = True, port: Optional[int] = None) -> None:
         except Exception:
             pass
         worker.stop()
+
+
+def _ensure_edge_mic_permission(profile_dir: Path, url: str) -> None:
+    """Pre-grant microphone permission in the isolated Edge copilot profile so voice input never blocks."""
+    try:
+        import json
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        port = parsed.port or 8765
+        pref_file = profile_dir / "Default" / "Preferences"
+        pref_file.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        if pref_file.exists():
+            try:
+                data = json.loads(pref_file.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        content_settings = data.setdefault("profile", {}).setdefault("content_settings", {})
+        exceptions = content_settings.setdefault("exceptions", {})
+        mic = exceptions.setdefault("media_stream_mic", {})
+        mic[f"http://127.0.0.1:{port},*"] = {"setting": 1}
+        mic[f"http://localhost:{port},*"] = {"setting": 1}
+        pref_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.debug("Could not pre-configure Edge mic permissions: %s", e)
 
 
 def _find_edge() -> Optional[str]:

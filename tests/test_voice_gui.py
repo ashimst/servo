@@ -17,7 +17,7 @@ def test_gui_html_contains_voice_elements():
     assert 'id="voiceWave"' in html
     assert 'Voice Input (ASR)' in html
     assert 'Alt+V' in html
-    assert 'webkitSpeechRecognition' in html or 'SpeechRecognition' in html
+    assert 'MediaRecorder' in html
     assert '/api/voice/transcribe' in html
 
 
