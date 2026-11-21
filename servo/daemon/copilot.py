@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -51,8 +52,13 @@ APP_EXECUTABLE_MAP = {
     "calc": "calc.exe",
     "chrome": "chrome.exe",
     "google chrome": "chrome.exe",
+    "google-chrome": "chrome.exe",
     "edge": "msedge.exe",
     "microsoft edge": "msedge.exe",
+    "msedge": "msedge.exe",
+    "firefox": "firefox.exe",
+    "mozilla firefox": "firefox.exe",
+    "brave": "brave.exe",
     "terminal": "wt.exe",
     "cmd": "cmd.exe",
     "command prompt": "cmd.exe",
@@ -63,48 +69,101 @@ APP_EXECUTABLE_MAP = {
     "file explorer": "explorer.exe",
     "task manager": "taskmgr.exe",
     "taskmgr": "taskmgr.exe",
+    "code": "Code.exe",
+    "vs code": "Code.exe",
+    "vscode": "Code.exe",
 }
+
+
+def resolve_app_executable(app_name: str) -> str:
+    """Resolve full executable path for Windows apps using Registry App Paths and known locations."""
+    app_key = app_name.strip().lower()
+    exe_name = APP_EXECUTABLE_MAP.get(app_key, f"{app_key}.exe")
+
+    # 1. Check if already absolute or in PATH
+    if os.path.isabs(exe_name) and os.path.exists(exe_name):
+        return exe_name
+    which_p = shutil.which(exe_name)
+    if which_p and os.path.exists(which_p):
+        return which_p
+
+    # 2. Check Windows App Paths in Registry (HKCU and HKLM)
+    if sys.platform == "win32":
+        import winreg
+        for target in (exe_name, f"{app_key}.exe"):
+            for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    key_path = f"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\{target}"
+                    with winreg.OpenKey(root, key_path) as k:
+                        val, _ = winreg.QueryValueEx(k, "")
+                        val = val.strip('\"\'')
+                        if os.path.exists(val):
+                            return val
+                except OSError:
+                    pass
+
+    # 3. Known fallback locations for common desktop applications
+    candidates = [
+        rf"C:\Program Files\Google\Chrome\Application\{exe_name}",
+        rf"C:\Program Files (x86)\Google\Chrome\Application\{exe_name}",
+        rf"C:\Program Files\Microsoft\Edge\Application\{exe_name}",
+        rf"C:\Program Files (x86)\Microsoft\Edge\Application\{exe_name}",
+        os.path.expandvars(rf"%LOCALAPPDATA%\Google\Chrome\Application\{exe_name}"),
+        os.path.expandvars(rf"%LOCALAPPDATA%\Microsoft\Edge\Application\{exe_name}"),
+        os.path.expandvars(rf"%LOCALAPPDATA%\Programs\{app_key}\{exe_name}"),
+        os.path.expandvars(rf"%PROGRAMFILES%\{exe_name}"),
+        os.path.expandvars(rf"%PROGRAMFILES(X86)%\{exe_name}"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+
+    return exe_name
 
 
 def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
     """Find an existing window for the app or launch it and return (hwnd, title)."""
     app_key = app_name.strip().lower()
-    exe_target = APP_EXECUTABLE_MAP.get(app_key, f"{app_key}.exe")
+    full_exe_path = resolve_app_executable(app_name)
+    exe_filename = os.path.basename(full_exe_path).lower()
 
     # 1. Check if window is already open
     open_wins = windows.list_windows()
     for w in open_wins:
-        proc = w.get("process_name", "").lower()
-        title = w.get("title", "").lower()
-        if (app_key in proc) or (app_key in title) or (exe_target in proc):
+        proc = str(w.get("process") or w.get("process_name") or "").lower()
+        title = str(w.get("title") or "").lower()
+        if (app_key in proc) or (app_key in title) or (exe_filename in proc):
             hwnd = int(w["hwnd"])
             if sys.platform == "win32":
                 import ctypes
                 ctypes.windll.user32.SetForegroundWindow(hwnd)
-            return hwnd, w.get("title", app_name)
+            return hwnd, str(w.get("title") or app_name)
 
     # 2. Launch the application
     try:
         if sys.platform == "win32":
-            subprocess.Popen([exe_target], shell=True)
+            if os.path.isabs(full_exe_path) and os.path.exists(full_exe_path):
+                subprocess.Popen([full_exe_path])
+            else:
+                subprocess.Popen(f'start "" "{full_exe_path}"', shell=True)
         else:
-            subprocess.Popen([exe_target])
+            subprocess.Popen([full_exe_path])
     except Exception as e:
         return None, f"Failed to launch '{app_name}': {e}"
 
     # Wait for the window to appear
-    for _ in range(25):
+    for _ in range(30):
         time.sleep(0.2)
         fresh_wins = windows.list_windows()
         for w in fresh_wins:
-            proc = w.get("process_name", "").lower()
-            title = w.get("title", "").lower()
-            if (app_key in proc) or (app_key in title) or (exe_target in proc):
+            proc = str(w.get("process") or w.get("process_name") or "").lower()
+            title = str(w.get("title") or "").lower()
+            if (app_key in proc) or (app_key in title) or (exe_filename in proc):
                 hwnd = int(w["hwnd"])
                 if sys.platform == "win32":
                     import ctypes
                     ctypes.windll.user32.SetForegroundWindow(hwnd)
-                return hwnd, w.get("title", app_name)
+                return hwnd, str(w.get("title") or app_name)
 
     # Fallback to foreground window
     fg_hwnd = windows.get_foreground_window()

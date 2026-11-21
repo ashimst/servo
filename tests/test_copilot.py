@@ -96,6 +96,14 @@ def test_launch_or_focus_app_existing_window(mock_list):
     assert "Notepad" in title
 
 
+def test_resolve_app_executable():
+    from servo.daemon.copilot import resolve_app_executable
+    chrome_path = resolve_app_executable("chrome")
+    assert "chrome" in chrome_path.lower()
+    notepad_path = resolve_app_executable("notepad")
+    assert "notepad" in notepad_path.lower()
+
+
 def test_copilot_brain_dictionary_subscripting_compatibility():
     """Verify legacy dictionary subscripting syntax works on MacroPlan without TypeError."""
     brain = CopilotBrain(user_name="Ashim")
