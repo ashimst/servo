@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from servo.config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,45 +33,122 @@ class VoiceIngestionManager:
     """Manages audio transcription and voice task dispatch."""
 
     def transcribe_audio(self, audio_bytes_or_path: bytes | str | Path) -> str:
-        """Transcribe an audio clip using Cactus Whistle.
+        """Transcribe an audio clip using Cactus Whistle, Whisper, or configured ASR."""
+        suffix = ".wav"
+        if isinstance(audio_bytes_or_path, (bytes, bytearray)):
+            b = bytes(audio_bytes_or_path[:16])
+            if b.startswith(b"\x1a\x45\xdf\xa3"):
+                suffix = ".webm"
+            elif b.startswith(b"OggS"):
+                suffix = ".ogg"
+            elif b.startswith(b"RIFF"):
+                suffix = ".wav"
+            elif b.startswith(b"ID3") or (len(b) >= 2 and b[0] == 0xff and (b[1] & 0xe0) == 0xe0):
+                suffix = ".mp3"
 
-        There is no synthetic fallback. The previous version returned a hard-coded
-        command ("Click search settings and type bluetooth") or a phrase built from the
-        file name when Whistle was missing, and that invented text was then executed
-        on the user's desktop.
-        """
+        # 1. Try Cactus Whistle if installed
         try:
             import cactus  # type: ignore
-        except ImportError as e:
-            raise VoiceUnavailableError("Cactus Whistle is not installed (pip install servo[cactus]).") from e
-        if not hasattr(cactus, "transcribe"):
-            raise VoiceUnavailableError("Installed cactus package has no 'transcribe' function.")
+            if hasattr(cactus, "transcribe"):
+                if isinstance(audio_bytes_or_path, (bytes, bytearray)):
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                        tmp.write(audio_bytes_or_path)
+                        tmp_path = tmp.name
+                    try:
+                        text = _extract_text(cactus.transcribe(tmp_path))
+                    finally:
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                else:
+                    path = Path(audio_bytes_or_path)
+                    if not path.is_file():
+                        raise VoiceUnavailableError(f"Audio file not found: {path}")
+                    text = _extract_text(cactus.transcribe(str(path)))
+                if not text:
+                    raise VoiceUnavailableError("Transcription was empty.")
+                return text
+        except VoiceUnavailableError:
+            raise
+        except (ImportError, AttributeError):
+            pass
+        except Exception as e:
+            logger.warning("Cactus transcription failed: %s", e)
 
+        # 2. Try faster-whisper or whisper if installed
         try:
+            from faster_whisper import WhisperModel  # type: ignore
+            model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
             if isinstance(audio_bytes_or_path, (bytes, bytearray)):
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                     tmp.write(audio_bytes_or_path)
                     tmp_path = tmp.name
                 try:
-                    text = _extract_text(cactus.transcribe(tmp_path))
+                    segments, _ = model.transcribe(tmp_path)
+                    text = " ".join(s.text for s in segments).strip()
                 finally:
                     try:
                         os.remove(tmp_path)
                     except OSError:
                         pass
             else:
-                path = Path(audio_bytes_or_path)
-                if not path.is_file():
-                    raise VoiceUnavailableError(f"Audio file not found: {path}")
-                text = _extract_text(cactus.transcribe(str(path)))
-        except VoiceUnavailableError:
-            raise
-        except Exception as e:
-            raise VoiceUnavailableError(f"Transcription failed: {e}") from e
+                segments, _ = model.transcribe(str(audio_bytes_or_path))
+                text = " ".join(s.text for s in segments).strip()
+            if text:
+                return text
+        except Exception:
+            pass
 
-        if not text:
-            raise VoiceUnavailableError("Transcription was empty.")
-        return text
+        try:
+            import whisper  # type: ignore
+            model = whisper.load_model("tiny.en")
+            if isinstance(audio_bytes_or_path, (bytes, bytearray)):
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(audio_bytes_or_path)
+                    tmp_path = tmp.name
+                try:
+                    res = model.transcribe(tmp_path)
+                    text = res.get("text", "").strip()
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+            else:
+                res = model.transcribe(str(audio_bytes_or_path))
+                text = res.get("text", "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+        # 3. Try OpenAI Audio API if API key is configured
+        if getattr(settings, "openai_api_key", ""):
+            try:
+                import httpx
+                if isinstance(audio_bytes_or_path, (bytes, bytearray)):
+                    raw_bytes = bytes(audio_bytes_or_path)
+                else:
+                    raw_bytes = Path(audio_bytes_or_path).read_bytes()
+                files = {"file": ("audio" + suffix, raw_bytes, "audio/octet-stream")}
+                data = {"model": "whisper-1"}
+                first_key = settings.openai_api_key.split(",")[0].strip()
+                headers = {"Authorization": f"Bearer {first_key}"}
+                url = "https://api.openai.com/v1/audio/transcriptions"
+                with httpx.Client(timeout=30.0) as client:
+                    r = client.post(url, headers=headers, data=data, files=files)
+                if r.status_code == 200:
+                    text = r.json().get("text", "").strip()
+                    if text:
+                        return text
+            except Exception as e:
+                logger.warning("OpenAI whisper transcription failed: %s", e)
+
+        raise VoiceUnavailableError(
+            "Cactus Whistle is not installed (pip install servo[cactus]), "
+            "and no local Whisper or OpenAI transcription backend is available."
+        )
 
     def ingest_voice_task(
         self,

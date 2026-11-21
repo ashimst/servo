@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import secrets
@@ -363,6 +364,11 @@ class SendBody(BaseModel):
     text: str
 
 
+class VoiceTranscribeBody(BaseModel):
+    audio_b64: str
+    auto_send: bool = False
+
+
 class ConfigBody(BaseModel):
     provider: str
     model: Optional[str] = None
@@ -473,6 +479,62 @@ def create_app(session: CopilotSession) -> FastAPI:
             return {"run_id": session.send(body.text)}
         except (ValueError, RuntimeError) as e:
             raise HTTPException(status_code=409, detail=str(e))
+
+    @app.get("/api/voice/status")
+    def voice_status(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        backend = "none"
+        available = False
+        try:
+            import cactus  # type: ignore
+            if hasattr(cactus, "transcribe"):
+                backend = "cactus"
+                available = True
+        except ImportError:
+            pass
+        if not available:
+            try:
+                import faster_whisper  # type: ignore
+                backend = "faster_whisper"
+                available = True
+            except ImportError:
+                pass
+        if not available:
+            try:
+                import whisper  # type: ignore
+                backend = "whisper"
+                available = True
+            except ImportError:
+                pass
+        if not available and getattr(settings, "openai_api_key", ""):
+            backend = "openai"
+            available = True
+        return {
+            "available": available,
+            "backend": backend,
+            "web_speech_supported": True,
+        }
+
+    @app.post("/api/voice/transcribe")
+    def voice_transcribe(body: VoiceTranscribeBody, x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        if not body.audio_b64:
+            raise HTTPException(status_code=400, detail="Empty audio data.")
+        try:
+            audio_bytes = base64.b64decode(body.audio_b64, validate=True)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 audio: {e}")
+        try:
+            from servo.daemon.voice import voice_manager, VoiceUnavailableError
+            text = voice_manager.transcribe_audio(audio_bytes)
+            run_id = None
+            if body.auto_send and text:
+                run_id = session.send(text)
+            return {"text": text, "run_id": run_id, "status": "ok"}
+        except VoiceUnavailableError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"ASR transcription error: {e}")
 
     @app.post("/api/stop")
     def stop(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:

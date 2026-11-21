@@ -291,6 +291,49 @@ textarea::placeholder { color: var(--ink-3); }
 }
 .send:disabled { opacity: .35; cursor: default; }
 .send.stop { background: var(--fail); color: #fff; }
+
+/* ---------- voice ASR ---------- */
+.voice-btn {
+  width: 34px; height: 34px; border-radius: 10px; border: 0; cursor: pointer; display: grid; place-items: center;
+  background: transparent; color: var(--ink-2); transition: all .15s ease; flex-shrink: 0;
+}
+.voice-btn:hover { background: var(--line); color: var(--ink); }
+.voice-btn:disabled { opacity: .35; cursor: default; }
+.voice-btn.listening {
+  background: #ef4444 !important; color: #fff !important;
+  box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+  animation: pulse-ring 1.4s infinite cubic-bezier(0.24, 0, 0.38, 1);
+}
+.voice-btn.transcribing {
+  background: #f59e0b !important; color: #fff !important;
+  animation: spin 1s linear infinite;
+}
+@keyframes pulse-ring {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+  70% { transform: scale(1.05); box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.voice-wave {
+  display: none; align-items: center; gap: 3px; height: 20px; margin: 0 2px 7px 0;
+}
+.voice-wave.active { display: flex; }
+.voice-wave span {
+  display: inline-block; width: 3px; background: #ef4444; border-radius: 2px;
+  animation: wave 0.8s ease-in-out infinite;
+}
+.voice-wave span:nth-child(1) { height: 6px; animation-delay: 0.1s; }
+.voice-wave span:nth-child(2) { height: 16px; animation-delay: 0.25s; }
+.voice-wave span:nth-child(3) { height: 10px; animation-delay: 0.4s; }
+.voice-wave span:nth-child(4) { height: 14px; animation-delay: 0.15s; }
+@keyframes wave {
+  0%, 100% { transform: scaleY(0.3); }
+  50% { transform: scaleY(1.3); }
+}
+
 .hint { color: var(--ink-3); font-size: 11.5px; margin: 6px 4px 0; display: flex; justify-content: space-between; }
 .conn { display: none; }
 .conn.down { display: inline; color: var(--fail); }
@@ -402,11 +445,22 @@ textarea::placeholder { color: var(--ink-3); }
 <footer>
   <form class="composer" id="form">
     <textarea id="input" rows="1" placeholder="Tell Servo what to do…" aria-label="Request"></textarea>
+    <div class="voice-wave" id="voiceWave" aria-hidden="true">
+      <span></span><span></span><span></span><span></span>
+    </div>
+    <button class="voice-btn" id="voiceBtn" type="button" title="Voice Input (ASR) · Alt+V" aria-label="Voice input">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+        <line x1="12" y1="19" x2="12" y2="22"/>
+        <line x1="8" y1="22" x2="16" y2="22"/>
+      </svg>
+    </button>
     <button class="send" id="send" type="submit" title="Send (Enter)" aria-label="Send">
       <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 8.5 14 2l-3.8 12-2.4-5.1z"/></svg>
     </button>
   </form>
-  <div class="hint"><span id="hint">Enter to send · Shift+Enter for a new line</span>
+  <div class="hint"><span id="hint">Enter to send · Shift+Enter for newline · Alt+V for Voice ASR</span>
     <span><span class="conn" id="conn">Reconnecting…</span>
     <label class="switch" title="Pause before every step and wait for Next"><input type="checkbox" id="stepMode"> Step by step</label></span></div>
 </footer>
@@ -833,6 +887,165 @@ textarea::placeholder { color: var(--ink-3); }
   $("#stepMode").onchange = (e) => api("/api/step_mode", { on: e.target.checked }).catch(() => {});
   document.querySelectorAll(".chip").forEach((c) => c.onclick = () => submit(c.dataset.cmd));
   function autosize() { input.style.height = "auto"; input.style.height = Math.min(140, input.scrollHeight) + "px"; }
+
+  // ---------- voice ASR ----------
+  const voiceBtn = $("#voiceBtn"), voiceWave = $("#voiceWave");
+  let isListening = false, recognition = null, mediaRecorder = null, audioChunks = [];
+  const hasWebSpeech = ("webkitSpeechRecognition" in window) || ("SpeechRecognition" in window);
+
+  function setVoiceState(state) {
+    if (state === "listening") {
+      isListening = true;
+      voiceBtn.classList.add("listening");
+      voiceBtn.classList.remove("transcribing");
+      voiceWave.classList.add("active");
+      voiceBtn.title = "Listening... Click to stop (Alt+V)";
+      input.placeholder = "Listening... Speak to Servo";
+    } else if (state === "transcribing") {
+      isListening = false;
+      voiceBtn.classList.remove("listening");
+      voiceBtn.classList.add("transcribing");
+      voiceWave.classList.remove("active");
+      voiceBtn.title = "Transcribing audio...";
+      input.placeholder = "Transcribing speech...";
+    } else {
+      isListening = false;
+      voiceBtn.classList.remove("listening", "transcribing");
+      voiceWave.classList.remove("active");
+      voiceBtn.title = "Voice Input (ASR) · Alt+V";
+      input.placeholder = "Tell Servo what to do…";
+    }
+  }
+
+  function startWebSpeech() {
+    try {
+      const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+      recognition = new SpeechRec();
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.lang = navigator.language || "en-US";
+
+      let initialText = input.value;
+      recognition.onstart = () => setVoiceState("listening");
+      recognition.onresult = (e) => {
+        let interim = "", final = "";
+        for (let i = e.resultIndex; i < e.results.length; ++i) {
+          if (e.results[i].isFinal) final += e.results[i][0].transcript;
+          else interim += e.results[i][0].transcript;
+        }
+        if (final) {
+          input.value = (initialText ? initialText.trim() + " " : "") + final.trim();
+        } else if (interim) {
+          input.value = (initialText ? initialText.trim() + " " : "") + interim;
+        }
+        autosize();
+        sendBtn.disabled = !input.value.trim();
+      };
+      recognition.onerror = (e) => {
+        console.warn("SpeechRecognition error:", e.error);
+        if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+          stopVoice();
+          startMediaRecorder();
+          return;
+        }
+        stopVoice();
+      };
+      recognition.onend = () => {
+        stopVoice();
+        input.focus();
+      };
+      recognition.start();
+    } catch (err) {
+      console.warn("Could not start Web Speech, falling back to MediaRecorder:", err);
+      startMediaRecorder();
+    }
+  }
+
+  async function startMediaRecorder() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      alert("Microphone capture is not supported in this browser environment.");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunks = [];
+      const mimeType = (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported("audio/webm;codecs=opus"))
+        ? "audio/webm;codecs=opus"
+        : ((window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported("audio/webm")) ? "audio/webm" : "");
+      mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunks.push(e.data);
+      };
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop());
+        if (!audioChunks.length) {
+          setVoiceState("idle");
+          return;
+        }
+        setVoiceState("transcribing");
+        const blobType = mediaRecorder.mimeType || "audio/webm";
+        const audioBlob = new Blob(audioChunks, { type: blobType });
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+          try {
+            const b64 = (reader.result || "").split(",")[1];
+            if (!b64) throw new Error("Audio buffer conversion failed");
+            const res = await api("/api/voice/transcribe", { audio_b64: b64 });
+            if (res && res.text) {
+              input.value = (input.value ? input.value.trim() + " " : "") + res.text.trim();
+              autosize();
+              sendBtn.disabled = !input.value.trim();
+            }
+          } catch (err) {
+            console.error("ASR transcription error:", err);
+            const run = ensureRun("local-" + Date.now(), "Voice ASR");
+            run.reply.classList.remove("pending");
+            run.reply.classList.add("fail");
+            run.reply.textContent = "ASR Voice Error: " + err.message;
+          } finally {
+            setVoiceState("idle");
+            input.focus();
+          }
+        };
+        reader.readAsDataURL(audioBlob);
+      };
+      mediaRecorder.start();
+      setVoiceState("listening");
+    } catch (err) {
+      console.error("Microphone access error:", err);
+      alert("Could not access microphone: " + err.message);
+      setVoiceState("idle");
+    }
+  }
+
+  function stopVoice() {
+    if (recognition) {
+      try { recognition.stop(); } catch (_) {}
+      recognition = null;
+    }
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      try { mediaRecorder.stop(); } catch (_) {}
+    }
+    setVoiceState("idle");
+  }
+
+  function toggleVoice() {
+    if (isListening) stopVoice();
+    else if (hasWebSpeech) startWebSpeech();
+    else startMediaRecorder();
+  }
+
+  voiceBtn.onclick = (e) => {
+    e.preventDefault();
+    toggleVoice();
+  };
+
+  document.addEventListener("keydown", (e) => {
+    if (e.altKey && (e.key === "v" || e.key === "V")) {
+      e.preventDefault();
+      toggleVoice();
+    }
+  });
 
   // ---------- utils ----------
   function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
