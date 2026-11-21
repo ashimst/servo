@@ -19,6 +19,7 @@ copilot can show the full trace:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -34,6 +35,24 @@ from servo.cognition.trace import NullTracer, Tracer
 from servo.config import settings
 
 logger = logging.getLogger("servo.system2")
+
+
+def parse_api_keys(raw: Optional[str]) -> List[str]:
+    """Split comma, semicolon, or newline delimited API keys for multi-key pool failover."""
+    if not raw:
+        return []
+    parts = re.split(r"[,;\n\r]+", raw.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+@dataclass
+class ProviderCandidate:
+    provider: str
+    api_key: str = ""
+    model: str = ""
+    base_url: str = ""
+    name: str = ""
+
 
 
 class System2Unavailable(RuntimeError):
@@ -146,12 +165,20 @@ def build_plan_prompt(
     failure: Optional[Dict[str, Any]] = None,
     user_name: str = "User",
     round_no: int = 1,
+    memory_context: Optional[str] = None,
 ) -> str:
     from servo.cognition.needle import known_folder
     from servo.cognition.windows_context import windows_context
 
     ctx = windows_context.retrieve_context(goal)
     ctx_block = ctx.to_prompt_text()
+
+    if memory_context is None:
+        try:
+            from servo.cognition.memory import chat_memory
+            memory_context = chat_memory.to_prompt_context(query=goal)
+        except Exception:
+            memory_context = ""
 
     lines = [
         f"User name: {user_name}",
@@ -161,6 +188,8 @@ def build_plan_prompt(
         f"Round: {round_no}",
         ctx_block,
     ]
+    if memory_context:
+        lines.append(memory_context)
     if completed:
         lines.append("Already done (in order):\n" + "\n".join(f"- {c}" for c in completed))
         if not failure:
@@ -320,8 +349,13 @@ class System2:
             return res
 
     def chat(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> System2Result:
-        convo = "\n".join(f"{m['role']}: {m['text']}" for m in (history or [])[-6:])
-        prompt = (convo + "\n" if convo else "") + f"user: {message}"
+        try:
+            from servo.cognition.memory import chat_memory
+            mem_text = chat_memory.to_prompt_context(query=message)
+        except Exception:
+            convo = "\n".join(f"{m['role']}: {m['text']}" for m in (history or [])[-6:])
+            mem_text = (convo + "\n" if convo else "")
+        prompt = (mem_text + "\n" if mem_text else "") + f"user: {message}"
         with self.tracer.span("model", "System 2 · chat", tier="system2", provider=self.provider) as sp:
             res = self._complete(CHAT_SYSTEM.format(name=self.user_name), prompt, json_mode=False, max_tokens=600)
             res.reply = res.raw.strip()
@@ -333,33 +367,124 @@ class System2:
 
     def _complete(self, system: str, user: str, json_mode: bool, max_tokens: int = 16000) -> System2Result:
         t0 = time.perf_counter()
-        if self.provider == "anthropic":
-            res = self._anthropic(system, user, max_tokens)
-        elif self.provider == "openai":
-            res = self._openai(system, user, json_mode)
-        elif self.provider == "gemini":
-            res = self._gemini(system, user, json_mode)
-        elif self.provider == "cactus":
-            res = self._cactus(system, user)
-        else:
+        if self.provider in ("none", "passthrough"):
             raise System2Unavailable(
                 f"No System 2 provider configured (SERVO_PLANNER_PROVIDER={self.provider!r}). "
                 "Set it to anthropic, openai (Ollama/any OpenAI-compatible server), gemini or cactus."
             )
-        res.latency_ms = int((time.perf_counter() - t0) * 1000)
-        return res
 
-    def _anthropic(self, system: str, user: str, max_tokens: int) -> System2Result:
+        candidates: List[ProviderCandidate] = []
+
+        # 1. Primary provider candidates (all keys configured for primary provider)
+        if self.provider == "anthropic":
+            keys = parse_api_keys(settings.anthropic_api_key) or [""]
+            for i, k in enumerate(keys):
+                name = f"anthropic[key_{i+1}]" if len(keys) > 1 else "anthropic"
+                candidates.append(ProviderCandidate(
+                    provider="anthropic", api_key=k, model=settings.anthropic_model, name=name
+                ))
+        elif self.provider == "gemini":
+            keys = parse_api_keys(settings.gemini_api_key) or [""]
+            for i, k in enumerate(keys):
+                name = f"gemini[key_{i+1}]" if len(keys) > 1 else "gemini"
+                candidates.append(ProviderCandidate(
+                    provider="gemini", api_key=k, model=settings.gemini_model, name=name
+                ))
+        elif self.provider == "openai":
+            keys = parse_api_keys(settings.openai_api_key) or [""]
+            for i, k in enumerate(keys):
+                name = f"openai[key_{i+1}:{settings.openai_model}]" if len(keys) > 1 else f"openai[{settings.openai_model}]"
+                candidates.append(ProviderCandidate(
+                    provider="openai", api_key=k, model=settings.openai_model, base_url=settings.openai_base_url, name=name
+                ))
+        elif self.provider == "cactus":
+            candidates.append(ProviderCandidate(
+                provider="cactus", model=settings.cactus_engine_model, name="cactus"
+            ))
+
+        # 2. Backup cloud providers if alternative keys are configured
+        if self.provider != "anthropic" and settings.anthropic_api_key:
+            for i, k in enumerate(parse_api_keys(settings.anthropic_api_key)):
+                candidates.append(ProviderCandidate(
+                    provider="anthropic", api_key=k, model=settings.anthropic_model, name=f"anthropic_backup[key_{i+1}]"
+                ))
+        if self.provider != "gemini" and settings.gemini_api_key:
+            for i, k in enumerate(parse_api_keys(settings.gemini_api_key)):
+                candidates.append(ProviderCandidate(
+                    provider="gemini", api_key=k, model=settings.gemini_model, name=f"gemini_backup[key_{i+1}]"
+                ))
+        if self.provider != "openai" and settings.openai_api_key:
+            for i, k in enumerate(parse_api_keys(settings.openai_api_key)):
+                candidates.append(ProviderCandidate(
+                    provider="openai", api_key=k, model=settings.openai_model, base_url=settings.openai_base_url, name=f"openai_backup[key_{i+1}]"
+                ))
+
+        # 3. Default local small model on Ollama (tailored for 4GB VRAM devices)
+        local_model = getattr(settings, "default_local_model", "llama3.2:1b")
+        already_has_local = any(
+            c.provider == "openai" and c.model == local_model and "11434" in c.base_url
+            for c in candidates
+        )
+        if not already_has_local:
+            candidates.append(ProviderCandidate(
+                provider="openai",
+                api_key="",
+                model=local_model,
+                base_url="http://localhost:11434/v1",
+                name=f"local_default[{local_model}]",
+            ))
+
+        if not candidates:
+            raise System2Unavailable(
+                f"No System 2 provider configured (SERVO_PLANNER_PROVIDER={self.provider!r}). "
+                "Set it to anthropic, openai (Ollama/any OpenAI-compatible server), gemini or cactus."
+            )
+
+        errors: List[str] = []
+        for idx, cand in enumerate(candidates):
+            try:
+                if cand.provider == "anthropic":
+                    res = self._anthropic(system, user, max_tokens, api_key=cand.api_key, model=cand.model)
+                elif cand.provider == "openai":
+                    res = self._openai(system, user, json_mode, api_key=cand.api_key, model=cand.model, base_url=cand.base_url)
+                elif cand.provider == "gemini":
+                    res = self._gemini(system, user, json_mode, api_key=cand.api_key, model=cand.model)
+                elif cand.provider == "cactus":
+                    res = self._cactus(system, user)
+                else:
+                    continue
+                res.latency_ms = int((time.perf_counter() - t0) * 1000)
+                return res
+            except Exception as e:
+                err_str = f"{cand.name}: {e}"
+                errors.append(err_str)
+                logger.warning("System 2 candidate %s failed: %s", cand.name, e)
+                if idx < len(candidates) - 1:
+                    next_cand = candidates[idx + 1]
+                    self.tracer.emit(
+                        "model",
+                        f"Failover: {cand.name} failed ({e}); switching to {next_cand.name}...",
+                        tier="system2",
+                        candidate_failed=cand.name,
+                        candidate_next=next_cand.name,
+                    )
+
+        raise System2Unavailable(
+            "All System 2 providers/keys in failover pool failed:\n" + "\n".join(f"- {err}" for err in errors)
+        )
+
+    def _anthropic(self, system: str, user: str, max_tokens: int, api_key: str = "", model: str = "") -> System2Result:
         try:
             import anthropic
         except ImportError as e:
             raise System2Unavailable("The 'anthropic' package is not installed: pip install servo[anthropic]") from e
-        client = anthropic.Anthropic(api_key=settings.anthropic_api_key or None, timeout=120.0)
-        model = settings.anthropic_model or "claude-opus-5-5"
+        key = api_key or settings.anthropic_api_key or None
+        client = anthropic.Anthropic(api_key=key, timeout=120.0)
+        mdl = model or settings.anthropic_model or "claude-opus-5-5"
         try:
             # Streaming keeps long thinking turns clear of HTTP timeouts.
             with client.beta.messages.stream(
-                model=model,
+                model=mdl,
                 max_tokens=max_tokens,
                 system=system,
                 thinking={"type": "adaptive", "display": "summarized"},
@@ -387,18 +512,21 @@ class System2:
             meta={"stop_reason": msg.stop_reason, "usage": msg.usage.model_dump() if msg.usage else {}},
         )
 
-    def _openai(self, system: str, user: str, json_mode: bool) -> System2Result:
+    def _openai(self, system: str, user: str, json_mode: bool, api_key: str = "", model: str = "", base_url: str = "") -> System2Result:
+        key = api_key if api_key != "" else settings.openai_api_key
+        mdl = model or settings.openai_model or getattr(settings, "default_local_model", "llama3.2:1b")
+        b_url = base_url or settings.openai_base_url or "http://localhost:11434/v1"
         headers = {"Content-Type": "application/json"}
-        if settings.openai_api_key:
-            headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
         payload: Dict[str, Any] = {
-            "model": settings.openai_model,
+            "model": mdl,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "temperature": 0.1,
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-        url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
+        url = f"{b_url.rstrip('/')}/chat/completions"
         try:
             with httpx.Client(timeout=90.0) as client:
                 r = client.post(url, headers=headers, json=payload)
@@ -408,17 +536,19 @@ class System2:
             r.raise_for_status()
             msg = r.json()["choices"][0]["message"]
         except httpx.HTTPError as e:
-            raise System2Unavailable(f"OpenAI-compatible endpoint {settings.openai_base_url} failed: {e}") from e
+            raise System2Unavailable(f"OpenAI-compatible endpoint {b_url} failed: {e}") from e
         except (KeyError, IndexError, ValueError) as e:
-            raise System2Unavailable(f"Unexpected response from {settings.openai_base_url}: {e}") from e
+            raise System2Unavailable(f"Unexpected response from {b_url}: {e}") from e
         content, think = _split_think(msg.get("content") or "")
         reasoning = msg.get("reasoning_content") or msg.get("reasoning") or think
-        return System2Result(raw=content, reasoning=str(reasoning or ""), provider="openai", model=settings.openai_model)
+        return System2Result(raw=content, reasoning=str(reasoning or ""), provider="openai", model=mdl)
 
-    def _gemini(self, system: str, user: str, json_mode: bool) -> System2Result:
-        if not settings.gemini_api_key:
+    def _gemini(self, system: str, user: str, json_mode: bool, api_key: str = "", model: str = "") -> System2Result:
+        key = api_key or settings.gemini_api_key
+        if not key:
             raise System2Unavailable("SERVO_GEMINI_API_KEY is not set.")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent"
+        mdl = model or settings.gemini_model or "gemini-2.0-flash"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{mdl}:generateContent"
         gen: Dict[str, Any] = {"temperature": 0.2, "thinkingConfig": {"includeThoughts": True}}
         if json_mode:
             gen["responseMimeType"] = "application/json"
@@ -429,14 +559,14 @@ class System2:
         }
         try:
             with httpx.Client(timeout=90.0) as client:
-                r = client.post(url, headers={"x-goog-api-key": settings.gemini_api_key}, json=payload)
+                r = client.post(url, headers={"x-goog-api-key": key}, json=payload)
             r.raise_for_status()
             parts = r.json()["candidates"][0]["content"]["parts"]
         except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
             raise System2Unavailable(f"Gemini request failed: {e}") from e
         text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
         thoughts = "\n".join(p.get("text", "") for p in parts if p.get("thought"))
-        return System2Result(raw=text, reasoning=thoughts, provider="gemini", model=settings.gemini_model)
+        return System2Result(raw=text, reasoning=thoughts, provider="gemini", model=mdl)
 
     def _cactus(self, system: str, user: str) -> System2Result:
         try:

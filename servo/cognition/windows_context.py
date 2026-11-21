@@ -59,10 +59,15 @@ class WindowsContextResult(BaseModel):
     matched_installed_apps: List[AppInfo] = Field(default_factory=list)
     uninstalled_apps: List[AppInfo] = Field(default_factory=list)
     matched_capabilities: List[WindowsCapability] = Field(default_factory=list)
+    device_state: Optional[Any] = None
 
     def to_prompt_text(self) -> str:
         """Render a concise, high-density context block for System 2 planning."""
-        lines = ["[Windows Desktop Context]"]
+        lines = []
+        if self.device_state is not None and hasattr(self.device_state, "to_prompt_text"):
+            lines.append(self.device_state.to_prompt_text())
+
+        lines.append("[Windows Desktop Context]")
 
         # 1. Active Windows
         if self.active_windows:
@@ -458,12 +463,20 @@ class WindowsContextEngine:
 
         matched_caps.sort(key=lambda c: sum(1 for kw in c.keywords if kw in q), reverse=True)
 
+        dev_state = None
+        try:
+            from servo.perception.device_state import get_device_state
+            dev_state = get_device_state()
+        except Exception as e:
+            logger.debug("Failed querying device state: %s", e)
+
         return WindowsContextResult(
             query=query,
             active_windows=active_windows[:limit],
             matched_installed_apps=matched_installed[:limit],
             uninstalled_apps=uninstalled[:limit],
             matched_capabilities=matched_caps[:limit],
+            device_state=dev_state,
         )
 
 

@@ -122,6 +122,7 @@ class CascadeRouter:
         context: str = "desktop",
         ask: Optional[AskFn] = None,
         step_mode: bool = False,
+        memory: Optional[Any] = None,
     ) -> None:
         self.tracer = tracer
         self.user_name = user_name
@@ -142,6 +143,14 @@ class CascadeRouter:
         self.title = windows.get_window_title(target_hwnd) if target_hwnd and windows.is_window(target_hwnd) else ""
         self.exclude_hwnds = exclude_hwnds
         self.history = history or []
+        if memory is not None:
+            self.memory = memory
+        else:
+            try:
+                from servo.cognition.memory import chat_memory
+                self.memory = chat_memory
+            except Exception:
+                self.memory = None
         self.context = context  # "desktop" | "browser"
         self.goal = ""
         self._reports: List[StepExecutionReport] = []
@@ -158,6 +167,11 @@ class CascadeRouter:
         counters = {"replans": 0, "rounds": 0}
 
         def finish(success: bool, reply: str, route: str, aborted: bool = False) -> RunOutcome:
+            if self.memory is not None:
+                try:
+                    self.memory.add_turn("assistant", reply, run_id=tr.run_id, route=route)
+                except Exception:
+                    pass
             out = RunOutcome(
                 run_id=tr.run_id, goal=self.goal, success=success, reply=reply, route=route, steps=records,
                 replans=counters["replans"], aborted=aborted, latency_ms=int((time.perf_counter() - t0) * 1000),
@@ -167,6 +181,12 @@ class CascadeRouter:
                     rounds=counters["rounds"], steps=len(records))
             self._record_telemetry(out)
             return out
+
+        if self.memory is not None:
+            try:
+                self.memory.add_turn("user", self.goal, run_id=tr.run_id)
+            except Exception:
+                pass
 
         # 0. Conversation and desktop introspection never need a model.
         if self.brain is not None:
@@ -378,6 +398,14 @@ class CascadeRouter:
 
     def _confirm(self, req: ConfirmationRequest) -> bool:
         """Risky action: Proceed / Skip this step / Stop."""
+        if self.confirmation_callback is not None:
+            try:
+                approved = bool(self.confirmation_callback(req))
+                if not approved and self._skip_requested:
+                    self.tracer.emit("decision", "You skipped this step", req.tool_call, tier="kev", status="warn")
+                return approved
+            except Exception:
+                pass
         if self.ask is not None:
             choice = self._ask("confirm", req.model_dump(), ["proceed", "skip", "stop"], default="stop")
             if choice == "skip":
@@ -388,11 +416,6 @@ class CascadeRouter:
                 self.abort_event.set()
                 return False
             return choice == "proceed"
-        if self.confirmation_callback is not None:
-            try:
-                return bool(self.confirmation_callback(req))
-            except Exception:
-                return False
         return False
 
     # ============================================================ execution

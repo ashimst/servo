@@ -149,7 +149,9 @@ class ServoConfig(BaseSettings):
     planner_provider: Literal["openai", "anthropic", "gemini", "cactus", "passthrough", "none"] = "openai"
     openai_api_key: str = ""
     openai_base_url: str = "http://localhost:11434/v1"
-    openai_model: str = "qwen2.5-coder:7b"
+    # Default model chosen specifically to fit 4GB VRAM local GPU budgets
+    openai_model: str = "llama3.2:1b"
+    default_local_model: str = "llama3.2:1b"
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-opus-5-5"
     gemini_api_key: str = ""

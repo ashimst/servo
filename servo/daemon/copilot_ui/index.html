@@ -191,6 +191,19 @@ main { flex: 1; overflow-y: auto; padding: 14px 14px 24px; scroll-behavior: smoo
 
 .confirm.step { border-color: var(--focus); }
 .confirm.step .btn.primary { background: var(--focus); border-color: var(--focus); color: #0b1430; }
+.confirm.high-risk {
+  border: 2px solid var(--fail);
+  background: rgba(255, 111, 111, 0.12);
+  box-shadow: 0 0 24px rgba(255, 111, 111, 0.35);
+  animation: pulse-high-risk 2s infinite;
+}
+.confirm.high-risk h3 { color: var(--fail); font-weight: 700; font-size: 15px; }
+.confirm.high-risk .btn.primary { background: var(--fail); border-color: var(--fail); color: #fff; }
+@keyframes pulse-high-risk {
+  0% { box-shadow: 0 0 10px rgba(255, 111, 111, 0.2); }
+  50% { box-shadow: 0 0 24px rgba(255, 111, 111, 0.45); }
+  100% { box-shadow: 0 0 10px rgba(255, 111, 111, 0.2); }
+}
 .confirm .stepof { color: var(--ink-3); font-size: 12px; margin: 0 0 6px; }
 .btn.stop { color: var(--fail); }
 .confirm .row { flex-wrap: wrap; }
@@ -324,33 +337,33 @@ textarea::placeholder { color: var(--ink-3); }
   <form id="setupForm">
     <fieldset class="choices">
       <label class="choice"><input type="radio" name="prov" value="anthropic"><b>Claude</b>
-        <small>Anthropic API key. Strongest planning; shows its reasoning.</small>
+        <small>Anthropic API key. Strongest planning; shows its reasoning (multi-key failover supported).</small>
         <div class="fields">
-          <label>API key<input name="anthropic_key" type="password" autocomplete="off" placeholder="sk-ant-…"></label>
+          <label>API key<input name="anthropic_key" type="password" autocomplete="off" placeholder="sk-ant-… (separate multiple keys with commas)"></label>
           <label>Model<input name="anthropic_model" placeholder="claude-opus-5-5"></label>
           <p class="note" id="anthropicNote"></p>
         </div>
       </label>
       <label class="choice"><input type="radio" name="prov" value="ollama"><b>Ollama on this PC</b>
-        <small>Free and private. Needs Ollama running with a model pulled.</small>
+        <small>Free and private. Lightweight default for 4GB VRAM GPU (llama3.2:1b). Automatic failover fallback.</small>
         <div class="fields">
           <label>Model<select name="ollama_model"></select></label>
           <p class="note" id="ollamaNote"></p>
         </div>
       </label>
       <label class="choice"><input type="radio" name="prov" value="gemini"><b>Gemini</b>
-        <small>Google AI Studio API key.</small>
+        <small>Google AI Studio API key (multi-key failover supported).</small>
         <div class="fields">
-          <label>API key<input name="gemini_key" type="password" autocomplete="off"></label>
+          <label>API key<input name="gemini_key" type="password" autocomplete="off" placeholder="AIza… (separate multiple keys with commas)"></label>
           <label>Model<input name="gemini_model" placeholder="gemini-2.0-flash"></label>
           <p class="note" id="geminiNote"></p>
         </div>
       </label>
       <label class="choice"><input type="radio" name="prov" value="openai"><b>Other OpenAI-compatible server</b>
-        <small>LM Studio, vLLM, OpenRouter, OpenAI…</small>
+        <small>LM Studio, vLLM, OpenRouter, OpenAI… (multi-key failover supported)</small>
         <div class="fields">
           <label>Server URL<input name="openai_url" placeholder="https://api.openai.com/v1"></label>
-          <label>API key<input name="openai_key" type="password" autocomplete="off" placeholder="optional for local servers"></label>
+          <label>API key<input name="openai_key" type="password" autocomplete="off" placeholder="optional for local (separate multiple keys with commas)"></label>
           <label>Model<input name="openai_model"></label>
           <p class="note" id="openaiNote"></p>
         </div>
@@ -607,8 +620,10 @@ textarea::placeholder { color: var(--ink-3); }
     card.className = `confirm ${spec.cls}`; card.id = "c-" + msg.id; card.dataset.kind = msg.kind;
     let head = "", body = "";
     if (msg.kind === "confirm") {
-      head = `Allow this ${esc(p.risk_level || "")}-risk action?`;
-      body = `<p class="why">${esc(p.reason || "")}</p><code>${esc(p.tool_call || p.sub_goal || "")}</code>`;
+      const isHigh = p.risk_level === "high";
+      if (isHigh) card.classList.add("high-risk");
+      head = isHigh ? `⚠️ HIGH-RISK ACTION — User Confirmation Required` : `Allow this ${esc(p.risk_level || "")}-risk action?`;
+      body = `<p class="why">${isHigh ? "<b>Security Alert:</b> " : ""}${esc(p.reason || "")}</p><code>${esc(p.tool_call || p.sub_goal || "")}</code>`;
     } else if (msg.kind === "step") {
       head = `Next: ${esc(p.command || "")}`;
       body = `<p class="stepof">Step ${p.index} of ${p.total}</p>`;

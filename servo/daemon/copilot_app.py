@@ -91,15 +91,17 @@ class ForegroundTracker:
 class CopilotSession:
     def __init__(self, router_factory: Optional[Callable[..., Any]] = None) -> None:
         from servo.daemon.copilot import CopilotBrain, launch_or_focus_app
+        from servo.cognition.memory import chat_memory
 
         self.token = secrets.token_urlsafe(24)
         self.brain = CopilotBrain()
+        self.memory = chat_memory
         self.launcher = launch_or_focus_app
         self.router_factory = router_factory or CascadeRouter
         self.abort = threading.Event()
         self.busy = False
         self.current_run: Optional[str] = None
-        self.history: List[Dict[str, str]] = []
+        self.history: List[Dict[str, str]] = self.memory.get_recent_history()
         self.context = "desktop"
         self.target_hwnd: Optional[int] = None
         self._lock = threading.Lock()
@@ -219,7 +221,8 @@ class CopilotSession:
             self.abort.clear()
             run_id = new_run_id()
             self.current_run = run_id
-        self.history.append({"role": "user", "text": text})
+        self.memory.add_turn("user", text, run_id=run_id)
+        self.history = self.memory.get_recent_history()
         self.broadcast({"type": "run_started", "run_id": run_id, "text": text})
         threading.Thread(target=self._run, args=(run_id, text), name=f"servo-run-{run_id}", daemon=True).start()
         return run_id
@@ -256,7 +259,9 @@ class CopilotSession:
             self.target_hwnd = getattr(router, "hwnd", None) or self.target_hwnd
             self.context = getattr(router, "context", self.context)
             self.brain.active_hwnd = self.target_hwnd
-            self.history.append({"role": "assistant", "text": outcome.reply})
+            if outcome is not None:
+                self.memory.add_turn("assistant", outcome.reply, run_id=run_id, route=outcome.route)
+                self.history = self.memory.get_recent_history()
         except Exception as e:
             logger.exception("run failed")
             tracer.emit("error", "Run crashed", f"{e.__class__.__name__}: {e}", tier="copilot", status="fail")
@@ -318,7 +323,37 @@ class CopilotSession:
         return True
 
     def _confirm(self, req: ConfirmationRequest) -> bool:
-        """Plain yes/no confirmation for callers that only understand booleans."""
+        """Confirmation for risky actions.
+
+        For high-risk tasks, explicitly prompts the user with both an interactive
+        chat prompt and an OS-level top-most modal popup dialog so the user is directly
+        alerted on their desktop even if the Copilot window is unfocused.
+        """
+        if req.risk_level == "high" and sys.platform == "win32":
+            from servo.control.confirmation import DesktopDialogConfirmation
+            popup_dialog = DesktopDialogConfirmation(timeout_seconds=30.0)
+            popup_res: List[Optional[bool]] = [None]
+
+            def _show_popup():
+                try:
+                    popup_res[0] = popup_dialog(req)
+                except Exception as e:
+                    logger.debug("Desktop confirmation popup error: %s", e)
+
+            t = threading.Thread(target=_show_popup, name="servo-popup-confirm", daemon=True)
+            t.start()
+
+            choice = self.ask("confirm", req.model_dump(), ["proceed", "skip", "stop"], wait_s=30.0)
+            if choice == "proceed":
+                return True
+            if choice in ("skip", "stop"):
+                return False
+
+            t.join(timeout=0.5)
+            if popup_res[0] is not None:
+                return bool(popup_res[0])
+            return False
+
         return self.ask("confirm", req.model_dump(), ["proceed", "skip", "stop"]) == "proceed"
 
 
@@ -413,6 +448,23 @@ def create_app(session: CopilotSession) -> FastAPI:
     def get_state(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
         check(x_servo_token)
         return session.state()
+
+    @app.get("/api/memory")
+    def get_memory(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        return {
+            "entries_count": len(session.memory.entries),
+            "summary": session.memory.summary.model_dump(),
+            "recent_turns": session.memory.get_recent_history(limit=15),
+            "storage_path": str(session.memory.storage_path),
+        }
+
+    @app.post("/api/memory/clear")
+    def clear_memory(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        session.memory.clear()
+        session.history = []
+        return {"ok": True, "message": "Chat memory cleared."}
 
     @app.post("/api/send")
     def send(body: SendBody, x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
