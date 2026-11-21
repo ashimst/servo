@@ -204,6 +204,24 @@ def parse_grammar(text: str, user_name: str = "User") -> Optional[MacroPlan]:
         return None
     plan = parse_deterministic_intent(t, user_name=user_name)
     if plan and plan.steps and _plausible(plan):
+        # Validate that referenced applications are installed before blind Tier 1 launch
+        for s in plan.steps:
+            if s.tool_name == "launch_app":
+                app = str(s.arguments.get("app_name") or "")
+                try:
+                    from servo.cognition.windows_context import windows_context
+                    installed, _ = windows_context.is_installed(app)
+                    if not installed:
+                        web_fallback = windows_context.get_web_fallback(app)
+                        if web_fallback:
+                            return MacroPlan(
+                                goal=t,
+                                steps=[_step(1, "open_url", {"url": web_fallback}, f"Open {app.capitalize()} Web ({web_fallback})")],
+                            )
+                        # Not installed: let System 2 handle with Windows context
+                        return None
+                except Exception:
+                    pass
         return plan
     return None
 

@@ -77,6 +77,7 @@ Rules:
 - Prefer the browser commands ("go to", "search the web for") for anything on the web.
 - To save a file, use "save as <name>" (add "on the desktop" etc. for a folder).
 - If the request is only conversation, return no subtasks and answer in "reply".
+- Consult the [Windows Desktop Context] block in the prompt: it lists running windows, installed apps, and system settings. If an app is not installed locally, use its web version or explain to the user in "reply".
 - If something failed, do not repeat the same command unchanged; use the screen
   description to pick a different label or approach, or stop and explain in "reply".
 
@@ -147,6 +148,10 @@ def build_plan_prompt(
     round_no: int = 1,
 ) -> str:
     from servo.cognition.needle import known_folder
+    from servo.cognition.windows_context import windows_context
+
+    ctx = windows_context.retrieve_context(goal)
+    ctx_block = ctx.to_prompt_text()
 
     lines = [
         f"User name: {user_name}",
@@ -154,6 +159,7 @@ def build_plan_prompt(
         f"Desktop folder: {known_folder('desktop')}  |  Documents: {known_folder('documents')}",
         f"Goal: {goal}",
         f"Round: {round_no}",
+        ctx_block,
     ]
     if completed:
         lines.append("Already done (in order):\n" + "\n".join(f"- {c}" for c in completed))

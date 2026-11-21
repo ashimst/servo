@@ -151,20 +151,90 @@ def match_target(dets: List[Detection], target: str) -> Tuple[Optional[Detection
     return best, best_score, ranked
 
 
+def _run_windows_ocr(img: Image.Image) -> Optional[List[Detection]]:
+    """Native Windows OCR (WinRT via winsdk). Sub-100ms on Windows 10/11."""
+    import sys
+    if sys.platform != "win32":
+        return None
+    try:
+        import winsdk.windows.media.ocr as ocr
+        import winsdk.windows.graphics.imaging as imaging
+        import winsdk.windows.storage.streams as streams
+        import asyncio
+        import io
+
+        async def _rec():
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            writer = streams.DataWriter()
+            writer.write_bytes(buf.getvalue())
+            ras = streams.InMemoryRandomAccessStream()
+            await ras.write_async(writer.detach_buffer())
+            ras.seek(0)
+            dec = await imaging.BitmapDecoder.create_async(ras)
+            sb = await dec.get_software_bitmap_async()
+            eng = ocr.OcrEngine.try_create_from_user_profile_languages()
+            if not eng:
+                return []
+            res = await eng.recognize_async(sb)
+            dets: List[Detection] = []
+            for line in res.lines:
+                lt = line.text.strip()
+                if lt:
+                    xs = [w.bounding_rect.x for w in line.words]
+                    ys = [w.bounding_rect.y for w in line.words]
+                    x2s = [w.bounding_rect.x + w.bounding_rect.width for w in line.words]
+                    y2s = [w.bounding_rect.y + w.bounding_rect.height for w in line.words]
+                    if xs and ys:
+                        bbox = (int(min(xs)), int(min(ys)), int(max(x2s)), int(max(y2s)))
+                        dets.append(Detection(label=lt, bbox=bbox, kind="text", score=0.95))
+                if len(line.words) > 1:
+                    for w in line.words:
+                        wt = w.text.strip()
+                        if len(wt) >= 2:
+                            bx = (
+                                int(w.bounding_rect.x),
+                                int(w.bounding_rect.y),
+                                int(w.bounding_rect.x + w.bounding_rect.width),
+                                int(w.bounding_rect.y + w.bounding_rect.height),
+                            )
+                            dets.append(Detection(label=wt, bbox=bx, kind="text", score=0.90))
+            return dets
+
+        try:
+            return asyncio.run(_rec())
+        except RuntimeError:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                return ex.submit(lambda: asyncio.run(_rec())).result(timeout=5.0)
+    except Exception as e:
+        logger.debug("Native Windows OCR unavailable or failed: %s", e)
+        return None
+
+
 def describe_image(img: Image.Image) -> Optional[Dict[str, Any]]:
-    """Run Mirage on a PIL image. Returns raw JSON or None if Mirage is unavailable."""
+    """Run Mirage (Cactus or native Windows OCR) on a PIL image. Returns raw JSON or None."""
     from servo.cognition.cactus_runtime import get_mirage
 
     model = get_mirage()
-    if model is None:
-        return None
-    try:
-        rgb = img.convert("RGB")
-        raw = model.describe(rgb, sections=["objects", "text"], fields=["bbox"])
-        return raw if isinstance(raw, dict) else {"result": raw}
-    except Exception as e:
-        logger.warning("Mirage describe failed: %s", e)
-        return None
+    if model is not None:
+        try:
+            rgb = img.convert("RGB")
+            raw = model.describe(rgb, sections=["objects", "text"], fields=["bbox"])
+            return raw if isinstance(raw, dict) else {"result": raw}
+        except Exception as e:
+            logger.warning("Mirage describe failed: %s", e)
+
+    # Fallback to Native Windows OCR
+    ocr_dets = _run_windows_ocr(img)
+    if ocr_dets:
+        return {
+            "text": [
+                {"label": d.label, "bbox": list(d.bbox), "score": d.score}
+                for d in ocr_dets
+            ]
+        }
+    return None
 
 
 def summarize(dets: List[Detection], limit: int = 60) -> str:

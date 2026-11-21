@@ -43,7 +43,12 @@ def _import_cactus() -> Any:
 
 def status() -> Dict[str, Any]:
     """Report which Cactus capabilities are importable (does not load weights)."""
-    info: Dict[str, Any] = {"installed": False, "needle": False, "mirage": False, "engine": False, "version": None}
+    info: Dict[str, Any] = {"installed": False, "needle": False, "mirage": False, "engine": False, "version": None, "windows_ocr": False}
+    try:
+        import winsdk.windows.media.ocr  # noqa: F401
+        info["windows_ocr"] = True
+    except Exception:
+        pass
     try:
         cactus = _import_cactus()
     except Exception as e:

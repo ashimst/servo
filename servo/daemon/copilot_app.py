@@ -173,10 +173,13 @@ class CopilotSession:
                 return f"installed cactus package has no {label} (need cactus-compute >= 3.3)"
             return f"cactus-compute {cactus.get('version') or ''}".strip()
 
+        mirage_avail = bool(cactus.get("mirage")) or bool(cactus.get("windows_ocr"))
+        mirage_detail = "cactus-compute (Mirage)" if cactus.get("mirage") else ("Windows Media OCR (Native WinRT)" if cactus.get("windows_ocr") else cactus_detail("mirage", "Mirage"))
+
         return {
             "needle": {"available": bool(cactus.get("needle")), "detail": cactus_detail("needle", "Needle"),
                        "threshold": settings.needle_confidence_threshold},
-            "mirage": {"available": bool(cactus.get("mirage")), "detail": cactus_detail("mirage", "Mirage")},
+            "mirage": {"available": mirage_avail, "detail": mirage_detail},
             "kev": {"available": kev.model_enabled, "detail": settings.kev_url or "heuristic gate (set SERVO_KEV_URL)"},
             "browser": {"available": browser_mod.playwright_installed(), "detail": f"Playwright · {settings.browser_channel}"},
             "system2": {"available": s2["available"], "detail": f"{s2['provider']} · {s2['model']}".strip(" ·")},

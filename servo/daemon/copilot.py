@@ -72,6 +72,16 @@ APP_EXECUTABLE_MAP = {
 def resolve_app_executable(app_name: str) -> str:
     """Resolve full executable path for Windows apps using Registry App Paths and known locations."""
     app_key = app_name.strip().lower()
+
+    # 0. Check Windows Context Catalog (Start Menu & App Paths)
+    try:
+        from servo.cognition.windows_context import windows_context
+        installed, app_info = windows_context.is_installed(app_name)
+        if installed and app_info and app_info.executable and os.path.exists(app_info.executable):
+            return app_info.executable
+    except Exception:
+        pass
+
     exe_name = APP_EXECUTABLE_MAP.get(app_key, f"{app_key}.exe")
 
     # 1. Check if already absolute or in PATH
@@ -165,6 +175,17 @@ def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
     for w in windows.list_windows():
         if _matches_app(w, app_key, exe_filename):
             return _focus(w)
+
+    # 1.5. If the app is not installed, fail fast without waiting 8 seconds
+    if sys.platform == "win32":
+        if not (os.path.isabs(full_exe_path) and os.path.exists(full_exe_path)) and not shutil.which(full_exe_path):
+            try:
+                from servo.cognition.windows_context import windows_context
+                installed, _ = windows_context.is_installed(app_name)
+                if not installed:
+                    return None, f"Application '{app_name}' is not installed on this system."
+            except Exception:
+                pass
 
     # 2. Launch it
     try:
