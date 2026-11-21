@@ -1,7 +1,8 @@
-"""Floating On-Screen Desktop Copilot Chat Overlay (System 2 + System 1).
+"""Copilot brain and app-launch helpers.
 
-Always-on-top companion widget sitting on the screen edge, providing conversational
-chat, LLM macro planning (System 2), alias mapping, and verified reflex arc execution (System 1).
+The floating UI lives in servo.daemon.copilot_app; routing lives in
+servo.cognition.router. This module keeps the conversational shortcuts, the legacy
+process_message API, and Windows app resolution/launching.
 """
 
 from __future__ import annotations
@@ -19,13 +20,6 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
-
-try:
-    import tkinter as tk
-    from tkinter import ttk
-except ImportError:
-    tk = None  # type: ignore
-    ttk = None  # type: ignore
 
 from servo.actuation.alias_mapping import AliasMapper, CanonicalAction, CanonicalActionType
 from servo.config import settings
@@ -121,25 +115,58 @@ def resolve_app_executable(app_name: str) -> str:
     return exe_name
 
 
+# Apps whose window belongs to a different process than the executable we start.
+_PROCESS_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "terminal": ("windowsterminal.exe",),
+    "windows terminal": ("windowsterminal.exe",),
+    "calculator": ("calculatorapp.exe",),
+    "calc": ("calculatorapp.exe", "calculator.exe"),
+    "settings": ("systemsettings.exe",),
+    "paint": ("mspaint.exe",),
+    "photos": ("photos.exe",),
+    "file explorer": ("explorer.exe",),
+    "explorer": ("explorer.exe",),
+}
+
+
+def _matches_app(w: Dict[str, Any], app_key: str, exe_filename: str) -> bool:
+    """Match a window to an app by its PROCESS, not its title.
+
+    Title matching made "open notepad" focus an Edge tab whose title contained the
+    word "notepad". Titles are used only when the process name is unknown.
+    """
+    proc = str(w.get("process") or w.get("process_name") or "").lower()
+    title = str(w.get("title") or "").lower()
+    if "servo copilot" in title:
+        return False
+    if proc:
+        if proc in _PROCESS_ALIASES.get(app_key, ()):
+            return True
+        stem = proc[:-4] if proc.endswith(".exe") else proc
+        return proc == exe_filename or stem == app_key.replace(" ", "") or (len(app_key) >= 4 and app_key.replace(" ", "") in stem)
+    return app_key in title
+
+
 def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
     """Find an existing window for the app or launch it and return (hwnd, title)."""
     app_key = app_name.strip().lower()
     full_exe_path = resolve_app_executable(app_name)
     exe_filename = os.path.basename(full_exe_path).lower()
 
-    # 1. Check if window is already open
-    open_wins = windows.list_windows()
-    for w in open_wins:
-        proc = str(w.get("process") or w.get("process_name") or "").lower()
-        title = str(w.get("title") or "").lower()
-        if (app_key in proc) or (app_key in title) or (exe_filename in proc):
-            hwnd = int(w["hwnd"])
-            if sys.platform == "win32":
-                import ctypes
-                ctypes.windll.user32.SetForegroundWindow(hwnd)
-            return hwnd, str(w.get("title") or app_name)
+    def _focus(w: Dict[str, Any]) -> Tuple[int, str]:
+        hwnd = int(w["hwnd"])
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE if minimized
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        return hwnd, str(w.get("title") or app_name)
 
-    # 2. Launch the application
+    # 1. Already open?
+    for w in windows.list_windows():
+        if _matches_app(w, app_key, exe_filename):
+            return _focus(w)
+
+    # 2. Launch it
     try:
         if sys.platform == "win32":
             if os.path.isabs(full_exe_path) and os.path.exists(full_exe_path):
@@ -151,24 +178,13 @@ def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
     except Exception as e:
         return None, f"Failed to launch '{app_name}': {e}"
 
-    # Wait for the window to appear
-    for _ in range(30):
+    # 3. Wait for its window (Store apps like Notepad/Calculator run under a different
+    #    process than the stub we launched, so match by name, for up to 8 s).
+    for _ in range(40):
         time.sleep(0.2)
-        fresh_wins = windows.list_windows()
-        for w in fresh_wins:
-            proc = str(w.get("process") or w.get("process_name") or "").lower()
-            title = str(w.get("title") or "").lower()
-            if (app_key in proc) or (app_key in title) or (exe_filename in proc):
-                hwnd = int(w["hwnd"])
-                if sys.platform == "win32":
-                    import ctypes
-                    ctypes.windll.user32.SetForegroundWindow(hwnd)
-                return hwnd, str(w.get("title") or app_name)
-
-    # Fallback to foreground window
-    fg_hwnd = windows.get_foreground_window()
-    if fg_hwnd and windows.is_window(fg_hwnd):
-        return fg_hwnd, windows.get_window_title(fg_hwnd)
+        for w in windows.list_windows():
+            if _matches_app(w, app_key, exe_filename):
+                return _focus(w)
 
     return None, f"Window for '{app_name}' did not appear in time."
 
@@ -306,91 +322,89 @@ class CopilotBrain:
             pass
         return None
 
+    def conversational_reply(self, prompt: str) -> Optional[str]:
+        """Answer identity, small talk and desktop introspection locally (no model, no actuation)."""
+        p = prompt.strip()
+        p_lower = p.lower()
+
+        m_name = re.search(r"^(?:my name is|call me|i am|i'm)\s+([a-zA-Z0-9_\s]+)$", p, re.I)
+        if m_name and "how" not in p_lower and "what" not in p_lower:
+            name = m_name.group(1).strip()
+            self.user_name = name
+            return f"Nice to meet you, {name}! I'll remember that. What would you like me to do on your computer?"
+
+        if any(q in p_lower for q in ["what is my name", "what's my name", "who am i", "do you know my name"]):
+            return f"Your name is {self.user_name}! Let me know what you'd like me to help you with."
+
+        if any(w in p_lower for w in ["what windows are open", "what's on my screen", "what is on my screen", "list windows", "what is open", "show windows"]):
+            wins = windows.list_windows()
+            if not wins:
+                return "I couldn't find any visible application windows right now."
+            lines = ["Here are the open windows on your screen:"]
+            for w in wins[:6]:
+                marker = " (active target)" if w.get("hwnd") == self.active_hwnd else ""
+                lines.append(f"• {w.get('title', 'Untitled')}{marker}")
+            if len(wins) > 6:
+                lines.append(f"…and {len(wins) - 6} more.")
+            return "\n".join(lines)
+
+        if re.match(r"^(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|howdy)\b", p_lower):
+            return f"Hello {self.user_name}! I'm Servo. Tell me what to do on your computer, or just ask me something."
+
+        if re.match(r"^(?:how are you|how's it going|how are you doing)\b", p_lower):
+            return "All systems are running. What should we do?"
+
+        if re.match(r"^(?:who are you|what are you)\b", p_lower):
+            return ("I'm Servo, a local-first desktop copilot. Simple commands run on small on-device models; "
+                    "anything that needs reasoning goes to a larger model, and you can watch every decision in the trace.")
+
+        if re.match(r"^(?:what can you do|help|capabilities)\b", p_lower):
+            return (
+                "Try:\n"
+                "• open notepad and write hello world\n"
+                "• open calculator and click 7\n"
+                "• search the web for weather in Kathmandu\n"
+                "• go to github.com\n"
+                "• what windows are open?"
+            )
+        return None
+
+    def offline_chat_reply(self, prompt: str) -> str:
+        p_lower = prompt.lower()
+        if "joke" in p_lower:
+            return "Why do programmers prefer dark mode? Because light attracts bugs."
+        if "thank" in p_lower:
+            return "You're welcome."
+        return ("I can act on your screen — try “open notepad and write …”, “click …” or “search the web for …”. "
+                "For open-ended chat, configure a System 2 model (SERVO_PLANNER_PROVIDER).")
+
     def process_message(
         self,
         prompt: str,
         scene: Optional[SceneIndex] = None,
     ) -> Tuple[str, Optional[MacroPlan]]:
-        """Process user input: either a conversational response or a multi-step MacroPlan."""
+        """Legacy entry point: a reply, or a MacroPlan. Cheap tiers first.
+
+        The copilot UI uses servo.cognition.router.CascadeRouter instead; this remains for
+        API callers and tests. Order: local conversation → command grammar → System 2 LLM.
+        """
         p = prompt.strip()
-        p_lower = p.lower()
+        quick = self.conversational_reply(p)
+        if quick:
+            return quick, None
 
-        # 1. Identity & Name Learning
-        m_name = re.search(r"^(?:my name is|call me|i am|i'm)\s+([a-zA-Z0-9_\s]+)$", p, re.I)
-        if m_name and "how" not in p_lower and "what" not in p_lower:
-            name = m_name.group(1).strip()
-            self.user_name = name
-            return f"Nice to meet you, {name}! I'll remember that. What would you like me to do on your computer?", None
-
-        if any(q in p_lower for q in ["what is my name", "what's my name", "who am i", "do you know my name"]):
-            return f"Your name is {self.user_name}! Let me know what you'd like me to help you with.", None
-
-        # 2. Window & Desktop Introspection
-        if any(w in p_lower for w in ["what windows are open", "what's on my screen", "what is on my screen", "list windows", "what is open", "show windows"]):
-            wins = windows.list_windows()
-            if not wins:
-                return "I couldn't find any visible interactive application windows right now.", None
-            top_wins = wins[:6]
-            lines = ["Here are the open windows on your screen:"]
-            for w in top_wins:
-                t = w.get("title", "Untitled")
-                h = w.get("hwnd")
-                is_active = (h == self.active_hwnd)
-                marker = " 🎯 [Active]" if is_active else ""
-                lines.append(f"• {t} (HWND {h}){marker}")
-            if len(wins) > 6:
-                lines.append(f"...and {len(wins) - 6} more.")
-            return "\n".join(lines), None
-
-        # 3. Conversational Greetings & Small Talk
-        if re.match(r"^(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|howdy)\b", p_lower):
-            return f"Hello {self.user_name}! I'm Servo, your on-screen desktop copilot. Ask me anything or tell me what to do on your computer!", None
-
-        if re.match(r"^(?:how are you|how's it going|how are you doing)\b", p_lower):
-            return "I'm doing great and all systems are running smoothly! Ready to write notes, open apps, or chat about anything. What's on your mind?", None
-
-        if re.match(r"^(?:who are you|what are you)\b", p_lower):
-            return "I'm Servo, a local-first closed-loop desktop control copilot! You can chat with me about anything, or tell me to interact directly with your screen (typing, clicking, and managing apps).", None
-
-        if re.match(r"^(?:what can you do|help|capabilities)\b", p_lower):
-            return (
-                "Here are some things you can ask me to do:\n"
-                "• 'open notepad and write hello world'\n"
-                "• 'write my name'\n"
-                "• 'open calculator and click 7'\n"
-                "• 'what windows are open?'\n"
-                "• 'close notepad'\n"
-                "• Or just ask me any general question to chat!"
-            ), None
-
-        # 4. Attempt System 2 LLM Plan Generation
-        llm_plan = self.query_llm_for_plan(p, scene=scene)
-        if llm_plan and llm_plan.steps:
-            return f"Decomposed goal into {len(llm_plan.steps)} execution steps:", llm_plan
-
-        # 5. Deterministic Zero-Config Intent Parser (Small-Model Fallback)
         plan = self._parse_deterministic_plan(p)
         if plan and plan.steps:
             return f"Decomposed goal into {len(plan.steps)} execution steps:", plan
 
-        # 6. Conversational LLM or Knowledge Fallback
+        llm_plan = self.query_llm_for_plan(p, scene=scene)
+        if llm_plan and llm_plan.steps:
+            return f"Decomposed goal into {len(llm_plan.steps)} execution steps:", llm_plan
+
         llm_chat = self.query_llm_for_chat(p)
         if llm_chat:
             return llm_chat, None
-
-        if "python" in p_lower:
-            return "Python is a versatile programming language known for readability, powering backend services, machine learning, and automation runtimes like Servo!", None
-
-        if "joke" in p_lower:
-            return "Why do programmers prefer dark mode? Because light attracts bugs! 😄", None
-
-        if "thank" in p_lower:
-            return "You're very welcome! Let me know whenever you need anything else on your desktop.", None
-
-        return (
-            f"I hear you! I'm ready to help with that. If you'd like me to perform an action on your desktop, "
-            f"try: 'open notepad and write ...', 'click ...', or 'what windows are open?'."
-        ), None
+        return self.offline_chat_reply(p), None
 
     def _parse_deterministic_plan(self, p: str) -> Optional[MacroPlan]:
         """Deterministic System 2 plan decomposition for offline and edge execution."""
@@ -518,494 +532,10 @@ class CopilotBrain:
         return None
 
 
-class DesktopCopilotApp:
-    """Floating On-Screen Desktop Copilot Chat Widget with System 1/2 Handoff."""
-
-    def __init__(self) -> None:
-        global tk, ttk
-        if tk is None or "tkinter" in sys.modules:
-            try:
-                import tkinter as tk
-                from tkinter import ttk
-            except ImportError:
-                pass
-
-        if tk is None:
-            raise RuntimeError(
-                "Tkinter is required to run the DesktopCopilotApp UI. "
-                "Please ensure Tkinter is installed in your Python environment."
-            )
-
-        worker.start()
-
-        self.brain = CopilotBrain()
-        self.current_target_hwnd: Optional[int] = None
-        self.current_target_title: str = ""
-        self._abort_requested = threading.Event()
-        self._abort_lock = threading.Lock()
-        self._is_executing = False
-
-        self.root = tk.Tk()
-        self.root.title("Servo Copilot")
-
-        # Keep on top of other windows
-        self.root.attributes("-topmost", True)
-
-        # Geometry: 380px wide, docked on the right side of the screen
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        width = 380
-        height = 620
-        x_pos = screen_w - width - 24
-        y_pos = (screen_h - height) // 2
-        self.root.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
-
-        self.bg_color = "#0f172a"
-        self.panel_color = "#1e293b"
-        self.text_color = "#f8fafc"
-        self.accent_color = "#3b82f6"
-        self.user_bubble_color = "#2563eb"
-        self.bot_bubble_color = "#334155"
-
-        self.root.configure(bg=self.bg_color)
-        self.stop_btn: Optional[tk.Button] = None
-        self.send_btn: Optional[tk.Button] = None
-        self._build_ui()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _build_ui(self) -> None:
-        import tkinter as tk
-        from tkinter import ttk
-
-        # Header Frame
-        header = tk.Frame(self.root, bg=self.panel_color, height=52)
-        header.pack(fill=tk.X, side=tk.TOP)
-
-        title_label = tk.Label(
-            header,
-            text="🤖 Servo Copilot",
-            font=("Segoe UI", 12, "bold"),
-            bg=self.panel_color,
-            fg=self.text_color,
-        )
-        title_label.pack(side=tk.LEFT, padx=14, pady=12)
-
-        self.status_pill = tk.Label(
-            header,
-            text="● Ready",
-            font=("Segoe UI", 9, "bold"),
-            bg=self.panel_color,
-            fg="#34d399",
-        )
-        self.status_pill.pack(side=tk.RIGHT, padx=14, pady=12)
-
-        # Active Window Banner
-        self.target_banner = tk.Label(
-            self.root,
-            text="🎯 No active target locked",
-            font=("Segoe UI", 8),
-            bg="#111827",
-            fg="#94a3b8",
-            padx=10,
-            pady=3,
-            anchor="w",
-        )
-        self.target_banner.pack(fill=tk.X)
-
-        # Quick Actions Frame (Chips)
-        chips_frame = tk.Frame(self.root, bg=self.bg_color)
-        chips_frame.pack(fill=tk.X, padx=10, pady=6)
-
-        quick_chips = [
-            ("📝 Notepad & Write", "open notepad and write hello world"),
-            ("🧮 Calc", "open calculator and click 7"),
-            ("🖥️ Open Windows", "what windows are open?"),
-        ]
-        for label, cmd in quick_chips:
-            btn = tk.Button(
-                chips_frame,
-                text=label,
-                font=("Segoe UI", 8),
-                bg=self.panel_color,
-                fg="#94a3b8",
-                activebackground=self.accent_color,
-                activeforeground="#fff",
-                bd=0,
-                padx=6,
-                pady=4,
-                cursor="hand2",
-                command=lambda c=cmd: self._send_prompt(c),
-            )
-            btn.pack(side=tk.LEFT, padx=2)
-
-        # Chat Message Stream Frame
-        chat_container = tk.Frame(self.root, bg=self.bg_color)
-        chat_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        self.chat_canvas = tk.Canvas(chat_container, bg=self.bg_color, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(chat_container, orient="vertical", command=self.chat_canvas.yview)
-        self.scrollable_frame = tk.Frame(self.chat_canvas, bg=self.bg_color)
-
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.chat_canvas.configure(scrollregion=self.chat_canvas.bbox("all")),
-        )
-        self.chat_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw", width=340)
-        self.chat_canvas.configure(yscrollcommand=scrollbar.set)
-
-        self.chat_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Welcome message
-        self._add_message(
-            "assistant",
-            f"Hi {self.brain.user_name}! I'm Servo, your on-screen desktop copilot. Ask me anything or tell me to control apps on your screen!",
-        )
-
-        # Bottom Input Area
-        input_frame = tk.Frame(self.root, bg=self.panel_color, height=60)
-        input_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=10, pady=10)
-
-        self.entry = tk.Entry(
-            input_frame,
-            font=("Segoe UI", 10),
-            bg="#0b1120",
-            fg="#f8fafc",
-            insertbackground="#fff",
-            bd=1,
-            relief=tk.FLAT,
-        )
-        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6), pady=10)
-        self.entry.bind("<Return>", lambda e: self._on_enter())
-        self.entry.focus_set()
-
-        self.stop_btn = tk.Button(
-            input_frame,
-            text="⏹",
-            font=("Segoe UI", 11, "bold"),
-            bg="#475569",
-            fg="#cbd5e1",
-            activebackground="#ef4444",
-            activeforeground="#fff",
-            bd=0,
-            padx=10,
-            pady=6,
-            cursor="hand2",
-            state=tk.DISABLED,
-            command=self._on_stop,
-        )
-        self.stop_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=10)
-
-        self.send_btn = tk.Button(
-            input_frame,
-            text="➤",
-            font=("Segoe UI", 11, "bold"),
-            bg=self.accent_color,
-            fg="#fff",
-            activebackground="#2563eb",
-            activeforeground="#fff",
-            bd=0,
-            padx=12,
-            pady=6,
-            cursor="hand2",
-            command=self._on_enter,
-        )
-        self.send_btn.pack(side=tk.RIGHT, padx=(0, 6), pady=10)
-
-    def _set_status(self, text: str, color: str) -> None:
-        def _apply():
-            try:
-                if self.status_pill:
-                    self.status_pill.config(text=text, fg=color)
-            except Exception:
-                pass
-
-        try:
-            if threading.current_thread() is threading.main_thread():
-                _apply()
-            else:
-                self.root.after(0, _apply)
-        except Exception:
-            pass
-
-    def _set_status_if_idle(self, text: str, color: str) -> None:
-        try:
-            if not self._is_executing:
-                self._set_status(text, color)
-        except Exception:
-            pass
-
-    def _update_input_controls(self, is_executing: bool) -> None:
-        if tk is None:
-            return
-
-        def _update():
-            try:
-                if is_executing:
-                    if self.send_btn:
-                        self.send_btn.config(state=tk.DISABLED, bg="#475569")
-                    if self.stop_btn:
-                        self.stop_btn.config(state=tk.NORMAL, bg="#ef4444", fg="#ffffff")
-                    if self.entry:
-                        self.entry.config(state=tk.DISABLED)
-                else:
-                    if self.send_btn:
-                        self.send_btn.config(state=tk.NORMAL, bg=self.accent_color)
-                    if self.stop_btn:
-                        self.stop_btn.config(state=tk.DISABLED, bg="#475569", fg="#cbd5e1")
-                    if self.entry:
-                        self.entry.config(state=tk.NORMAL)
-                        self.entry.focus_set()
-            except Exception:
-                pass
-
-        try:
-            if threading.current_thread() is threading.main_thread():
-                _update()
-            else:
-                self.root.after(0, _update)
-        except Exception:
-            pass
-
-    def _on_stop(self) -> None:
-        """Request immediate cancellation of active execution."""
-        with self._abort_lock:
-            already_aborted = self._abort_requested.is_set()
-            self._abort_requested.set()
-        self._set_status("● Cancelled", "#ef4444")
-        if not already_aborted:
-            self._add_message("assistant", "🛑 Cancellation requested by user...")
-
-        def _disable_stop():
-            try:
-                if self.stop_btn and tk is not None:
-                    self.stop_btn.config(state=tk.DISABLED)
-            except Exception:
-                pass
-
-        try:
-            if threading.current_thread() is threading.main_thread():
-                _disable_stop()
-            else:
-                self.root.after(0, _disable_stop)
-        except Exception:
-            pass
-
-    def _on_abort(self) -> None:
-        self._on_stop()
-
-    def stop(self) -> None:
-        self._on_stop()
-
-    def cancel_execution(self) -> None:
-        self._on_stop()
-
-    def _on_close(self) -> None:
-        """Ensure active execution is aborted when window is closed."""
-        if self._is_executing:
-            self._abort_requested.set()
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-
-    def _update_target_banner(self, title: str, hwnd: Optional[int]) -> None:
-        def _apply():
-            try:
-                if self.target_banner:
-                    if hwnd:
-                        self.target_banner.config(text=f"🎯 Target: {title} (HWND {hwnd})", fg="#38bdf8")
-                    else:
-                        self.target_banner.config(text="🎯 No active target locked", fg="#94a3b8")
-            except Exception:
-                pass
-
-        try:
-            if threading.current_thread() is threading.main_thread():
-                _apply()
-            else:
-                self.root.after(0, _apply)
-        except Exception:
-            pass
-
-    def _add_message(self, role: str, text: str) -> None:
-        def _apply():
-            if tk is None:
-                return
-            try:
-                is_user = role == "user"
-                frame = tk.Frame(self.scrollable_frame, bg=self.bg_color)
-                frame.pack(fill=tk.X, pady=4, anchor="e" if is_user else "w")
-
-                bubble_bg = self.user_bubble_color if is_user else self.bot_bubble_color
-                fg_color = "#ffffff"
-
-                bubble = tk.Label(
-                    frame,
-                    text=text,
-                    font=("Segoe UI", 9),
-                    bg=bubble_bg,
-                    fg=fg_color,
-                    wraplength=260,
-                    justify=tk.LEFT,
-                    padx=10,
-                    pady=8,
-                )
-                bubble.pack(side=tk.RIGHT if is_user else tk.LEFT, padx=5)
-
-                self.root.update_idletasks()
-                self.chat_canvas.yview_moveto(1.0)
-            except Exception:
-                pass
-
-        try:
-            if threading.current_thread() is threading.main_thread():
-                _apply()
-            else:
-                self.root.after(0, _apply)
-        except Exception:
-            pass
-
-    def _on_enter(self) -> None:
-        text = self.entry.get().strip()
-        if not text:
-            return
-        self.entry.delete(0, "end")
-        self._send_prompt(text)
-
-    def _send_prompt(self, prompt: str) -> None:
-        if self._is_executing:
-            return
-
-        with self._abort_lock:
-            self._abort_requested.clear()
-        self._is_executing = True
-        self._update_input_controls(is_executing=True)
-
-        self._add_message("user", prompt)
-        self._set_status("● Planning...", "#f59e0b")
-
-        def _worker():
-            if sys.platform == "win32":
-                try:
-                    import pythoncom
-                    pythoncom.CoInitialize()
-                except Exception:
-                    pass
-            try:
-                # SENSE active scene if window is attached
-                scene = None
-                if self.current_target_hwnd and windows.is_window(self.current_target_hwnd):
-                    try:
-                        sensor = UIASensor(self.current_target_hwnd)
-                        scene = sensor.sense()
-                    except Exception:
-                        scene = None
-
-                if self._abort_requested.is_set():
-                    self._set_status("● Cancelled", "#ef4444")
-                    self._add_message("assistant", "🛑 Plan generation cancelled by user.")
-                    return
-
-                reply, plan = self.brain.process_message(prompt, scene=scene)
-                if reply:
-                    self._add_message("assistant", reply)
-
-                if self._abort_requested.is_set():
-                    self._set_status("● Cancelled", "#ef4444")
-                    self._add_message("assistant", "🛑 Execution cancelled by user before starting.")
-                    return
-
-                if plan:
-                    self._execute_handoff_plan(plan)
-            except Exception as e:
-                self._set_status("● Error", "#ef4444")
-                self._add_message("assistant", f"❌ Error: {e}")
-            finally:
-                if sys.platform == "win32":
-                    try:
-                        import pythoncom
-                        pythoncom.CoUninitialize()
-                    except Exception:
-                        pass
-                self._is_executing = False
-                self._update_input_controls(is_executing=False)
-                try:
-                    self.root.after(3500, lambda: self._set_status_if_idle("● Ready", "#34d399"))
-                except Exception:
-                    pass
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _execute_handoff_plan(self, plan: MacroPlan) -> None:
-        """Execute a System 2 plan using the SystemHandoffCoordinator."""
-        total_steps = len(plan.steps)
-
-        def on_plan_start(p: MacroPlan) -> None:
-            self._set_status(f"● Running (0/{total_steps})...", "#38bdf8")
-
-        def on_step_start(step: PlanStep) -> None:
-            self._set_status(f"● Step {step.step_index}: {step.tool_name}...", "#38bdf8")
-
-        def on_step_progress(step: PlanStep, report: StepExecutionReport) -> None:
-            source_tag = f" [{report.perception_source.upper()}]" if report.perception_source else ""
-            if report.success:
-                msg = f"  ✅ Step {step.step_index}: {report.description} ({report.latency_ms}ms){source_tag}"
-            elif "cancelled" in (report.error or "").lower() or self._abort_requested.is_set():
-                msg = f"  🛑 Step {step.step_index} interrupted: {report.error}"
-            else:
-                msg = f"  ⚠️ Step {step.step_index} failed: {report.error} ({report.latency_ms}ms)"
-            self._add_message("assistant", msg)
-
-        def on_plan_complete(summary: PlanExecutionSummary) -> None:
-            if summary.aborted:
-                self._set_status("● Cancelled", "#ef4444")
-                final_msg = f"🛑 Execution aborted by user ({summary.completed_steps}/{summary.total_steps} steps completed)."
-            elif summary.success:
-                self._set_status("● Completed", "#10b981")
-                final_msg = f"🎉 Plan completed successfully ({summary.completed_steps}/{summary.total_steps} steps in {summary.total_latency_ms}ms)!"
-            else:
-                self._set_status("● Error", "#ef4444")
-                final_msg = f"⚠️ Plan stopped: completed {summary.completed_steps}/{summary.total_steps} steps."
-            self._add_message("assistant", final_msg)
-
-        coordinator = SystemHandoffCoordinator(
-            target_hwnd=self.current_target_hwnd,
-            fast_mode=False,
-            should_abort=self._abort_requested,
-            on_plan_start=on_plan_start,
-            on_step_start=on_step_start,
-            on_step_progress=on_step_progress,
-            on_plan_complete=on_plan_complete,
-        )
-
-        summary = coordinator.execute_plan(plan, app_launcher=launch_or_focus_app)
-
-        if summary.active_hwnd:
-            self.current_target_hwnd = summary.active_hwnd
-            self.current_target_title = summary.active_title
-            self.brain.active_hwnd = summary.active_hwnd
-            self.brain.active_title = summary.active_title
-            self._update_target_banner(summary.active_title, summary.active_hwnd)
-
-        # Telemetry: Persist execution run and step traces to TraceStore (SQLite + JSONL)
-        try:
-            from servo.daemon.tasks import record_plan_trace
-            record_plan_trace(summary, mode="assistant")
-        except Exception as te:
-            logger.debug("Failed to record copilot telemetry trace: %s", te)
-
-    def run(self) -> None:
-        try:
-            self.root.mainloop()
-        finally:
-            worker.stop()
-
-
 def launch_copilot() -> None:
-    """Entrypoint for starting the Floating On-Screen Copilot."""
-    app = DesktopCopilotApp()
-    app.run()
+    """Entrypoint for the floating on-screen copilot (web UI in a native window)."""
+    from servo.daemon.copilot_app import run_copilot
+    run_copilot()
 
 
 if __name__ == "__main__":

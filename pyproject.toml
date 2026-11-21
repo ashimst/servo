@@ -21,14 +21,24 @@ dependencies = [
     "Pillow>=9.5.0",
     "fastapi>=0.100.0",
     "uvicorn>=0.22.0",
+    "anthropic>=2.12.0",
 ]
 
 [project.optional-dependencies]
 mcp = [
     "fastmcp>=0.1.0",
 ]
+# On-device Needle 3 (tool calling) + Mirage (vision). Imports as `cactus`.
 cactus = [
-    "cactus-compute>=0.1.0",
+    "cactus-compute>=3.3.0",
+]
+# Playwright browser tier (uses installed Edge/Chrome; `playwright install chromium` for the bundled build)
+browser = [
+    "playwright>=1.49",
+]
+# Frameless always-on-top native window for the copilot (falls back to Edge --app)
+ui = [
+    "pywebview>=5.0",
 ]
 anthropic = [
     "anthropic>=2.12.0",
@@ -36,6 +46,7 @@ anthropic = [
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "playwright>=1.49",
 ]
 
 [project.scripts]
@@ -46,6 +57,9 @@ markers = [
     "desktop: drives the real Windows desktop (launches apps, moves the mouse); opt in with -m desktop",
 ]
 addopts = "-m 'not desktop'"
+
+[tool.setuptools.package-data]
+"servo.daemon" = ["copilot_ui/*.html"]
 
 [tool.setuptools.packages.find]
 where = ["."]

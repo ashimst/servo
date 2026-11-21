@@ -1,107 +1,244 @@
-"""Cactus Mirage (22 MB) Visual Fallback Wrapper.
+"""Cactus Mirage visual perception.
 
-See ADR-01 and Section 2.1 in SERVO_ARCHITECTURE_V1.md.
-Invoked automatically when UIA controls are sparse (< 3 elements) or post-action checks fail.
+Mirage (``cactus.Mirage().describe(image, sections=[...], fields=[...])``) returns JSON
+from the engine. Its detection schema is not documented by Cactus, so
+``parse_detections`` accepts the plausible shapes (lists under ``objects`` / ``text`` /
+``detections`` / ``elements``; boxes as ``[x1,y1,x2,y2]``, ``[x,y,w,h]`` or dicts; pixel
+or 0-1 normalized coordinates) and drops anything it cannot place.
+
+Mirage is the *sideways* escalation in the cascade: it is used when the accessibility
+tree (UIA) or the DOM cannot find a target, not when the request needs reasoning.
 """
 
 from __future__ import annotations
 
-import io
+import difflib
 import logging
-from typing import Dict, Optional
-from PIL import Image, ImageGrab
+import re
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from PIL import Image, ImageGrab
+from pydantic import BaseModel
+
+from servo.config import settings
+from servo.perception.scene_index import SceneElement, SceneIndex
 from servo.perception.viewport import ViewportTransform
-from servo.perception.scene_index import SceneIndex, SceneElement
 
 logger = logging.getLogger(__name__)
 
+_LIST_KEYS = ("objects", "text", "lines", "words", "detections", "elements", "items", "regions")
+_LABEL_KEYS = ("label", "text", "name", "class", "category", "content")
+
+
+class Detection(BaseModel):
+    """One Mirage detection, bbox in IMAGE pixel coordinates (x1, y1, x2, y2)."""
+    label: str
+    bbox: Tuple[int, int, int, int]
+    score: Optional[float] = None
+    kind: str = "object"
+
+    @property
+    def center(self) -> Tuple[int, int]:
+        return ((self.bbox[0] + self.bbox[2]) // 2, (self.bbox[1] + self.bbox[3]) // 2)
+
+
+def _num(v: Any) -> Optional[float]:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _box(item: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    raw = None
+    for k in ("bbox", "box", "bounds", "rect", "bounding_box"):
+        if k in item:
+            raw = item[k]
+            break
+    if raw is None and all(k in item for k in ("x1", "y1", "x2", "y2")):
+        raw = {k: item[k] for k in ("x1", "y1", "x2", "y2")}
+    if raw is None and all(k in item for k in ("x", "y", "w", "h")):
+        raw = {k: item[k] for k in ("x", "y", "w", "h")}
+    if isinstance(raw, dict):
+        if all(k in raw for k in ("x1", "y1", "x2", "y2")):
+            vals = [_num(raw[k]) for k in ("x1", "y1", "x2", "y2")]
+        elif all(k in raw for k in ("left", "top", "right", "bottom")):
+            vals = [_num(raw[k]) for k in ("left", "top", "right", "bottom")]
+        elif all(k in raw for k in ("x", "y")) and any(k in raw for k in ("w", "width")):
+            x, y = _num(raw["x"]), _num(raw["y"])
+            w, h = _num(raw.get("w", raw.get("width"))), _num(raw.get("h", raw.get("height")))
+            if None in (x, y, w, h):
+                return None
+            vals = [x, y, x + w, y + h]  # type: ignore[operator]
+        else:
+            return None
+    elif isinstance(raw, (list, tuple)) and len(raw) == 4:
+        vals = [_num(v) for v in raw]
+        if None not in vals and (vals[2] <= vals[0] or vals[3] <= vals[1]):  # type: ignore[operator]
+            vals = [vals[0], vals[1], vals[0] + vals[2], vals[1] + vals[3]]  # type: ignore[operator]
+    else:
+        return None
+    if None in vals:
+        return None
+    return tuple(vals)  # type: ignore[return-value]
+
+
+def _walk_lists(raw: Any) -> Iterable[Tuple[str, Dict[str, Any]]]:
+    if isinstance(raw, dict):
+        for key, val in raw.items():
+            if key in _LIST_KEYS and isinstance(val, list):
+                kind = "text" if key in ("text", "lines", "words") else "object"
+                for item in val:
+                    if isinstance(item, dict):
+                        yield kind, item
+            elif isinstance(val, (dict, list)):
+                yield from _walk_lists(val)
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and _box(item) is not None:
+                yield "object", item
+            else:
+                yield from _walk_lists(item)
+
+
+def parse_detections(raw: Any, width: int, height: int) -> List[Detection]:
+    """Normalize Mirage output into pixel-space detections."""
+    out: List[Detection] = []
+    for kind, item in _walk_lists(raw):
+        label = next((str(item[k]).strip() for k in _LABEL_KEYS if isinstance(item.get(k), str) and item[k].strip()), "")
+        if not label:
+            continue
+        box = _box(item)
+        if box is None:
+            continue
+        x1, y1, x2, y2 = box
+        if max(x1, y1, x2, y2) <= 1.0:  # normalized 0-1
+            x1, x2, y1, y2 = x1 * width, x2 * width, y1 * height, y2 * height
+        x1, x2 = max(0, min(x1, width)), max(0, min(x2, width))
+        y1, y2 = max(0, min(y1, height)), max(0, min(y2, height))
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            continue
+        score = _num(item.get("score", item.get("confidence", item.get("conf"))))
+        out.append(Detection(label=label, bbox=(int(x1), int(y1), int(x2), int(y2)), score=score, kind=kind))
+    return out
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", " ", s.lower()).strip()
+
+
+def match_score(target: str, label: str) -> float:
+    t, lbl = _norm(target), _norm(label)
+    if not t or not lbl:
+        return 0.0
+    if t == lbl:
+        return 1.0
+    if re.search(r"\b" + re.escape(t) + r"\b", lbl):
+        return 0.9 if len(t) >= 3 else 0.75
+    return difflib.SequenceMatcher(None, t, lbl).ratio()
+
+
+def match_target(dets: List[Detection], target: str) -> Tuple[Optional[Detection], float, List[Tuple[str, float]]]:
+    """Best detection for a target label, its score, and the runner-up list for the trace."""
+    scored = sorted(((match_score(target, d.label), d) for d in dets), key=lambda x: -x[0])
+    ranked = [(d.label, round(s, 3)) for s, d in scored[:6]]
+    if not scored:
+        return None, 0.0, ranked
+    best_score, best = scored[0]
+    # Ambiguity: two near-identical candidates is not a confident match.
+    if len(scored) > 1 and scored[1][0] >= best_score - 0.02 and scored[1][1].label != best.label:
+        best_score *= 0.8
+    return best, best_score, ranked
+
+
+def describe_image(img: Image.Image) -> Optional[Dict[str, Any]]:
+    """Run Mirage on a PIL image. Returns raw JSON or None if Mirage is unavailable."""
+    from servo.cognition.cactus_runtime import get_mirage
+
+    model = get_mirage()
+    if model is None:
+        return None
+    try:
+        rgb = img.convert("RGB")
+        raw = model.describe(rgb, sections=["objects", "text"], fields=["bbox"])
+        return raw if isinstance(raw, dict) else {"result": raw}
+    except Exception as e:
+        logger.warning("Mirage describe failed: %s", e)
+        return None
+
+
+def summarize(dets: List[Detection], limit: int = 60) -> str:
+    """Compact text description of what Mirage saw (fed to System 2 on escalation)."""
+    lines = [f"- {d.kind} '{d.label}' at {d.bbox}" for d in dets[:limit]]
+    return "\n".join(lines) if lines else "(no detections)"
+
 
 class MirageSensor:
-    """Visual sensor fallback powered by Cactus Mirage (22 MB) or deterministic synthetic fallback."""
+    """Visual sensor: screenshot of the target window -> Mirage -> SceneIndex (screen coords)."""
 
     def __init__(self, hwnd: int) -> None:
         self.hwnd = hwnd
         self.viewport = ViewportTransform(hwnd)
+        self.last_detections: List[Detection] = []
 
     def capture_window_image(self) -> Optional[Image.Image]:
-        """Capture screenshot strictly cropped to target window bounds."""
         self.viewport.refresh()
         b = self.viewport.bounds
         if b.width <= 1 or b.height <= 1:
             return None
         try:
-            # Screen bbox: (left, top, right, bottom)
-            img = ImageGrab.grab(bbox=(b.left, b.top, b.right, b.bottom))
-            return img
+            return ImageGrab.grab(bbox=(b.left, b.top, b.right, b.bottom), all_screens=True)
         except Exception:
             return None
 
     def sense(self, window_title: str = "Target Window") -> SceneIndex:
-        """Perform a visual pass via Cactus Mirage and produce a SceneIndex.
+        """Visual pass. Returns an empty scene with ``sense_error`` when Mirage is unavailable.
 
-        Returns an empty scene with ``sense_error`` set when Mirage is unavailable.
+        No synthetic fallback: inventing regions made the loop click things that were not
+        controls. An error-flagged scene makes the loop fail and escalate instead.
         """
-        self.viewport.refresh()
         img = self.capture_window_image()
-        elements_map: Dict[int, SceneElement] = {}
-
-        # 1. Attempt Cactus Mirage if installed
-        cactus_available = False
-        try:
-            import cactus  # type: ignore
-            if hasattr(cactus, "Mirage"):
-                mirage = cactus.Mirage()
-                if img is not None:
-                    # Save image to bytes
-                    buf = io.BytesIO()
-                    img.save(buf, format="PNG")
-                    buf.seek(0)
-                    desc = mirage.describe(buf.getvalue())
-                    # If Mirage returns structured parsed detections, map them
-                    if isinstance(desc, dict) and "elements" in desc:
-                        for idx, item in enumerate(desc["elements"]):
-                            norm_x1 = int(item.get("x1", 0))
-                            norm_y1 = int(item.get("y1", 0))
-                            norm_x2 = int(item.get("x2", 100))
-                            norm_y2 = int(item.get("y2", 100))
-                            s_x1, s_y1 = self.viewport.norm_to_screen(norm_x1, norm_y1)
-                            s_x2, s_y2 = self.viewport.norm_to_screen(norm_x2, norm_y2)
-                            center = ((s_x1 + s_x2) // 2, (s_y1 + s_y2) // 2)
-                            elements_map[idx] = SceneElement(
-                                element_id=idx,
-                                label=item.get("label", f"Visual_{idx}"),
-                                role=item.get("role", "VisualControl"),
-                                bbox_screen=(s_x1, s_y1, s_x2, s_y2),
-                                bbox_norm=(norm_x1, norm_y1, norm_x2, norm_y2),
-                                center_screen=center,
-                            )
-                        cactus_available = True
-        except ImportError:
-            cactus_available = False
-        except Exception as e:
-            logger.warning("Cactus Mirage visual pass failed: %s", e)
-            cactus_available = False
-
-        # No synthetic fallback. The previous version invented three fixed regions
-        # ("Visual Area Center", ...) when Mirage was unavailable, and the control loop
-        # then physically clicked them as if they were real controls. An empty,
-        # error-flagged scene makes the loop fail and escalate instead.
-        sense_error = None
-        if not cactus_available:
-            sense_error = "Cactus Mirage is unavailable or failed; no visual detections."
-
         b = self.viewport.bounds
+        elements: Dict[int, SceneElement] = {}
+        sense_error: Optional[str] = None
+
+        raw = describe_image(img) if img is not None else None
+        if img is None:
+            sense_error = "Could not capture the target window for Mirage."
+        elif raw is None:
+            sense_error = "Cactus Mirage is unavailable or failed; no visual detections."
+        else:
+            self.last_detections = parse_detections(raw, img.width, img.height)
+            for idx, d in enumerate(self.last_detections):
+                x1, y1, x2, y2 = d.bbox
+                screen = (b.left + x1, b.top + y1, b.left + x2, b.top + y2)
+                elements[idx] = SceneElement(
+                    element_id=idx,
+                    label=d.label,
+                    role="VisualText" if d.kind == "text" else "VisualControl",
+                    bbox_screen=screen,
+                    bbox_norm=self.viewport.bbox_screen_to_norm(screen),
+                    center_screen=((screen[0] + screen[2]) // 2, (screen[1] + screen[3]) // 2),
+                )
+            if not elements:
+                sense_error = "Mirage returned no placeable detections."
+
         return SceneIndex(
             hwnd=self.hwnd,
             window_title=window_title,
             source="mirage",
-            viewport={
-                "x": b.left,
-                "y": b.top,
-                "width": b.width,
-                "height": b.height,
-            },
-            elements=elements_map,
+            viewport={"x": b.left, "y": b.top, "width": b.width, "height": b.height},
+            elements=elements,
             sense_error=sense_error,
         )
+
+    def locate(self, target: str) -> Tuple[Optional[SceneElement], float, List[Tuple[str, float]], SceneIndex]:
+        """Sense, then fuzzy-match ``target``. Returns (element|None, score, ranked, scene)."""
+        scene = self.sense()
+        if scene.sense_error:
+            return None, 0.0, [], scene
+        best, score, ranked = match_target(self.last_detections, target)
+        if best is None or score < settings.mirage_match_threshold:
+            return None, score, ranked, scene
+        idx = self.last_detections.index(best)
+        return scene.elements.get(idx), score, ranked, scene

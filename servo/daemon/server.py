@@ -423,7 +423,8 @@ def main() -> None:
     import logging
 
     parser = argparse.ArgumentParser(description="Servo Desktop Control Runtime Daemon")
-    parser.add_argument("--copilot", action="store_true", help="Launch floating on-screen desktop Copilot chat companion")
+    parser.add_argument("--copilot", action="store_true", help="Launch the floating on-screen Copilot (web UI with live reasoning trace)")
+    parser.add_argument("--no-window", action="store_true", help="With --copilot: serve the UI without opening a window")
     parser.add_argument("--gui", action="store_true", help="Launch native desktop GUI inspector")
     parser.add_argument("--mcp", action="store_true", help="Run as FastMCP server over stdio")
     parser.add_argument("--port", type=int, default=8000, help="Port for REST server (default: 8000)")
@@ -433,8 +434,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
     if args.copilot:
-        from servo.daemon.copilot import launch_copilot
-        launch_copilot()
+        from servo.daemon.copilot_app import run_copilot
+        run_copilot(open_window=not args.no_window, port=args.port if args.port != 8000 else None)
         return
 
     if args.gui:

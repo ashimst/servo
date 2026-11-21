@@ -467,6 +467,14 @@ class AliasMapper:
                 focusable = [el for el in role_candidates if el.is_keyboard_focusable]
                 if len(focusable) == 1:
                     return focusable[0], None
+                pool = focusable if focusable else role_candidates
+                def _area(elem: SceneElement) -> int:
+                    w = max(0, elem.bbox_screen[2] - elem.bbox_screen[0])
+                    h = max(0, elem.bbox_screen[3] - elem.bbox_screen[1])
+                    return w * h
+                best = max(pool, key=_area)
+                if _area(best) > 0:
+                    return best, None
 
         # 6. Ambiguity vs Not Found Diagnostics
         if len(partial_matches) > 1:

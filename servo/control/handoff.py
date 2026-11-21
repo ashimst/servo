@@ -21,6 +21,7 @@ from servo.actuation.alias_mapping import (
     CanonicalActionType,
 )
 from servo.control.confirmation import ConfirmationCallback
+from servo.cognition.trace import NullTracer, Tracer
 from servo.control.loop import ExecutionResult, ServoControlLoop
 from servo.perception import windows
 from servo.perception.scene_index import SceneIndex
@@ -89,8 +90,13 @@ class SystemHandoffCoordinator:
         on_step_start: Optional[OnStepStartFn] = None,
         on_step_progress: Optional[OnStepProgressFn] = None,
         on_plan_complete: Optional[OnPlanCompleteFn] = None,
+        tracer: Optional[Tracer] = None,
+        exclude_hwnds: Optional[Callable[[], set]] = None,
     ) -> None:
         self.target_hwnd = target_hwnd
+        self.tracer = tracer or NullTracer()
+        # Windows that must never be adopted as the target (the copilot itself).
+        self.exclude_hwnds = exclude_hwnds
         self.fast_mode = fast_mode
         self.confirmation_callback = confirmation_callback
         if isinstance(should_abort, threading.Event):
@@ -279,7 +285,8 @@ class SystemHandoffCoordinator:
             # Ensure target window exists
             if not current_hwnd or not windows.is_window(current_hwnd):
                 fg = windows.get_foreground_window()
-                if fg and windows.is_window(fg):
+                excluded = self.exclude_hwnds() if self.exclude_hwnds else set()
+                if fg and windows.is_window(fg) and fg not in excluded:
                     current_hwnd = fg
                     current_title = windows.get_window_title(fg)
                     self.target_hwnd = fg
@@ -339,6 +346,7 @@ class SystemHandoffCoordinator:
                 confirmation_callback=self.confirmation_callback,
                 should_abort=self.should_abort,
                 mode=self.mode,
+                tracer=self.tracer,
             )
 
             # Action routing through loop.execute_subgoal

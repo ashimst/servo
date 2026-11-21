@@ -2,7 +2,7 @@
 
 import threading
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from servo.control.handoff import (
     PlanExecutionSummary,
@@ -217,7 +217,7 @@ def test_handoff_safety_gating_rejection_halts_plan(mock_scene):
     assert mock_loop.execute_subgoal.call_count == 1
     # Verify confirmation_callback passed to loop constructor
     mock_loop_cls.assert_called_with(
-        hwnd=9999, fast_mode=True, confirmation_callback=confirmation_cb, should_abort=None, mode=None
+        hwnd=9999, fast_mode=True, confirmation_callback=confirmation_cb, should_abort=None, mode=None, tracer=ANY
     )
 
 

@@ -42,8 +42,11 @@ pip install -e ".[dev,mcp]"
 ```
 
 Optional extras:
-* `pip install -e ".[cactus]"` — Adds local Cactus edge models (Needle, Mirage, Whistle).
-* `pip install -e ".[dev]"` — Installs pytest test runner.
+* `pip install -e ".[cactus]"` — Cactus Needle 3 (on-device tool calling) and Mirage (vision fallback), from `cactus-compute` >= 3.3.
+* `pip install -e ".[browser]"` — Playwright browser tier. Uses your installed Edge/Chrome; run `playwright install chromium` only if you want the bundled build.
+* `pip install -e ".[ui]"` — pywebview for a frameless, always-on-top copilot window (otherwise it opens as an Edge app window).
+* `pip install -e ".[anthropic]"` — Claude as System 2.
+* `pip install -e ".[dev]"` — pytest and Playwright for the test suite.
 
 ---
 
@@ -51,20 +54,30 @@ Optional extras:
 
 ### 1. Floating On-Screen Desktop Copilot (Recommended)
 
-Launch the always-on-top on-screen chat companion docked to your screen:
-
 ```powershell
-servo --copilot
+servo --copilot            # floating window, docked right, always on top
+servo --copilot --no-window   # serve the UI only (prints the URL)
 ```
-*(or run `python -m servo.daemon.copilot`)*
 
-The Copilot stays floating on top of your windows (like a screen-share HUD companion). You can naturally chat with it to execute desktop tasks end-to-end:
+On first launch the copilot asks which reasoning model to use (Claude, Ollama on this PC,
+Gemini, any OpenAI-compatible server, or none), tests the connection, and saves it to
+`~/.servo/settings.json` with keys encrypted for your Windows account. The button at the
+top right always shows what's active; click it to change. Direct commands work without
+any model.
+
+Ask in plain language:
 * *"open notepad and write hello world"*
-* *"open calculator and click 7"*
-* *"write 'urgent meeting' into search"*
-* *"click Save"*
+* *"search the web for weather in Kathmandu"* (Playwright drives the browser)
+* *"click Save"* (acts on the window you were last using, never on the copilot)
+* *"open notepad, write a haiku about rain and save it"* (multi-step: goes to System 2)
 
-It automatically launches or focuses the application, extracts the UI control tree, plans the actions, and drives the mouse and keyboard via the verified closed-loop reflex arc.
+Requests run through a cost-and-latency cascade: the command grammar and Cactus Needle
+handle direct commands on-device, UIA or the browser DOM find the target, Mirage looks at
+the pixels when the accessibility tree has nothing, Kev gates every action, and only
+requests that need reasoning reach the LLM. Each run shows a **reasoning trace**: which
+tier handled what and why, confidences, Kev's verdicts, the exact LLM prompt and its
+visible reasoning, and every action and verification. Medium- and high-risk actions ask
+for approval inside the copilot. See [docs/COGNITIVE_CASCADE.md](docs/COGNITIVE_CASCADE.md).
 
 ---
 
@@ -128,7 +141,13 @@ Configure runtime options via environment variables (prefix `SERVO_`):
 | `SERVO_MODE` | `assistant` | `assistant` (prompts on medium/high risk) or `harness` (autonomous sandboxed CI). |
 | `SERVO_CONFIRMATION_CHANNEL` | `dialog` | `dialog` (desktop Yes/No modal) or `deny` (automatically refuses risky actions). |
 | `SERVO_WHITELISTED_PROCESS_NAMES` | `[]` | JSON array of permitted processes in harness mode (e.g., `'["notepad.exe"]'`). |
-| `SERVO_PLANNER_PROVIDER` | `openai` | System 2 backend: `openai`, `anthropic`, `gemini`, or `passthrough`. |
+| `SERVO_PLANNER_PROVIDER` | `openai` | System 2 backend: `openai` (Ollama or any OpenAI-compatible server), `anthropic`, `gemini`, `cactus` (local cactus-engine), or `none`. |
+| `SERVO_ANTHROPIC_MODEL` | `claude-opus-5-5` | Claude model for System 2; `SERVO_SYSTEM2_EFFORT` sets reasoning depth (default `medium`). |
+| `SERVO_KEV_URL` | *(empty)* | Kev server base URL (e.g. `http://127.0.0.1:8009`). Empty = heuristic gate. |
+| `SERVO_NEEDLE_CONFIDENCE_THRESHOLD` | `0.7` | Minimum Needle confidence to act without System 2. |
+| `SERVO_MIRAGE_MATCH_THRESHOLD` | `0.72` | Minimum Mirage label match to click a visual target. |
+| `SERVO_MAX_REPLANS` | `2` | How many times System 2 may re-plan after a failure. |
+| `SERVO_BROWSER_CHANNEL` | `msedge` | Browser for the Playwright tier: `msedge`, `chrome`, or `chromium`. |
 | `SERVO_OPENAI_BASE_URL` | `http://localhost:11434/v1` | URL for local Ollama or OpenAI-compatible service. |
 | `SERVO_FAST_MODE` | `false` | When `true`, snaps cursor directly to targets (for automated CI). |
 

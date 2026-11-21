@@ -33,6 +33,7 @@ from servo.perception import windows
 from servo.perception.mirage_sensor import MirageSensor
 from servo.perception.scene_index import SceneElement, SceneIndex
 from servo.perception.uia_sensor import UIASensor
+from servo.cognition.trace import NullTracer, Tracer
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +85,10 @@ class ServoControlLoop:
         confirmation_callback: Optional[ConfirmationCallback] = None,
         mode: Optional[Literal["assistant", "harness"]] = None,
         should_abort: Optional[Callable[[], bool]] = None,
+        tracer: Optional[Tracer] = None,
     ) -> None:
         self.hwnd = hwnd
+        self.tracer = tracer or NullTracer()
         self.fast_mode = fast_mode
         self.confirmation_callback = confirmation_callback
         self.mode = mode or settings.mode
@@ -295,10 +298,26 @@ class ServoControlLoop:
             return self._finalize(res, t_start)
 
         # ATTEMPT 1: UIA
+        tr = self.tracer
+        t_sense = time.perf_counter()
         uia_scene = self.uia_sensor.sense()
         uia_diag: Optional[str] = None
+        if uia_scene.sense_error:
+            tr.emit("perception", "UIA sense failed", uia_scene.sense_error, tier="uia", status="fail",
+                    duration_ms=int((time.perf_counter() - t_sense) * 1000))
         if not uia_scene.sense_error:
             target, uia_diag = AliasMapper.resolve_element(uia_scene, target_label_hint, action_type=canon_type)
+            tr.emit(
+                "perception",
+                f"UIA · {len(uia_scene.elements)} controls in “{uia_scene.window_title}”",
+                (f"Resolved “{target_label_hint}” → #{target.element_id} {target.role} “{target.label}”"
+                 if target is not None else (uia_diag or "no match")),
+                tier="uia",
+                status="ok" if target is not None else "warn",
+                confidence=1.0 if target is not None else 0.0,
+                duration_ms=int((time.perf_counter() - t_sense) * 1000),
+                labels=[f"{e.role}: {e.label}" for e in list(uia_scene.elements.values())[:80]],
+            )
             if target is not None:
                 res = self._run_reflex_pass(
                     scene=uia_scene,
@@ -321,12 +340,35 @@ class ServoControlLoop:
                 res.attempts_used = 1
                 return self._finalize(res, t_start)
 
-        # ATTEMPT 2: Mirage visual fallback, only reached when nothing has been actuated.
+        # ATTEMPT 2: Mirage visual fallback. A perception miss goes SIDEWAYS to vision,
+        # not up to the LLM. Only reached when nothing has been actuated.
+        tr.emit("escalate", "Perception miss → Mirage",
+                "Target is not in the accessibility tree; looking at the pixels instead.",
+                tier="mirage", status="warn")
         mirage_sense = lambda: self.mirage_sensor.sense(window_title=uia_scene.window_title)  # noqa: E731
+        t_m = time.perf_counter()
         mirage_scene = mirage_sense()
         mirage_diag: Optional[str] = None
         if not mirage_scene.sense_error:
             target, mirage_diag = AliasMapper.resolve_element(mirage_scene, target_label_hint, action_type=canon_type)
+            score = 1.0 if target is not None else 0.0
+            ranked: list = []
+            if target is None and target_label_hint:
+                from servo.perception.mirage_sensor import match_target
+                best, score, ranked = match_target(self.mirage_sensor.last_detections, target_label_hint)
+                if best is not None and score >= settings.mirage_match_threshold:
+                    idx = self.mirage_sensor.last_detections.index(best)
+                    target = mirage_scene.elements.get(idx)
+                    mirage_diag = None
+            tr.emit(
+                "perception",
+                f"Mirage · {len(mirage_scene.elements)} detections",
+                (f"Matched “{target_label_hint}” → “{target.label}” at {target.center_screen}"
+                 if target is not None else (mirage_diag or "no confident match")),
+                tier="mirage", status="ok" if target is not None else "fail",
+                confidence=score, duration_ms=int((time.perf_counter() - t_m) * 1000),
+                ranked=ranked,
+            )
             if target is not None:
                 res = self._run_reflex_pass(
                     scene=mirage_scene,
@@ -349,6 +391,9 @@ class ServoControlLoop:
                 res.attempts_used = 2
                 return self._finalize(res, t_start)
 
+        if mirage_scene.sense_error:
+            tr.emit("perception", "Mirage unavailable", mirage_scene.sense_error, tier="mirage", status="fail",
+                    duration_ms=int((time.perf_counter() - t_m) * 1000))
         reasons = []
         if uia_scene.sense_error:
             reasons.append(f"UIA failed: {uia_scene.sense_error}")
@@ -412,6 +457,12 @@ class ServoControlLoop:
 
         # 1. Jev Pre-Action Risk Gate
         pre_risk = self.jev.evaluate_pre_risk(sub_goal, tool_call_repr, element_label)
+        self.tracer.emit(
+            "decision", f"Kev pre-check · {pre_risk.risk_level} risk", pre_risk.reason, tier="kev",
+            status="ok" if pre_risk.risk_level == "low" and pre_risk.scope_valid else "warn",
+            source=pre_risk.source, scope_valid=pre_risk.scope_valid, probabilities=pre_risk.probabilities,
+            tool_call=tool_call_repr,
+        )
 
         if not pre_risk.scope_valid:
             return self._fail(
@@ -440,6 +491,8 @@ class ServoControlLoop:
                 except Exception as e:
                     logger.warning("Confirmation callback raised %s; treating as rejection.", e)
             confirmation = "approved" if approved else "rejected"
+            self.tracer.emit("decision", f"Your confirmation · {confirmation}", tool_call_repr, tier="kev",
+                             status="ok" if approved else "fail")
             if not approved:
                 reason = (
                     "Action rejected by user confirmation (declined, timed out, or dialog unavailable)."
@@ -464,6 +517,13 @@ class ServoControlLoop:
             return res
 
         # 3. Actuate (exactly once)
+        self.tracer.emit(
+            "action", tool_call_repr,
+            (f"{perception_source.upper()} target “{element_label}” at {target_el.center_screen}"
+             + (" — cursor follows an eased path" if action_type in ("click", "double_click", "right_click") else "")
+             if target_el is not None else f"in “{scene.window_title}”"),
+            tier="mirage" if perception_source == "mirage" else "uia",
+        )
         try:
             if action_type == "type":
                 if target_el is None:
@@ -519,6 +579,12 @@ class ServoControlLoop:
                 sub_goal, delta, expected_outcome, typed_text=text_to_type if action_type == "type" else "",
             )
 
+        self.tracer.emit(
+            "verify",
+            "Kev post-check · " + ("change confirmed" if post_eval.transition_ok else "expected change not seen"),
+            post_eval.explanation, tier="kev", status="ok" if post_eval.transition_ok else "fail",
+            confidence=post_eval.confidence, delta=delta.model_dump(),
+        )
         return ExecutionResult(
             success=post_eval.transition_ok,
             attempts_used=1,

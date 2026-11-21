@@ -1,6 +1,11 @@
 """Shared test configuration."""
 
-import pytest
+import os
+
+# Tests must not pick up the developer's saved copilot setup (~/.servo/settings.json).
+os.environ["SERVO_NO_USER_SETTINGS"] = "1"
+
+import pytest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

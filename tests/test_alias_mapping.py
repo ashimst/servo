@@ -102,6 +102,34 @@ def test_resolve_element_role_fallback_for_editor():
     assert err is None
 
 
+def test_resolve_element_role_fallback_multiple_disambiguates_by_area():
+    # Simulate a window with a small search box Edit and a large main text Document
+    small_search = SceneElement(
+        element_id=0,
+        label="Find",
+        role="Edit",
+        bbox_screen=(100, 100, 300, 130),  # area = 200 * 30 = 6000
+        bbox_norm=(100, 100, 300, 130),
+        center_screen=(200, 115),
+        is_keyboard_focusable=True,
+    )
+    large_doc = SceneElement(
+        element_id=1,
+        label="",
+        role="Document",
+        bbox_screen=(100, 150, 900, 800),  # area = 800 * 650 = 520000
+        bbox_norm=(100, 150, 900, 800),
+        center_screen=(500, 475),
+        is_keyboard_focusable=True,
+    )
+    scene = SceneIndex(hwnd=1001, window_title="Test App", source="uia", elements={0: small_search, 1: large_doc})
+    el, err = AliasMapper.resolve_element(scene, "editor", action_type=CanonicalActionType.TYPE)
+    assert el is not None
+    assert el.element_id == 1
+    assert el.role == "Document"
+    assert err is None
+
+
 def test_resolve_element_ambiguous_returns_diagnostic():
     scene = _make_scene([("Help Topics", "Button"), ("Help Center", "Button")])
     el, err = AliasMapper.resolve_element(scene, "Help")
