@@ -36,6 +36,8 @@ from servo.config import settings
 from servo import user_settings
 from servo.control.confirmation import ConfirmationRequest
 from servo.control.jev_gate import JevGate
+from servo.daemon.auth import LocalHostGuard
+from servo.daemon.scheduler import Scheduler
 from servo.perception import windows
 
 logger = logging.getLogger("servo.copilot")
@@ -111,6 +113,8 @@ class CopilotSession:
         self.step_mode = False
         self.tracker = ForegroundTracker(self.is_own_window)
         self._unsub = bus.subscribe(self._on_trace)
+        # Queue + schedule. The firing thread starts in run_copilot(), not here.
+        self.scheduler = Scheduler(self._start_scheduled, notify=self._notice)
 
     # ---------------------------------------------------------------- plumbing
 
@@ -210,6 +214,49 @@ class CopilotSession:
         }
 
     # -------------------------------------------------------------------- runs
+
+    def submit(self, text: str) -> Dict[str, Any]:
+        """Front door for a typed/spoken request: schedule, queue, or run now.
+
+        Returns {"run_id": id} when a run started, or {"notice": text, "queued": bool}
+        when the request was scheduled, queued behind the current run, or was a
+        schedule-management command ("list scheduled tasks", "cancel ab12cd").
+        """
+        text = text.strip()
+        if not text:
+            raise ValueError("Type a request first.")
+        reply = self.scheduler.handle_command(text)
+        if reply is not None:
+            self.broadcast({"type": "notice", "text": text, "reply": reply})
+            return {"run_id": None, "notice": reply, "queued": False}
+        goal = self.scheduler.queue_request(text) or text
+        if self.busy:
+            job = self.scheduler.enqueue(goal)
+            ahead = sum(1 for j in self.scheduler.jobs() if j.kind == "queued") - 1
+            reply = f"Queued [{job.id}]: it starts when the current request finishes" + (
+                f" ({ahead} ahead of it)." if ahead else ".")
+            self.broadcast({"type": "notice", "text": text, "reply": reply})
+            return {"run_id": None, "notice": reply, "queued": True}
+        try:
+            return {"run_id": self.send(goal)}
+        except RuntimeError:  # lost a race with a run that just started
+            job = self.scheduler.enqueue(goal)
+            reply = f"Queued [{job.id}]: it starts when the current request finishes."
+            self.broadcast({"type": "notice", "text": text, "reply": reply})
+            return {"run_id": None, "notice": reply, "queued": True}
+
+    def _start_scheduled(self, goal: str) -> bool:
+        """Scheduler callback: start ``goal`` if idle; False means try again later."""
+        if self.busy:
+            return False
+        try:
+            self.send(goal)
+            return True
+        except RuntimeError:
+            return False
+
+    def _notice(self, reply: str) -> None:
+        self.broadcast({"type": "notice", "text": "", "reply": reply})
 
     def send(self, text: str) -> str:
         text = text.strip()
@@ -344,7 +391,7 @@ class CopilotSession:
             t = threading.Thread(target=_show_popup, name="servo-popup-confirm", daemon=True)
             t.start()
 
-            choice = self.ask("confirm", req.model_dump(), ["proceed", "skip", "stop"], wait_s=30.0)
+            choice = self.ask("confirm", req.model_dump(), ["proceed", "skip", "stop"], timeout=30.0)
             if choice == "proceed":
                 return True
             if choice in ("skip", "stop"):
@@ -362,6 +409,10 @@ class CopilotSession:
 
 class SendBody(BaseModel):
     text: str
+
+
+class CancelBody(BaseModel):
+    id: Optional[str] = None  # None = cancel everything
 
 
 class VoiceTranscribeBody(BaseModel):
@@ -440,6 +491,8 @@ class StepModeBody(BaseModel):
 
 def create_app(session: CopilotSession) -> FastAPI:
     app = FastAPI(title="Servo Copilot", docs_url=None, redoc_url=None, openapi_url=None)
+    # The page at / embeds the session token, so a DNS-rebound origin must not reach it.
+    app.add_middleware(LocalHostGuard)
 
     def check(token: Optional[str]) -> None:
         if not token or not secrets.compare_digest(token, session.token):
@@ -476,9 +529,24 @@ def create_app(session: CopilotSession) -> FastAPI:
     def send(body: SendBody, x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
         check(x_servo_token)
         try:
-            return {"run_id": session.send(body.text)}
+            return session.submit(body.text)
         except (ValueError, RuntimeError) as e:
             raise HTTPException(status_code=409, detail=str(e))
+
+    @app.get("/api/schedule")
+    def get_schedule(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        return {"jobs": [dict(j.model_dump(), description=j.describe()) for j in session.scheduler.jobs()]}
+
+    @app.post("/api/schedule/cancel")
+    def cancel_schedule(body: CancelBody, x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        if body.id:
+            job = session.scheduler.cancel(body.id)
+            if job is None:
+                raise HTTPException(status_code=404, detail=f"No scheduled task with id {body.id}.")
+            return {"ok": True, "cancelled": 1}
+        return {"ok": True, "cancelled": session.scheduler.clear()}
 
     @app.get("/api/voice/status")
     def voice_status(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
@@ -517,11 +585,13 @@ def create_app(session: CopilotSession) -> FastAPI:
         try:
             from servo.daemon.voice import voice_manager, VoiceUnavailableError
             text = voice_manager.transcribe_audio(audio_bytes)
-            run_id = None
+            result: Dict[str, Any] = {"run_id": None}
             if body.auto_send and text:
-                run_id = session.send(text)
-            return {"text": text, "run_id": run_id, "status": "ok"}
+                result = session.submit(text)
+            return {"text": text, "status": "ok", **result}
         except VoiceUnavailableError as e:
+            if "empty" in str(e).lower():
+                return {"text": "", "status": "ok", "run_id": None}
             raise HTTPException(status_code=503, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"ASR transcription error: {e}")
@@ -733,6 +803,7 @@ def run_copilot(open_window: bool = True, port: Optional[int] = None) -> None:
     worker.start()
     session = CopilotSession()
     session.tracker.start()
+    session.scheduler.start()
     app = create_app(session)
     port = _free_port(port or settings.copilot_port)
     server = _start_server(app, port)
@@ -789,6 +860,7 @@ def run_copilot(open_window: bool = True, port: Optional[int] = None) -> None:
                 f"--unsafely-treat-insecure-origin-as-secure={url.rstrip('/')}",
                 "--autoplay-policy=no-user-gesture-required",
                 "--enable-features=SpeechRecognition",
+                "--use-fake-ui-for-media-stream",
             ])
             hwnd = find_window(WINDOW_TITLE)
             if hwnd:
@@ -830,6 +902,10 @@ def _ensure_edge_mic_permission(profile_dir: Path, url: str) -> None:
         mic = exceptions.setdefault("media_stream_mic", {})
         mic[f"http://127.0.0.1:{port},*"] = {"setting": 1}
         mic[f"http://localhost:{port},*"] = {"setting": 1}
+        mic["http://127.0.0.1:*"] = {"setting": 1}
+        mic["http://localhost:*"] = {"setting": 1}
+        default_settings = data.setdefault("profile", {}).setdefault("default_content_setting_values", {})
+        default_settings["media_stream_mic"] = 1
         pref_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception as e:
         logger.debug("Could not pre-configure Edge mic permissions: %s", e)

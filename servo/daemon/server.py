@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from servo import __version__
 from servo.config import get_hardware_profile, settings
-from servo.daemon.auth import get_api_token, require_token, token_path
+from servo.daemon.auth import LOOPBACK_HOSTS, LocalHostGuard, get_api_token, require_token, token_path
 from servo.daemon.tasks import TaskRequestError, get_trace_store, run_goal, sense_scene
 from servo.daemon.ui import hud_overlay
 from servo.daemon.voice import VoiceUnavailableError, voice_manager
@@ -55,6 +55,9 @@ app = FastAPI(
     description="Local-First, Closed-Loop Neuro-Symbolic Desktop Control Runtime",
     lifespan=lifespan,
 )
+# Mutable so main() can add a deliberately chosen non-loopback bind address.
+ALLOWED_HOSTS = set(LOOPBACK_HOSTS) | {h.strip().lower() for h in settings.allowed_hosts if h.strip()}
+app.add_middleware(LocalHostGuard, allowed_hosts=ALLOWED_HOSTS)
 
 ModeField = Optional[Literal["assistant", "harness"]]
 
@@ -455,6 +458,10 @@ def main() -> None:
     else:
         if args.host not in ("127.0.0.1", "localhost", "::1"):
             print(f"WARNING: binding to {args.host} exposes desktop control beyond this machine.", file=sys.stderr)
+            if args.host in ("0.0.0.0", "::"):
+                print("Add the address clients will use to SERVO_ALLOWED_HOSTS, or requests get 403.", file=sys.stderr)
+            else:
+                ALLOWED_HOSTS.add(args.host.lower())
         get_api_token()
         print(f"Servo REST API token: {token_path()} (or SERVO_API_TOKEN)", file=sys.stderr)
         print(f"Servo Web Dashboard available at: http://{args.host}:{args.port}/", file=sys.stderr)

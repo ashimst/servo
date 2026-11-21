@@ -31,6 +31,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from pydantic import BaseModel, Field
 
+from servo.actuation import system_tools
 from servo.cognition import browser as browser_mod
 from servo.cognition.needle import BROWSER_TOOLS, Tier1Intent, describe_step
 from servo.cognition.system2 import System2, System2Unavailable
@@ -63,6 +64,7 @@ class StepRecord(BaseModel):
     success: bool
     error: Optional[str] = None
     latency_ms: int = 0
+    output: str = ""  # what a system tool returned (file text, command output)
 
 
 class StepOutcome(BaseModel):
@@ -72,6 +74,7 @@ class StepOutcome(BaseModel):
     tier: str = "uia"
     detail: Dict[str, Any] = Field(default_factory=dict)
     reports: List[StepExecutionReport] = Field(default_factory=list)
+    output: str = ""  # system tools: shown to you and fed back to System 2
 
 
 class RunOutcome(BaseModel):
@@ -84,6 +87,13 @@ class RunOutcome(BaseModel):
     replans: int = 0
     aborted: bool = False
     latency_ms: int = 0
+
+
+_RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+
+def _indent(text: str, prefix: str = "    ") -> str:
+    return "\n".join(prefix + line for line in text.splitlines())
 
 
 def classify_error(err: str) -> str:
@@ -280,7 +290,11 @@ class CascadeRouter:
             else:
                 if not agentic:
                     n = len(records)
-                    return finish(True, f"Done — {n} step{'s' if n != 1 else ''} completed.", route)
+                    shown = [r.output for r in records if r.output]
+                    reply = f"Done — {n} step{'s' if n != 1 else ''} completed."
+                    if shown:
+                        reply += "\n\n" + "\n\n".join(shown)
+                    return finish(True, reply, route)
                 failure = None
                 screen_kind = None
                 if counters["rounds"] >= settings.max_rounds:
@@ -352,6 +366,7 @@ class CascadeRouter:
                 steps = [item]
 
             skipped = False
+            outputs: List[str] = []
             for step in steps:
                 if self.abort_event.is_set():
                     progress(i, "fail", "stopped")
@@ -361,8 +376,11 @@ class CascadeRouter:
                     out = self._execute(step)
                     sp.done("ok" if out.success else "fail", out.error or "", tier=out.tier)
                 records.append(StepRecord(command=command, tool=step.tool_name, tier=out.tier, success=out.success,
-                                          error=out.error, latency_ms=int((time.perf_counter() - t_step) * 1000)))
+                                          error=out.error, latency_ms=int((time.perf_counter() - t_step) * 1000),
+                                          output=out.output))
                 if out.success:
+                    if out.output:
+                        outputs.append(out.output)
                     continue
                 if self._skip_requested:
                     self._skip_requested = False
@@ -381,7 +399,8 @@ class CascadeRouter:
                 completed.append(f"(skipped by the user) {command}")
             else:
                 progress(i, "ok")
-                completed.append(command)
+                # System 2 sees what a command printed or a file contains, so it can act on it.
+                completed.append(command + "".join(f"\n  output:\n{_indent(o)}" for o in outputs))
         return "ok", {}
 
     # ------------------------------------------------------------ asking you
@@ -422,6 +441,8 @@ class CascadeRouter:
 
     def _execute(self, step: PlanStep) -> StepOutcome:
         tool = step.tool_name
+        if tool in system_tools.SYSTEM_TOOLS:
+            return self._system(step)
         if tool in BROWSER_TOOLS:
             return self._browser_nav(step)
         if tool in BROWSER_CAPABLE and self.context == "browser" and self._browser_open():
@@ -485,9 +506,15 @@ class CascadeRouter:
 
     # ---------------------------------------------------------- browser
 
-    def _gate(self, sub_goal: str, tool_call: str, label: str, window_title: str) -> Optional[StepOutcome]:
-        """Kev pre-check + confirmation. Returns a failed outcome to stop, or None to proceed."""
+    def _gate(self, sub_goal: str, tool_call: str, label: str, window_title: str,
+              floor: Optional[Tuple[str, str]] = None, process_name: str = "browser") -> Optional[StepOutcome]:
+        """Kev pre-check + confirmation. Returns a failed outcome to stop, or None to proceed.
+
+        ``floor`` is a deterministic (level, reason) minimum that Kev cannot lower.
+        """
         pre = self.kev.evaluate_pre_risk(sub_goal, tool_call, label)
+        if floor and _RISK_ORDER[floor[0]] > _RISK_ORDER[pre.risk_level]:
+            pre = pre.model_copy(update={"risk_level": floor[0], "reason": f"{floor[1]} (floor; was {pre.risk_level}: {pre.reason})"})
         self.tracer.emit("decision", f"Kev pre-check · {pre.risk_level} risk", pre.reason, tier="kev",
                          status="ok" if pre.risk_level == "low" and pre.scope_valid else "warn",
                          source=pre.source, scope_valid=pre.scope_valid, probabilities=pre.probabilities)
@@ -497,7 +524,7 @@ class CascadeRouter:
         if settings.mode == "assistant" and pre.risk_level in ("medium", "high"):
             approved = self._confirm(ConfirmationRequest(
                 sub_goal=sub_goal, tool_call=tool_call, element_label=label, risk_level=pre.risk_level,
-                reason=pre.reason, hwnd=0, window_title=window_title, process_name="browser",
+                reason=pre.reason, hwnd=0, window_title=window_title, process_name=process_name,
             ))
             self.tracer.emit("decision", f"Your confirmation · {'approved' if approved else 'rejected'}", tool_call,
                              tier="kev", status="ok" if approved else "fail")
@@ -509,6 +536,40 @@ class CascadeRouter:
         if self.abort_event.is_set():
             return StepOutcome(success=False, kind="abort", tier="browser", error="Execution cancelled by user.")
         return None
+
+    # ---------------------------------------------------------- system
+
+    def _system(self, step: PlanStep) -> StepOutcome:
+        """Files and shell, without the GUI. Gated like every other action, with a floor."""
+        tool, args = step.tool_name, step.arguments
+        call = system_tools.describe(tool, args)
+        why = system_tools.availability()
+        if why:
+            return StepOutcome(success=False, kind="policy", tier="system", error=why)
+        try:
+            floor = system_tools.risk_floor(tool, args)
+        except Exception as e:  # e.g. an unparsable path
+            return StepOutcome(success=False, kind="error", tier="system", error=str(e))
+        stop = self._gate(step.rationale or call, call, str(args.get("path") or args.get("command") or ""),
+                          "system", floor=floor, process_name="system")
+        if stop:
+            return stop
+        self.tracer.emit("action", call, f"Direct {tool.replace('_', ' ')} (no GUI)", tier="system")
+        t0 = time.perf_counter()
+        try:
+            res = system_tools.execute(tool, args, abort=self.abort_event)
+        except system_tools.SystemToolError as e:
+            kind = "abort" if self.abort_event.is_set() else "error"
+            self.tracer.emit("verify", f"{tool} failed", str(e), tier="system", status="fail")
+            self._report(step, False, call, str(e))
+            return StepOutcome(success=False, kind=kind, tier="system", error=str(e))
+        except Exception as e:
+            self._report(step, False, call, str(e))
+            return StepOutcome(success=False, kind="error", tier="system", error=f"{tool} failed: {e}")
+        self.tracer.emit("verify", res.summary, res.output[:2000], tier="system", status="ok",
+                         duration_ms=int((time.perf_counter() - t0) * 1000))
+        self._report(step, True, res.summary)
+        return StepOutcome(success=True, tier="system", output=res.output)
 
     def _browser_nav(self, step: PlanStep) -> StepOutcome:
         args = step.arguments

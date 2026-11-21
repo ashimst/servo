@@ -157,8 +157,15 @@ def _matches_app(w: Dict[str, Any], app_key: str, exe_filename: str) -> bool:
     return app_key in title
 
 
+# App names come from the user, Needle or an LLM (which may have read a hostile web
+# page). Shell metacharacters have no place in an app name, so refuse them outright.
+_UNSAFE_APP_NAME = re.compile(r'["&|^<>%;`$\r\n]')
+
+
 def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
     """Find an existing window for the app or launch it and return (hwnd, title)."""
+    if _UNSAFE_APP_NAME.search(app_name):
+        return None, f"Refusing to launch '{app_name}': app names cannot contain shell characters."
     app_key = app_name.strip().lower()
     full_exe_path = resolve_app_executable(app_name)
     exe_filename = os.path.basename(full_exe_path).lower()
@@ -193,7 +200,8 @@ def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
             if os.path.isabs(full_exe_path) and os.path.exists(full_exe_path):
                 subprocess.Popen([full_exe_path])
             else:
-                subprocess.Popen(f'start "" "{full_exe_path}"', shell=True)
+                # ShellExecute resolves App Paths / PATH like `start` did, without a shell.
+                os.startfile(full_exe_path)  # type: ignore[attr-defined]
         else:
             subprocess.Popen([full_exe_path])
     except Exception as e:

@@ -5,7 +5,7 @@
 Servo is an ultra-low-latency desktop automation engine built around a three-tier cybernetic servomechanism:
 
 1. **System 2 (Setpoint Planner):** Breaks high-level user instructions into atomic sub-goals without needing raw screenshots or pixel coordinates. Supports OpenAI-compatible endpoints, Anthropic Claude, Google Gemini, and direct MCP callers.
-2. **Safety Comparator (Jev Gate):** Non-autoregressive decision model validating pre-action risk levels (`low`, `medium`, `high`) and verifying post-action UI transitions.
+2. **Safety Comparator (Kev Gate):** Non-autoregressive decision model ([Kev](https://github.com/jaredpalmer/kev), the open implementation of TypeSafe's Jev API) validating pre-action risk levels (`low`, `medium`, `high`) and verifying post-action UI transitions. Without a Kev server, a deterministic keyword and shell-command floor gates every action.
 3. **System 1 Reflex Arc (UIA + Mirage + Needle 3):** High-frequency, deterministic perception and kinematics running on CPU within a strict memory budget.
 
 ---
@@ -79,6 +79,46 @@ tier handled what and why, confidences, Kev's verdicts, the exact LLM prompt and
 visible reasoning, and every action and verification. Medium- and high-risk actions ask
 for approval inside the copilot. See [docs/COGNITIVE_CASCADE.md](docs/COGNITIVE_CASCADE.md).
 
+#### Files and shell, without the GUI
+
+For work that is really about files or commands, Servo skips the GUI:
+
+* *"read file desktop\notes.txt"*, *"list folder downloads"*
+* *`write "buy milk" to file desktop\todo.txt`* (or `append "…" to file …`)
+* *`run command "Get-PSDrive C"`* (PowerShell; `run cmd command "…"` for cmd)
+
+The output shows in the reply, and System 2 sees it next round, so a multi-step goal
+can act on what a command printed. These commands are parsed only by the command
+grammar (the on-device model never proposes them), and they are gated:
+
+| Action | Risk | Effect in assistant mode |
+| :--- | :--- | :--- |
+| Read a file, list a folder | low | runs |
+| Read a credential store (`.ssh`, `*.pem`, browser `Login Data`…) | high | asks |
+| Write a new file, append | medium | asks |
+| Overwrite a file, write a script/executable, write into Startup | high | asks |
+| Any shell command | medium | asks, showing the exact command |
+| Destructive or download-and-run command (`del`, `rm -rf`, `Remove-Item`, `iex`…) | high | asks |
+
+`~/.servo` (API token, keys, chat memory) is never readable or writable this way, because
+file contents go to the System 2 provider. Commands time out after
+`SERVO_COMMAND_TIMEOUT_SECONDS`, and Stop kills the command and everything it started.
+System tools are disabled in harness mode (it runs without confirmation) and can be
+turned off with `SERVO_SYSTEM_TOOLS=false`.
+
+#### Queue and schedule
+
+* Press Enter while a request is running and the new one **queues** behind it
+  (or say *"after this, …"*).
+* *"in 10 minutes …"*, *"at 15:30 …"*, *"tomorrow at 9am …"*, *"every day at 9:00 …"*,
+  *"every 30 minutes …"* schedule a request.
+* *"list scheduled tasks"*, *"cancel ab12cd"*, *"clear the schedule"* manage them.
+
+Scheduled requests run through the same cascade and gate, but only while the copilot
+is running (this is not the Windows Task Scheduler). A job that came due while Servo
+was off is not run late: one-shot jobs are dropped, recurring ones skip ahead. If a
+scheduled run reaches a risky step and nobody answers, it stops.
+
 ---
 
 ### 2. Run as a Model Context Protocol (MCP) Server
@@ -109,7 +149,7 @@ Exposed MCP Tools:
 
 ---
 
-### 2. Run as a Local REST Server
+### 3. Run as a Local REST Server
 
 Launch the FastAPI daemon with local bearer authentication:
 
@@ -150,6 +190,10 @@ Configure runtime options via environment variables (prefix `SERVO_`):
 | `SERVO_BROWSER_CHANNEL` | `msedge` | Browser for the Playwright tier: `msedge`, `chrome`, or `chromium`. |
 | `SERVO_OPENAI_BASE_URL` | `http://localhost:11434/v1` | URL for local Ollama or OpenAI-compatible service. |
 | `SERVO_FAST_MODE` | `false` | When `true`, snaps cursor directly to targets (for automated CI). |
+| `SERVO_SYSTEM_TOOLS` | `true` | Allow the gated file and shell commands (never available in harness mode). |
+| `SERVO_COMMAND_TIMEOUT_SECONDS` | `120` | Kill a shell command (and its children) after this long. |
+| `SERVO_SCHEDULE_FILE` | `~/.servo/schedule.json` | Where scheduled requests are saved. |
+| `SERVO_ALLOWED_HOSTS` | `[]` | Extra `Host` names the REST server accepts besides loopback, e.g. `'["192.168.1.20"]'` when binding to a LAN address. Requests with any other `Host` get 403 (DNS-rebinding guard). |
 
 ---
 

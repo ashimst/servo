@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 
 from servo.actuation.alias_mapping import AliasMapper
+from servo.actuation.system_tools import SYSTEM_GRAMMAR, SYSTEM_TOOLS, parse_system_intent
 from servo.cognition import cactus_runtime
 from servo.cognition.trace import NullTracer, Tracer
 from servo.config import settings
@@ -63,7 +64,8 @@ type "<text>" into <label>     e.g. type "hello" into Search
 type "<text>"                  types into the focused editor
 press <keys>                   e.g. press ctrl+s, press enter
 save as <file name>            e.g. save as notes.txt on the desktop
-wait <seconds>                 e.g. wait 1"""
+wait <seconds>                 e.g. wait 1
+""" + SYSTEM_GRAMMAR
 
 _BROWSER_APPS = r"(?:chrome|google chrome|edge|microsoft edge|msedge|firefox|brave|the browser|browser|a browser)"
 _URLISH = re.compile(r"^(?:https?://\S+|(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:/\S*)?)$", re.I)
@@ -79,7 +81,7 @@ class Tier1Proposal(BaseModel):
 
 def _step(i: int, tool: str, args: Dict[str, Any], why: str) -> PlanStep:
     canon = None
-    if tool not in BROWSER_TOOLS:
+    if tool not in BROWSER_TOOLS and tool not in SYSTEM_TOOLS:
         try:
             canon = AliasMapper.canonicalize_action(raw_action=tool, **args)
         except Exception:
@@ -181,6 +183,11 @@ def parse_save(t: str) -> Optional[MacroPlan]:
 
 
 def parse_grammar(text: str, user_name: str = "User") -> Optional[MacroPlan]:
+    # System tools first: grammar-only (never Needle), and their quoted text is literal.
+    sys_intent = parse_system_intent(text)
+    if sys_intent:
+        tool, args = sys_intent
+        return MacroPlan(goal=text.strip(), steps=[_step(1, tool, args, f"{tool.replace('_', ' ').capitalize()}")])
     t = text.strip().rstrip(".")
     plan = parse_web_intent(t)
     if plan and _plausible(plan):
@@ -250,7 +257,7 @@ def _describes_text_to_write(t: str) -> bool:
 # Verbs that start a new clause in a compound request ("…, then open notepad and type …").
 _CLAUSE_VERBS = (
     r"open|launch|start|close|quit|exit|click|double[\s-]click|right[\s-]click|press|hit|type|write|enter|"
-    r"go\s+to|visit|navigate|browse|search|google|look\s+up|wait|save|store|put|paste|copy|note|record|"
+    r"go\s+to|visit|navigate|browse|search|google|look\s+up|wait|save|run|store|put|paste|copy|note|record|"
     r"summari[sz]e|send|email|reply|compare|list|find|read|tell|show|make|create|add|remove|delete|"
     r"download|upload|select|scroll|switch|rename|move|minimi[sz]e|maximi[sz]e|check|fill|submit|sign|log"
 )

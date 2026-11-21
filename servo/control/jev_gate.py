@@ -122,6 +122,55 @@ def _keyword_risk(text: str) -> Tuple[str, str]:
     return "low", "Standard benign operation"
 
 
+# Windows whose keystrokes run as commands. Anything typed or pressed there can do
+# whatever the user's account can, whatever the words look like.
+SHELL_PROCESSES = frozenset({
+    "cmd.exe", "powershell.exe", "pwsh.exe", "powershell_ise.exe", "windowsterminal.exe",
+    "wt.exe", "conhost.exe", "openconsole.exe", "bash.exe", "wsl.exe", "mintty.exe",
+})
+
+# Destructive or download-and-run shell commands. Matched as whole command words (not
+# the suffix rule above), so "del" does not fire on "delivery" or "Dell".
+_DESTRUCTIVE_COMMAND = re.compile(
+    r"""(?ix)
+      \b(?:del|erase|rd|rmdir)\s+\S          # cmd deletes
+    | \brm\s+-\w*[rf]                       # rm -r / -f / -rf
+    | \bformat(?:\.com)?\s+[a-z]:           # format c:
+    | \breg(?:\.exe)?\s+(?:delete|add)\b    # registry edits
+    | \b(?:diskpart|bcdedit|vssadmin|takeown|icacls|schtasks|sc\s+delete|net\s+user)\b
+    | \bcipher\s+/w
+    | \b(?:remove-item|clear-content|stop-computer|restart-computer|clear-disk|format-volume
+          |set-executionpolicy|invoke-expression|start-process)\b
+    | \biex\b                               # PowerShell download-and-run
+    | \|\s*(?:sh|bash)\b                    # curl ... | sh
+    """
+)
+
+
+def _typed_text(tool_call: str) -> str:
+    """The text= argument of a type_text(...) / fill(...) call representation, if any."""
+    m = re.search(r"text=(['\"])(.*)\1", tool_call, re.S)
+    return m.group(2) if m else ""
+
+
+def _shell_risk(tool_call: str, target_process: str) -> Tuple[str, str]:
+    """Risk floor from where keystrokes land and what they say."""
+    proc = (target_process or "").strip().lower()
+    in_shell = proc in SHELL_PROCESSES
+    call = tool_call.strip().lower()
+    sends_keys = call.startswith(("type_text", "hotkey", "fill", "press"))
+    typed = _typed_text(tool_call)
+    if typed:
+        m = _DESTRUCTIVE_COMMAND.search(typed)
+        if m:
+            # In a shell it runs; elsewhere it is probably harmless text, but still ask.
+            level = "high" if in_shell else "medium"
+            return level, f"Destructive shell command in typed text: '{m.group(0).strip()}'"
+    if in_shell and sends_keys:
+        return "medium", f"Keystrokes into a shell window ({proc}) run as commands"
+    return "low", ""
+
+
 class KevClient:
     """Minimal client for the System One wire contract."""
 
@@ -219,18 +268,25 @@ class JevGate:
 
     # ----------------------------------------------------------------- safety
 
-    def evaluate_pre_risk(self, sub_goal: str, tool_call: str, element_label: str) -> PreRiskResult:
+    def evaluate_pre_risk(
+        self, sub_goal: str, tool_call: str, element_label: str, target_process: str = ""
+    ) -> PreRiskResult:
         """Classify risk (low | medium | high) and scope validity before actuation.
 
-        The final risk is the MAX of Kev's level and the keyword floor: a model may raise
-        the risk of an innocuous-sounding action, but never lower one that names a
-        destructive verb.
+        The final risk is the MAX of Kev's level and the deterministic floor (risky
+        keywords, plus keystrokes into a shell window or destructive shell commands): a
+        model may raise the risk of an innocuous-sounding action, but never lower one
+        the floor flags.
         """
         combined_text = f"{sub_goal} {tool_call} {element_label}"
         kw_level, kw_reason = _keyword_risk(combined_text)
+        sh_level, sh_reason = _shell_risk(tool_call, target_process)
+        if _RISK_ORDER[sh_level] > _RISK_ORDER[kw_level]:
+            kw_level, kw_reason = sh_level, sh_reason
 
         answers = self._ask(
-            {"sub_goal": sub_goal, "proposed_tool_call": tool_call, "target_element": element_label},
+            {"sub_goal": sub_goal, "proposed_tool_call": tool_call, "target_element": element_label,
+             "target_process": target_process},
             {
                 "risk_level": {
                     "type": "score",

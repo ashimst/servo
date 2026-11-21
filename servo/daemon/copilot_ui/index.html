@@ -473,7 +473,7 @@ textarea::placeholder { color: var(--ink-3); }
   const runs = new Map();       // run_id -> {root, ladder, reply, list, events: Map(seq->li), count, t0}
   let busy = false, currentRun = null, ws = null, retry = 0;
 
-  const TIER_NAME = { needle: "Needle", uia: "UIA", browser: "Browser", mirage: "Mirage", kev: "Kev", system2: "System 2", router: "Router", copilot: "Servo" };
+  const TIER_NAME = { needle: "Needle", uia: "UIA", browser: "Browser", mirage: "Mirage", kev: "Kev", system2: "System 2", system: "Files & shell", router: "Router", copilot: "Servo" };
   const RUNG_OF = { needle: "needle", uia: "screen", browser: "screen", mirage: "mirage", system2: "system2" };
   const RUNG_ORDER = ["needle", "screen", "mirage", "system2"];
   const RUNG_LABEL = { needle: "Needle", screen: "Screen", mirage: "Mirage", system2: "System 2" };
@@ -537,7 +537,7 @@ textarea::placeholder { color: var(--ink-3); }
       ? '<svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><rect x="2" y="2" width="10" height="10" rx="2"/></svg>'
       : '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 8.5 14 2l-3.8 12-2.4-5.1z"/></svg>';
     sendBtn.disabled = !b && !input.value.trim();
-    $("#hint").textContent = b ? "Working · Esc to stop" : "Enter to send · Shift+Enter for a new line";
+    $("#hint").textContent = b ? "Working · Esc to stop · Enter queues another request" : "Enter to send · Shift+Enter for a new line";
   }
 
   // ---------- runs ----------
@@ -847,6 +847,7 @@ textarea::placeholder { color: var(--ink-3); }
           if (ev.kind === "plan" && !run.planCards.has(ev.seq)) renderPlan(run, ev);
           break;
         }
+        case "notice": renderNotice(msg.text, msg.reply); break;
         case "ask": renderAsk(msg); break;
         case "ask_closed": closeAsk(msg); break;
         case "run_finished": {
@@ -867,13 +868,27 @@ textarea::placeholder { color: var(--ink-3); }
   }
 
   // ---------- composer ----------
+  // A request sent while another runs is queued by the server (or scheduled, for
+  // "in 10 minutes ..."); the server broadcasts a notice card for those.
+  function renderNotice(text, reply) {
+    const run = ensureRun("notice-" + Date.now() + Math.random(), text);
+    run.reply.classList.remove("pending");
+    run.reply.textContent = reply;
+    run.reply.closest(".run")?.querySelectorAll(".ladder, .trace").forEach((el) => el.remove());
+    if (!text) run.reply.closest(".run")?.querySelector(".you")?.remove();
+  }
   async function submit(text) {
     text = (text ?? input.value).trim();
-    if (!text || busy) return;
-    input.value = ""; autosize(); setBusy(true);
-    try { await api("/api/send", { text }); }
+    if (!text) return;
+    const wasBusy = busy;
+    input.value = ""; autosize();
+    if (!wasBusy) setBusy(true);
+    try {
+      const data = await api("/api/send", { text });
+      if (!data.run_id && !wasBusy) setBusy(false);
+    }
     catch (e) {
-      setBusy(false);
+      if (!wasBusy) setBusy(false);
       const run = ensureRun("local-" + Date.now(), text);
       run.reply.classList.remove("pending"); run.reply.classList.add("fail"); run.reply.textContent = e.message;
     }
@@ -894,8 +909,60 @@ textarea::placeholder { color: var(--ink-3); }
 
   // ---------- voice ASR ----------
   const voiceBtn = $("#voiceBtn"), voiceWave = $("#voiceWave");
-  let isListening = false, mediaRecorder = null, audioChunks = [];
-  let audioContext = null, analyser = null, animFrame = null, recStream = null;
+  let isListening = false, recStream = null;
+  let audioContext = null, analyser = null, animFrame = null, scriptNode = null, sourceNode = null;
+  let pcmChunks = [], audioChunks = [], mediaRecorder = null, recordTimer = null;
+
+  function downsampleTo16k(chunks, inRate) {
+    let totalLen = 0;
+    for (let i = 0; i < chunks.length; i++) totalLen += chunks[i].length;
+    const full = new Float32Array(totalLen);
+    let offset = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      full.set(chunks[i], offset);
+      offset += chunks[i].length;
+    }
+    if (inRate === 16000) return full;
+    const ratio = inRate / 16000;
+    const newLen = Math.round(full.length / ratio);
+    const result = new Float32Array(newLen);
+    for (let i = 0; i < newLen; i++) {
+      const srcIdx = i * ratio;
+      const low = Math.floor(srcIdx);
+      const high = Math.min(low + 1, full.length - 1);
+      const frac = srcIdx - low;
+      result[i] = full[low] * (1 - frac) + full[high] * frac;
+    }
+    return result;
+  }
+
+  function encodeWAV(samples, sampleRate) {
+    sampleRate = sampleRate || 16000;
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    function writeStr(offset, str) {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    }
+    writeStr(0, "RIFF");
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeStr(8, "WAVE");
+    writeStr(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, "data");
+    view.setUint32(40, samples.length * 2, true);
+    let offset = 44;
+    for (let i = 0; i < samples.length; i++, offset += 2) {
+      let s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return new Blob([view], { type: "audio/wav" });
+  }
 
   function setVoiceState(state) {
     if (state === "listening") {
@@ -904,14 +971,14 @@ textarea::placeholder { color: var(--ink-3); }
       voiceBtn.classList.remove("transcribing");
       voiceWave.classList.add("active");
       voiceBtn.title = "Recording... Click to stop & transcribe (Alt+V)";
-      input.placeholder = "🎙️ Recording... Speak now. Click mic again (or Alt+V) to finish.";
+      input.placeholder = "🎙️ Listening... Speak now. Click mic again (or Alt+V) to finish.";
     } else if (state === "transcribing") {
       isListening = false;
       voiceBtn.classList.remove("listening");
       voiceBtn.classList.add("transcribing");
       voiceWave.classList.remove("active");
-      voiceBtn.title = "Transcribing audio...";
-      input.placeholder = "Transcribing speech...";
+      voiceBtn.title = "Transcribing audio locally...";
+      input.placeholder = "Transcribing with Cactus Whistle...";
     } else {
       isListening = false;
       voiceBtn.classList.remove("listening", "transcribing");
@@ -927,111 +994,161 @@ textarea::placeholder { color: var(--ink-3); }
       return;
     }
     try {
-      recStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      audioChunks = [];
-      const mimeType = (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported("audio/webm;codecs=opus"))
-        ? "audio/webm;codecs=opus"
-        : ((window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported("audio/webm")) ? "audio/webm" : "");
-      mediaRecorder = mimeType ? new MediaRecorder(recStream, { mimeType }) : new MediaRecorder(recStream);
-      
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) audioChunks.push(e.data);
-      };
-
-      // Real-time audio visualizer on wave bars
-      try {
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        if (AudioCtx) {
-          audioContext = new AudioCtx();
-          const source = audioContext.createMediaStreamSource(recStream);
-          analyser = audioContext.createAnalyser();
-          analyser.fftSize = 64;
-          source.connect(analyser);
-          const dataArray = new Uint8Array(analyser.frequencyBinCount);
-          const waveBars = voiceWave.querySelectorAll("span");
-
-          function updateVisualizer() {
-            if (!isListening) return;
-            analyser.getByteFrequencyData(dataArray);
-            for (let i = 0; i < waveBars.length; i++) {
-              const val = dataArray[i * 2 + 1] || 0;
-              const h = Math.max(4, Math.min(22, (val / 255) * 22));
-              waveBars[i].style.height = h + "px";
-            }
-            animFrame = requestAnimationFrame(updateVisualizer);
-          }
-          updateVisualizer();
+      recStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
         }
-      } catch (visErr) {
-        console.debug("Audio visualizer error (non-fatal):", visErr);
+      });
+      pcmChunks = [];
+      audioChunks = [];
+
+      // AudioContext for raw 16kHz PCM capture and live waveform
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (AudioCtx) {
+        audioContext = new AudioCtx();
+        if (audioContext.state === "suspended") {
+          await audioContext.resume();
+        }
+        sourceNode = audioContext.createMediaStreamSource(recStream);
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 64;
+        sourceNode.connect(analyser);
+
+        if (audioContext.createScriptProcessor) {
+          scriptNode = audioContext.createScriptProcessor(4096, 1, 1);
+          scriptNode.onaudioprocess = (e) => {
+            if (!isListening) return;
+            const channelData = e.inputBuffer.getChannelData(0);
+            pcmChunks.push(new Float32Array(channelData));
+          };
+          sourceNode.connect(scriptNode);
+          scriptNode.connect(audioContext.destination);
+        }
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        const waveBars = voiceWave.querySelectorAll("span");
+        function updateVisualizer() {
+          if (!isListening) return;
+          analyser.getByteFrequencyData(dataArray);
+          for (let i = 0; i < waveBars.length; i++) {
+            const val = dataArray[i * 2 + 1] || 0;
+            const h = Math.max(4, Math.min(22, (val / 255) * 22));
+            waveBars[i].style.height = h + "px";
+          }
+          animFrame = requestAnimationFrame(updateVisualizer);
+        }
+        updateVisualizer();
       }
 
-      mediaRecorder.onstop = async () => {
-        if (animFrame) cancelAnimationFrame(animFrame);
-        if (audioContext && audioContext.state !== "closed") {
-          try { audioContext.close(); } catch (_) {}
+      // Parallel MediaRecorder backup
+      try {
+        if (window.MediaRecorder) {
+          const mimeType = (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported("audio/webm;codecs=opus"))
+            ? "audio/webm;codecs=opus"
+            : ((MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported("audio/webm")) ? "audio/webm" : "");
+          mediaRecorder = mimeType ? new MediaRecorder(recStream, { mimeType }) : new MediaRecorder(recStream);
+          mediaRecorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) audioChunks.push(e.data);
+          };
+          mediaRecorder.start(250);
         }
-        if (recStream) {
-          recStream.getTracks().forEach((track) => track.stop());
-          recStream = null;
-        }
+      } catch (mrErr) {
+        console.debug("MediaRecorder fallback initialization:", mrErr);
+      }
 
-        if (!audioChunks.length) {
-          setVoiceState("idle");
-          return;
-        }
-        setVoiceState("transcribing");
-        const blobType = mediaRecorder.mimeType || "audio/webm";
-        const audioBlob = new Blob(audioChunks, { type: blobType });
-        const reader = new FileReader();
-        reader.onloadend = async () => {
-          try {
-            const b64 = (reader.result || "").split(",")[1];
-            if (!b64) throw new Error("Audio buffer conversion failed");
-            const res = await api("/api/voice/transcribe", { audio_b64: b64 });
-            if (res && res.text) {
-              const transcribed = res.text.trim();
-              input.value = (input.value ? input.value.trim() + " " : "") + transcribed;
-              autosize();
-              sendBtn.disabled = !input.value.trim();
-            }
-          } catch (err) {
-            console.error("ASR transcription error:", err);
-            const run = ensureRun("local-" + Date.now(), "Voice ASR");
-            run.reply.classList.remove("pending");
-            run.reply.classList.add("fail");
-            run.reply.textContent = "ASR Error: " + err.message;
-          } finally {
-            setVoiceState("idle");
-            input.focus();
-          }
-        };
-        reader.readAsDataURL(audioBlob);
-      };
-
-      mediaRecorder.start(250);
       setVoiceState("listening");
+
+      // Auto-stop after 30 seconds
+      if (recordTimer) clearTimeout(recordTimer);
+      recordTimer = setTimeout(() => {
+        if (isListening) stopRecording();
+      }, 30000);
+
     } catch (err) {
       console.error("Microphone access error:", err);
       const run = ensureRun("local-" + Date.now(), "Microphone");
       run.reply.classList.remove("pending");
       run.reply.classList.add("fail");
-      run.reply.textContent = "Microphone error: " + err.message + ". Please verify microphone access in Windows Privacy Settings.";
+      run.reply.textContent = "Microphone error: " + err.message + ". Check Windows Settings > Privacy & security > Microphone.";
       setVoiceState("idle");
     }
   }
 
-  function stopRecording() {
+  async function stopRecording() {
+    if (!isListening) return;
+    if (recordTimer) { clearTimeout(recordTimer); recordTimer = null; }
     if (animFrame) cancelAnimationFrame(animFrame);
+    setVoiceState("transcribing");
+
+    if (scriptNode) {
+      try { scriptNode.disconnect(); } catch (_) {}
+      scriptNode = null;
+    }
+    if (sourceNode) {
+      try { sourceNode.disconnect(); } catch (_) {}
+      sourceNode = null;
+    }
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
       try { mediaRecorder.stop(); } catch (_) {}
-    } else {
-      if (recStream) {
-        recStream.getTracks().forEach((t) => t.stop());
-        recStream = null;
-      }
-      setVoiceState("idle");
     }
+    if (recStream) {
+      recStream.getTracks().forEach((track) => track.stop());
+      recStream = null;
+    }
+
+    const inSampleRate = audioContext ? audioContext.sampleRate : 48000;
+    if (audioContext && audioContext.state !== "closed") {
+      try { await audioContext.close(); } catch (_) {}
+      audioContext = null;
+    }
+
+    // Determine audio blob to send: prefer native 16kHz mono PCM WAV
+    let audioBlob = null;
+    if (pcmChunks.length > 0) {
+      const pcm16k = downsampleTo16k(pcmChunks, inSampleRate);
+      audioBlob = encodeWAV(pcm16k, 16000);
+    } else if (audioChunks.length > 0) {
+      const blobType = mediaRecorder?.mimeType || "audio/webm";
+      audioBlob = new Blob(audioChunks, { type: blobType });
+    }
+
+    if (!audioBlob || audioBlob.size <= 44) {
+      input.placeholder = "No speech detected. Please speak closer to your microphone.";
+      setVoiceState("idle");
+      setTimeout(() => { if (!isListening) input.placeholder = "Tell Servo what to do…"; }, 3000);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onloadend = async () => {
+      try {
+        const b64 = (reader.result || "").split(",")[1];
+        if (!b64) throw new Error("Audio buffer conversion failed");
+        const res = await api("/api/voice/transcribe", { audio_b64: b64 });
+        if (res && res.text) {
+          const transcribed = res.text.trim();
+          input.value = (input.value ? input.value.trim() + " " : "") + transcribed;
+          autosize();
+          sendBtn.disabled = !input.value.trim();
+        } else {
+          input.placeholder = "No speech detected. Please speak closer to your microphone.";
+          setTimeout(() => { if (!isListening) input.placeholder = "Tell Servo what to do…"; }, 3000);
+        }
+      } catch (err) {
+        console.error("ASR transcription error:", err);
+        const run = ensureRun("local-" + Date.now(), "Voice ASR");
+        run.reply.classList.remove("pending");
+        run.reply.classList.add("fail");
+        run.reply.textContent = "ASR Error: " + err.message;
+      } finally {
+        setVoiceState("idle");
+        input.focus();
+      }
+    };
+    reader.readAsDataURL(audioBlob);
   }
 
   function toggleVoice() {

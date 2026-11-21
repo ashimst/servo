@@ -18,7 +18,7 @@ def client(monkeypatch, tmp_path):
     from servo.config import settings
     monkeypatch.setattr(settings, "trace_dir", tmp_path)
     monkeypatch.setattr(tasks, "_trace_store", None)
-    return TestClient(app)
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 AUTH = {"Authorization": f"Bearer {TOKEN}"}

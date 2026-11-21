@@ -160,12 +160,23 @@ class ServoConfig(BaseSettings):
     # Local REST API bearer token. If empty, a random token is generated on first
     # start and stored in ~/.servo/api_token (see servo.daemon.auth).
     api_token: str = ""
+    # Extra Host names the REST server accepts besides loopback (DNS-rebinding guard),
+    # e.g. '["192.168.1.20"]' when deliberately binding to a LAN address.
+    allowed_hosts: list[str] = Field(default_factory=list)
 
     # Assistant-mode confirmation for medium/high-risk actions:
     #   'dialog' - native Yes/No dialog on the automated desktop (default No, times out to No)
     #   'deny'   - refuse all such actions (unattended / headless deployments)
     confirmation_channel: Literal["dialog", "deny"] = "dialog"
     confirmation_timeout_seconds: float = 60.0
+
+    # Direct file and shell tools (see servo/actuation/system_tools.py). Always gated:
+    # every command asks first in assistant mode; never available in harness mode.
+    system_tools: bool = True
+    command_timeout_seconds: float = 120.0
+
+    # Scheduled and queued goals (see servo/daemon/scheduler.py)
+    schedule_file: Path = Field(default_factory=lambda: Path.home() / ".servo" / "schedule.json")
 
     # Upper bound for a whole /task run (planning + all sub-goals) on the worker thread.
     # Generous because a human may be answering confirmation dialogs during the run.

@@ -456,7 +456,11 @@ class ServoControlLoop:
         element_label = target_el.label if target_el is not None else scene.window_title
 
         # 1. Jev Pre-Action Risk Gate
-        pre_risk = self.jev.evaluate_pre_risk(sub_goal, tool_call_repr, element_label)
+        try:
+            target_process = windows.get_process_name(scene.hwnd or self.hwnd)
+        except Exception:
+            target_process = ""
+        pre_risk = self.jev.evaluate_pre_risk(sub_goal, tool_call_repr, element_label, target_process)
         self.tracer.emit(
             "decision", f"Kev pre-check · {pre_risk.risk_level} risk", pre_risk.reason, tier="kev",
             status="ok" if pre_risk.risk_level == "low" and pre_risk.scope_valid else "warn",

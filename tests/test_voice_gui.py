@@ -27,7 +27,7 @@ def test_voice_status_endpoint():
     app = create_app(session)
 
     from fastapi.testclient import TestClient
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1")
 
     # Missing token -> 403
     r = client.get("/api/voice/status")
@@ -48,7 +48,7 @@ def test_voice_transcribe_endpoint_success():
     app = create_app(session)
 
     from fastapi.testclient import TestClient
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1")
 
     fake_audio_bytes = b"RIFFfake_audio_bytes_123"
     fake_b64 = base64.b64encode(fake_audio_bytes).decode("ascii")
@@ -72,7 +72,7 @@ def test_voice_transcribe_endpoint_auto_send():
     app = create_app(session)
 
     from fastapi.testclient import TestClient
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1")
 
     fake_b64 = base64.b64encode(b"RIFFtest").decode("ascii")
 
@@ -96,7 +96,7 @@ def test_voice_transcribe_endpoint_handles_unavailable_error():
     app = create_app(session)
 
     from fastapi.testclient import TestClient
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1")
 
     fake_b64 = base64.b64encode(b"RIFFtest").decode("ascii")
 
@@ -116,7 +116,7 @@ def test_voice_transcribe_endpoint_rejects_invalid_audio():
     app = create_app(session)
 
     from fastapi.testclient import TestClient
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1")
 
     # Empty string
     r = client.post(
@@ -133,3 +133,27 @@ def test_voice_transcribe_endpoint_rejects_invalid_audio():
         json={"audio_b64": "!!!not_base64!!!", "auto_send": False},
     )
     assert r.status_code == 400
+
+
+def test_voice_transcribe_endpoint_handles_empty_speech_gracefully():
+    """Verify /api/voice/transcribe returns text='' without 503 when silence is recorded."""
+    session = CopilotSession()
+    app = create_app(session)
+
+    from fastapi.testclient import TestClient
+    client = TestClient(app, base_url="http://127.0.0.1")
+
+    fake_b64 = base64.b64encode(b"RIFFsilence").decode("ascii")
+
+    with patch("servo.daemon.voice.voice_manager.transcribe_audio", return_value=""):
+        r = client.post(
+            "/api/voice/transcribe",
+            headers={"X-Servo-Token": session.token},
+            json={"audio_b64": fake_b64, "auto_send": False},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["text"] == ""
+        assert data["status"] == "ok"
+        assert data["run_id"] is None
+

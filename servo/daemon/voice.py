@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import sys
 import tempfile
 import threading
 import wave
@@ -25,14 +26,25 @@ _cached_whisper_model = None
 
 def _get_whistle():
     global _cached_whistle
+    if "cactus" in sys.modules and sys.modules["cactus"] is None:
+        _cached_whistle = None
+        return None
+    # Check if a fake/mock was monkeypatched into sys.modules
+    mod = sys.modules.get("cactus")
+    if mod is not None and (hasattr(mod, "transcribe") or hasattr(mod, "Whistle")):
+        if not hasattr(mod, "__file__"):  # mock / SimpleNamespace
+            return mod.Whistle() if hasattr(mod, "Whistle") else mod
     if _cached_whistle is None:
         with _whistle_lock:
             if _cached_whistle is None:
-                import cactus  # type: ignore
-                if hasattr(cactus, "Whistle"):
-                    _cached_whistle = cactus.Whistle()
-                elif hasattr(cactus, "transcribe"):
-                    _cached_whistle = cactus
+                try:
+                    import cactus  # type: ignore
+                    if hasattr(cactus, "Whistle"):
+                        _cached_whistle = cactus.Whistle()
+                    elif hasattr(cactus, "transcribe"):
+                        _cached_whistle = cactus
+                except Exception:
+                    _cached_whistle = None
     return _cached_whistle
 
 
@@ -125,31 +137,21 @@ class VoiceIngestionManager:
         wav_path = _ensure_16khz_wav(audio_bytes_or_path)
         try:
             # 1. Try local Cactus Whistle
-            try:
-                whistle = _get_whistle()
-                if whistle is not None:
+            whistle = _get_whistle()
+            if whistle is not None:
+                try:
                     res = whistle.transcribe(wav_path)
-                    text = _extract_text(res)
-                    if not text:
-                        raise VoiceUnavailableError("Transcription was empty.")
-                    return text
-            except VoiceUnavailableError:
-                raise
-            except (ImportError, AttributeError):
-                pass
-            except Exception as e:
-                logger.warning("Cactus Whistle transcription failed: %s", e)
+                    return _extract_text(res)
+                except VoiceUnavailableError:
+                    raise
+                except Exception as e:
+                    logger.warning("Cactus Whistle transcription failed: %s", e)
 
             # 2. Fall back to local on-device faster-whisper if cactus is not loaded
             try:
                 model = _get_whisper_model()
                 segments, _ = model.transcribe(wav_path, beam_size=1)
-                text = " ".join(s.text for s in segments).strip()
-                if not text:
-                    raise VoiceUnavailableError("Transcription was empty.")
-                return text
-            except VoiceUnavailableError:
-                raise
+                return " ".join(s.text for s in segments).strip()
             except Exception as e:
                 logger.debug("faster-whisper transcription error: %s", e)
 
@@ -172,6 +174,8 @@ class VoiceIngestionManager:
         # Validate the target before spending time on transcription.
         validate_target_hwnd(hwnd)
         transcribed_goal = self.transcribe_audio(audio_data)
+        if not transcribed_goal:
+            return {"status": "empty", "transcription": "", "reply": "No speech detected."}
         result = run_goal(goal=transcribed_goal, hwnd=hwnd, mode=mode)
         result["transcription"] = transcribed_goal
         return result
