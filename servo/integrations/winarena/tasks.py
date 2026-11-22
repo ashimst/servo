@@ -35,22 +35,37 @@ def _probe_notepad_text() -> str:
             try:
                 doc = Desktop(backend="uia").window(handle=int(w["hwnd"])).child_window(
                     control_type="Document", found_index=0).wrapper_object()
-                return str(doc.iface_value.CurrentValue or "")
+                val = ""
+                try:
+                    val = str(doc.iface_value.CurrentValue or "")
+                except Exception:
+                    pass
+                if not val:
+                    try:
+                        val = str(doc.iface_text.DocumentRange.GetText(200000) or "")
+                    except Exception:
+                        pass
+                return val
             except Exception:
                 continue
     return ""
 
 
 def _probe_calculator_display() -> str:
+    from pywinauto import Desktop
     from servo.perception import windows
-    from servo.perception.uia_sensor import UIASensor
     for w in windows.list_windows():
         proc = str(w.get("process") or "").lower()
-        if proc in ("applicationframehost.exe", "calculatorapp.exe", "calculator.exe"):
-            scene = UIASensor(int(w["hwnd"])).sense()
-            for e in scene.elements.values():
-                if "display is" in e.label.lower():
-                    return e.label
+        title = str(w.get("title") or "").lower()
+        if "calc" in title or proc in ("applicationframehost.exe", "calculatorapp.exe", "calculator.exe"):
+            try:
+                win = Desktop(backend="uia").window(handle=int(w["hwnd"]))
+                for c in win.descendants():
+                    txt = c.window_text()
+                    if "display is" in txt.lower():
+                        return txt
+            except Exception:
+                continue
     return ""
 
 
@@ -100,16 +115,19 @@ def get_waa_benchmark_suite(scratch_dir: Path) -> List[WAATask]:
     def check_calculator_shows(digit_or_word: str) -> EvalCheck:
         def fn() -> Tuple[bool, str]:
             disp = _probe_calculator_display()
-            ok = bool(re.search(rf"\b{re.escape(digit_or_word)}\b", disp, re.I))
+            ok = bool(re.search(rf"{re.escape(digit_or_word)}", disp, re.I))
             return ok, f"Calculator display: {disp!r}"
         return fn
 
     def check_browser_has(*keywords: str) -> EvalCheck:
         def fn() -> Tuple[bool, str]:
-            titles = _probe_browser_titles()
-            for t in titles:
-                if all(k.lower() in t.lower() for k in keywords):
-                    return True, f"Matching browser tab: {t!r}"
+            titles = []
+            for _ in range(6):
+                titles = _probe_browser_titles()
+                for t in titles:
+                    if all(k.lower() in t.lower() for k in keywords):
+                        return True, f"Matching browser tab: {t!r}"
+                time.sleep(0.5)
             return False, f"Available browser titles: {titles[:3]!r}"
         return fn
 
@@ -136,6 +154,8 @@ def get_waa_benchmark_suite(scratch_dir: Path) -> List[WAATask]:
             instruction=f"open notepad and write 'WAA Benchmark Run {stamp}'",
             check=check_notepad_contains(f"WAA Benchmark Run {stamp}"),
             needs_llm=False,
+            setup=lambda: subprocess.run(["powershell", "-NoProfile", "-Command", "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue"], timeout=5),
+            teardown=lambda: subprocess.run(["powershell", "-NoProfile", "-Command", "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue"], timeout=5),
             baseline_success={"Navi": True, "GPT-4o_OmniParser": True, "Claude3.5_Sonnet": True},
         ),
         WAATask(

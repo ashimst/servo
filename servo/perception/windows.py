@@ -42,9 +42,36 @@ def _as_int(hwnd: Optional[int]) -> int:
     return int(hwnd or 0)
 
 
+def ensure_default_desktop() -> bool:
+    """Ensure current thread is attached to the interactive 'default' desktop on WinSta0.
+
+    In Windows subshells or automated runner environments, execution threads can start
+    attached to isolated desktop objects where standard user windows and cursor inputs
+    are unavailable. This switches the thread to the interactive desktop.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        desk = _user32.GetThreadDesktop(_kernel32.GetCurrentThreadId())
+        buf = ctypes.create_unicode_buffer(256)
+        if _user32.GetUserObjectInformationW(desk, 2, buf, 256, None):
+            if buf.value.lower() != "default":
+                hdesk = _user32.OpenDesktopW("default", 0, False, 0x01FF)
+                if hdesk:
+                    return bool(_user32.SetThreadDesktop(hdesk))
+        return True
+    except Exception:
+        return False
+
+
+if sys.platform == "win32":
+    ensure_default_desktop()
+
+
 def get_foreground_window() -> int:
     if sys.platform != "win32":
         return 0
+    ensure_default_desktop()
     return _as_int(_user32.GetForegroundWindow())
 
 
@@ -109,6 +136,7 @@ def list_windows() -> List[Dict[str, object]]:
     """Enumerate visible, titled top-level windows."""
     if sys.platform != "win32":
         return []
+    ensure_default_desktop()
     results: List[Dict[str, object]] = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)

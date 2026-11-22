@@ -257,6 +257,7 @@ def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
         getattr(record, "kind", "desktop") in ("store", "web_app")
         or "\\windowsapps\\" in full_exe_path.lower()
         or not (os.path.isabs(full_exe_path) and os.path.exists(full_exe_path))
+        or any("!" in i for i in ids)
     )
     try:
         if by_id:
