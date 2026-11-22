@@ -192,3 +192,40 @@ def test_system1_reflex_loop_decoupling():
         source = inspect.getsource(mod)
         assert "graph_memory" not in source, f"{mod.__name__} violates System 1 decoupling guardrail!"
         assert "GraphMemory" not in source, f"{mod.__name__} violates System 1 decoupling guardrail!"
+
+
+def test_graph_and_consistency_api_endpoints():
+    """Verify that FastAPI app provides /api/graph, /api/graph/consistency, and /api/graph/rebuild."""
+    from servo.daemon.copilot_app import CopilotSession, create_app
+    from fastapi.testclient import TestClient
+
+    session = CopilotSession()
+    app = create_app(session)
+    client = TestClient(app, base_url="http://127.0.0.1")
+
+    # 1. GET /api/graph
+    r = client.get("/api/graph", headers={"X-Servo-Token": session.token})
+    assert r.status_code == 200
+    data = r.json()
+    assert "nodes" in data
+    assert "edges" in data
+    assert "stats" in data
+    assert data["stats"]["nodes_count"] > 10
+
+    # 2. GET /api/graph/consistency
+    r = client.get("/api/graph/consistency", headers={"X-Servo-Token": session.token})
+    assert r.status_code == 200
+    audit = r.json()
+    assert "score" in audit
+    assert "status" in audit
+    assert "checks" in audit
+    assert len(audit["checks"]) >= 5
+    assert audit["score"] >= 90
+
+    # 3. POST /api/graph/rebuild
+    r = client.post("/api/graph/rebuild", headers={"X-Servo-Token": session.token}, json={})
+    assert r.status_code == 200
+    rebuild = r.json()
+    assert rebuild["ok"] is True
+    assert rebuild["nodes_count"] > 10
+

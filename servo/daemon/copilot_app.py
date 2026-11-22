@@ -602,6 +602,41 @@ def create_app(session: CopilotSession) -> FastAPI:
         session.stop()
         return {"ok": True}
 
+    @app.get("/api/graph")
+    def get_graph(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        from servo.cognition.graph_memory import graph_memory
+        import collections
+        return {
+            "version": graph_memory.graph.version,
+            "generated_at": graph_memory.graph.generated_at,
+            "stats": {
+                "nodes_count": len(graph_memory.graph.nodes),
+                "edges_count": len(graph_memory.graph.edges),
+                "types": dict(collections.Counter(n.type for n in graph_memory.graph.nodes.values())),
+            },
+            "nodes": [n.model_dump() for n in graph_memory.graph.nodes.values()],
+            "edges": [e.model_dump() for e in graph_memory.graph.edges],
+        }
+
+    @app.get("/api/graph/consistency")
+    def get_graph_consistency(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        from servo.cognition.graph_memory import graph_memory
+        return graph_memory.audit_consistency()
+
+    @app.post("/api/graph/rebuild")
+    def rebuild_graph(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        from servo.cognition.graph_memory import graph_memory
+        g = graph_memory.rebuild_graph()
+        return {
+            "ok": True,
+            "nodes_count": len(g.nodes),
+            "edges_count": len(g.edges),
+            "generated_at": g.generated_at,
+        }
+
     @app.get("/api/config")
     def get_config(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
         check(x_servo_token)
