@@ -187,6 +187,19 @@ def build_plan_prompt(
         except Exception:
             memory_context = ""
 
+    graph_block = ""
+    try:
+        from servo.cognition.graph_memory import graph_memory
+        active_app = None
+        if ctx.active_windows:
+            active_app = ctx.active_windows[0].get("process")
+        graph_block = graph_memory.format_context_for_prompt(
+            goal=goal,
+            active_app=active_app,
+        )
+    except Exception:
+        graph_block = ""
+
     lines = [
         f"User name: {user_name}",
         f"Today: {time.strftime('%A %d %B %Y, %H:%M')}",
@@ -195,6 +208,8 @@ def build_plan_prompt(
         f"Round: {round_no}",
         ctx_block,
     ]
+    if graph_block:
+        lines.append(graph_block)
     if memory_context:
         lines.append(memory_context)
     if completed:
