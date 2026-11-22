@@ -36,3 +36,7 @@ Desktop.ini
 .idea/
 *.swp
 *.swo
+
+# Graphify Output
+graphify-out/
+*/graphify-out/
