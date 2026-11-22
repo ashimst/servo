@@ -129,11 +129,11 @@ def resolve_app_executable(app_name: str) -> str:
 _PROCESS_ALIASES: Dict[str, Tuple[str, ...]] = {
     "terminal": ("windowsterminal.exe",),
     "windows terminal": ("windowsterminal.exe",),
-    "calculator": ("calculatorapp.exe",),
-    "calc": ("calculatorapp.exe", "calculator.exe"),
-    "settings": ("systemsettings.exe",),
+    "calculator": ("calculatorapp.exe", "calculator.exe", "applicationframehost.exe"),
+    "calc": ("calculatorapp.exe", "calculator.exe", "applicationframehost.exe"),
+    "settings": ("systemsettings.exe", "applicationframehost.exe"),
     "paint": ("mspaint.exe",),
-    "photos": ("photos.exe",),
+    "photos": ("photos.exe", "applicationframehost.exe"),
     "file explorer": ("explorer.exe",),
     "explorer": ("explorer.exe",),
 }
@@ -184,6 +184,8 @@ def _matches_app(w: Dict[str, Any], app_key: str, exe_filename: str, app_ids: Tu
         if app_identity.is_web_app_window(hwnd, proc, aid):
             return False
     if proc:
+        if proc == "applicationframehost.exe":
+            return app_key in title
         if proc in _PROCESS_ALIASES.get(app_key, ()):
             return True
         stem = proc[:-4] if proc.endswith(".exe") else proc

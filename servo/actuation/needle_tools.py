@@ -294,12 +294,31 @@ class NeedleToolSurface:
             pass
 
         from pywinauto.keyboard import send_keys
-        if clear_first:
-            send_keys("^a{BACKSPACE}")
-        send_keys(escape_send_keys(text), with_spaces=True, with_tabs=True, with_newlines=True)
-        if press_enter:
-            send_keys("{ENTER}")
-        return f"Typed text into element {element_id} ('{element.label}') via keystrokes."
+        try:
+            if clear_first:
+                send_keys("^a{BACKSPACE}")
+            send_keys(escape_send_keys(text), with_spaces=True, with_tabs=True, with_newlines=True)
+            if press_enter:
+                send_keys("{ENTER}")
+            return f"Typed text into element {element_id} ('{element.label}') via keystrokes."
+        except Exception as err:
+            logger.warning("Keystroke typing failed (%s); attempting clipboard paste fallback.", err)
+            try:
+                import pyperclip
+                pyperclip.copy(text)
+                time.sleep(0.05)
+                import ctypes
+                user32 = ctypes.windll.user32
+                user32.keybd_event(0x11, 0, 0, 0)
+                user32.keybd_event(0x56, 0, 0, 0)
+                user32.keybd_event(0x56, 0, 2, 0)
+                user32.keybd_event(0x11, 0, 2, 0)
+                if press_enter:
+                    user32.keybd_event(0x0D, 0, 0, 0)
+                    user32.keybd_event(0x0D, 0, 2, 0)
+                return f"Pasted text into element {element_id} ('{element.label}') via clipboard fallback."
+            except Exception as e2:
+                raise ActuationError(f"Failed to enter text into element {element_id}: {err}; fallback error: {e2}") from err
 
     @tool_decorator
     def hotkey(self, keys: List[str]) -> str:
