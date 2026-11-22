@@ -54,6 +54,12 @@ def is_window(hwnd: int) -> bool:
     return bool(_user32.IsWindow(hwnd))
 
 
+def is_visible(hwnd: int) -> bool:
+    if sys.platform != "win32":
+        return False
+    return bool(_user32.IsWindowVisible(hwnd))
+
+
 def get_root_window(hwnd: int) -> int:
     """Return the top-level ancestor of ``hwnd`` (itself if already top-level)."""
     if sys.platform != "win32" or not hwnd:

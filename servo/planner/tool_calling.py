@@ -328,6 +328,8 @@ STANDARD_HOTKEY_KEYS: Set[str] = {
     "enter", "return", "tab", "esc", "escape", "backspace", "delete", "del", "space", "spacebar",
     "up", "down", "left", "right", "home", "end", "pageup", "pagedown", "pgup", "pgdn",
     "insert", "ins", "capslock", "numlock", "scrolllock", "printscreen", "prtsc", "pause",
+    # system media keys (sent as virtual keys; see needle_tools.MEDIA_KEYS)
+    "volumeup", "volumedown", "volumemute", "mute", "playpause", "nexttrack", "prevtrack",
 } | {f"f{i}" for i in range(1, 25)}
 
 
@@ -407,7 +409,7 @@ def parse_deterministic_intent(goal: str, user_name: str = "User") -> Optional[M
 
     # 2. "open <app> and (click|press|select) <target>"
     m_open_click = re.search(
-        r"^(?:open|launch|start)\s+([a-zA-Z0-9_\s\.\-]+?)\s+and\s+(?:click|press|select)\s+(.+)$",
+        r"^(?:open|launch|start)\s+([a-zA-Z0-9_\s\.\-]+?)\s+and\s+(?:click|press|select|tap)\s+(?:on\s+)?(?:the\s+)?(.+)$",
         p_strip,
         re.I,
     )
@@ -563,7 +565,7 @@ def parse_deterministic_intent(goal: str, user_name: str = "User") -> Optional[M
             return MacroPlan(goal=p_strip, steps=steps)
 
     # 8. "click|press|select <target>"
-    m_click = re.search(r"^(?:click|press|select)\s+(.+)$", p_strip, re.I)
+    m_click = re.search(r"^(?:click|press|select|tap)\s+(?:on\s+)?(?:the\s+)?(.+)$", p_strip, re.I)
     if m_click:
         target = m_click.group(1).strip().strip('"\'')
         steps.append(

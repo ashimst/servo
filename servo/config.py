@@ -10,6 +10,8 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from servo.paths import servo_home
+
 
 def init_windows_dpi_awareness() -> bool:
     """Initialize Windows Per-Monitor DPI v2 awareness for pixel-perfect coordinate mapping.
@@ -121,9 +123,15 @@ class ServoConfig(BaseSettings):
     max_replans: int = 2
     # Act-observe-decide rounds with System 2 before asking you whether to continue.
     max_rounds: int = 8
+    # Web tasks: 'user' opens pages in YOUR browser (preferred_browser, else the Windows
+    # default) and drives it like any desktop app; 'playwright' uses Servo's own
+    # separate automation browser (more reliable DOM access, but not your tabs/logins).
+    browser_mode: Literal["user", "playwright"] = "user"
+    # e.g. "dia", "chrome", "edge", "arc". Empty = the Windows default browser.
+    preferred_browser: str = ""
     # Playwright browser tier: 'msedge', 'chrome', or 'chromium' (bundled).
     browser_channel: str = "msedge"
-    browser_profile_dir: Path = Field(default_factory=lambda: Path.home() / ".servo" / "browser-profile")
+    browser_profile_dir: Path = Field(default_factory=lambda: servo_home() / "browser-profile")
     browser_headless: bool = False
     search_url: str = "https://www.bing.com/search?q={q}"
     # System 2 (LLM) reasoning depth for Anthropic models: low | medium | high | xhigh | max
@@ -143,7 +151,7 @@ class ServoConfig(BaseSettings):
     whitelisted_process_names: list[str] = Field(default_factory=list)
 
     # Telemetry storage
-    trace_dir: Path = Field(default_factory=lambda: Path.home() / ".servo" / "traces")
+    trace_dir: Path = Field(default_factory=lambda: servo_home() / "traces")
 
     # System 2 Planner config
     planner_provider: Literal["openai", "anthropic", "gemini", "cactus", "passthrough", "none"] = "openai"
@@ -175,8 +183,12 @@ class ServoConfig(BaseSettings):
     system_tools: bool = True
     command_timeout_seconds: float = 120.0
 
+    # Self-diagnosis (servo/cognition/diagnose.py): send code snippets to the planner model
+    # when asking it to explain a failure. Off by default: only function names/docstrings go.
+    diagnose_send_code: bool = False
+
     # Scheduled and queued goals (see servo/daemon/scheduler.py)
-    schedule_file: Path = Field(default_factory=lambda: Path.home() / ".servo" / "schedule.json")
+    schedule_file: Path = Field(default_factory=lambda: servo_home() / "schedule.json")
 
     # Upper bound for a whole /task run (planning + all sub-goals) on the worker thread.
     # Generous because a human may be answering confirmation dialogs during the run.

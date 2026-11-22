@@ -40,7 +40,7 @@ from servo.config import settings
 from servo.control.confirmation import ConfirmationCallback, ConfirmationRequest
 from servo.control.handoff import PlanExecutionSummary, StepExecutionReport, SystemHandoffCoordinator
 from servo.control.jev_gate import JevGate
-from servo.perception import windows
+from servo.perception import app_identity, windows
 from servo.perception.scene_index import SceneDelta
 from servo.planner.tool_calling import MacroPlan, PlanStep
 
@@ -60,11 +60,14 @@ BROWSER_CAPABLE = {"click_element", "click", "double_click", "right_click", "typ
 class StepRecord(BaseModel):
     command: str
     tool: str
+    call: str = ""  # the exact tool call, with arguments
     tier: str
     success: bool
     error: Optional[str] = None
     latency_ms: int = 0
     output: str = ""  # what a system tool returned (file text, command output)
+    verification: str = "confirmed"  # confirmed | unconfirmed | failed
+    note: Optional[str] = None
 
 
 class StepOutcome(BaseModel):
@@ -75,6 +78,8 @@ class StepOutcome(BaseModel):
     detail: Dict[str, Any] = Field(default_factory=dict)
     reports: List[StepExecutionReport] = Field(default_factory=list)
     output: str = ""  # system tools: shown to you and fed back to System 2
+    verification: str = "confirmed"  # confirmed | unconfirmed | failed (see PostTransitionResult)
+    note: Optional[str] = None       # why an unconfirmed step could not be confirmed
 
 
 class RunOutcome(BaseModel):
@@ -94,6 +99,45 @@ _RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 def _indent(text: str, prefix: str = "    ") -> str:
     return "\n".join(prefix + line for line in text.splitlines())
+
+
+def describe_scene(scene: Any, process: str = "", limit: int = 150) -> str:
+    """Screen description for System 2: window, address bar / focused text, then controls.
+
+    Duplicate labels are collapsed (YouTube lists each channel link twice) and long
+    labels are trimmed, so the entries cover more of the page.
+    """
+    lines = [f"Active window: {scene.window_title}" + (f"  ({process})" if process else "")]
+    edits = [e for e in scene.elements.values() if e.role in ("Edit", "ComboBox") and (e.value or "").strip()]
+    if edits:
+        lines.append(f"Address bar / input: {(edits[0].value or '')[:200]}")
+    seen = set()
+    controls: List[str] = []
+    for e in scene.elements.values():
+        label = " ".join((e.label or "").split())[:140]
+        key = (e.role, label)
+        if not label or key in seen:
+            continue
+        seen.add(key)
+        controls.append(f"{e.role}: {label}")
+        if len(controls) >= limit:
+            break
+    lines.append("Controls:\n" + "\n".join(controls))
+    return "\n".join(lines)
+
+
+def _summary_reply(records: List["StepRecord"]) -> str:
+    """Final reply that says what was confirmed and what only ran."""
+    n = len(records)
+    unconf = [r for r in records if r.success and r.verification == "unconfirmed"]
+    base = f"Done — {n} step{'s' if n != 1 else ''} completed."
+    if not unconf:
+        return base
+    lines = [f"Ran {n} step{'s' if n != 1 else ''}, but I couldn't confirm "
+             f"{'this one' if len(unconf) == 1 else f'{len(unconf)} of them'} worked:"]
+    lines += [f"• {r.command}: {r.note or 'no visible change'}" for r in unconf]
+    lines.append("Please check the screen.")
+    return "\n".join(lines)
 
 
 def classify_error(err: str) -> str:
@@ -151,6 +195,10 @@ class CascadeRouter:
         self.app_launcher = app_launcher
         self.hwnd = target_hwnd
         self.title = windows.get_window_title(target_hwnd) if target_hwnd and windows.is_window(target_hwnd) else ""
+        # Servo's own windows are never a target. Without a list from the copilot
+        # (CLI, task suite, another process) fall back to finding them by title.
+        if exclude_hwnds is None:
+            from servo.actuation.overlay import own_windows as exclude_hwnds
         self.exclude_hwnds = exclude_hwnds
         self.history = history or []
         if memory is not None:
@@ -162,6 +210,7 @@ class CascadeRouter:
             except Exception:
                 self.memory = None
         self.context = context  # "desktop" | "browser"
+        self.recent_browser = ""  # browser app this request launched (user browser mode)
         self.goal = ""
         self._reports: List[StepExecutionReport] = []
         self._skip_requested = False
@@ -170,9 +219,15 @@ class CascadeRouter:
 
     def run(self, goal: str) -> RunOutcome:
         t0 = time.perf_counter()
-        self.goal = goal.strip()
+        from servo.cognition.redact import redact_secrets
+        self.goal, secrets_found = redact_secrets(goal.strip())
         tr = self.tracer
         tr.emit("goal", self.goal, tier="copilot")
+        if secrets_found:
+            # Redacted before memory, traces or any model sees it; Servo never types secrets.
+            tr.emit("decision", "Secret removed from your request",
+                    f"{', '.join(sorted(set(secrets_found)))} replaced with [redacted]. Servo never types "
+                    "passwords, codes or card numbers; enter those yourself.", tier="kev", status="warn")
         records: List[StepRecord] = []
         counters = {"replans": 0, "rounds": 0}
 
@@ -190,6 +245,12 @@ class CascadeRouter:
                     duration_ms=out.latency_ms, route=route, replans=counters["replans"],
                     rounds=counters["rounds"], steps=len(records))
             self._record_telemetry(out)
+            try:
+                from servo.telemetry.run_record import build_record, save_run
+                save_run(build_record(out, tr.events, {"secrets_redacted": bool(secrets_found),
+                                                        "browser": self.recent_browser or None}))
+            except Exception:
+                pass
             return out
 
         if self.memory is not None:
@@ -204,6 +265,28 @@ class CascadeRouter:
             if quick:
                 tr.emit("route", "Conversation", "Answered locally without touching the desktop.", tier="router")
                 return finish(True, quick, "chat")
+
+        # 0b. A stated preference ("dia is my default browser") is remembered, not executed.
+        from servo.cognition.user_browser import parse_browser_preference
+        pref = parse_browser_preference(self.goal)
+        if pref:
+            try:
+                from servo import user_settings
+                user_settings.save(settings, {"preferred_browser": pref}, mark_done=False)
+            except Exception:
+                settings.preferred_browser = pref
+            tr.emit("route", "Preference saved", f"preferred_browser = {pref}", tier="router", status="ok")
+            return finish(True, f"Got it. I'll open web pages in {pref.capitalize()} from now on.", "preference")
+
+        # 0c. "why did that fail?": diagnose the last failed run from its record and the code graph.
+        from servo.cognition.diagnose import diagnose, parse_diagnose_request
+        target_run = parse_diagnose_request(self.goal)
+        if target_run is not None:
+            with tr.span("tier", "Self-diagnosis · run record + code graph", tier="router") as sp:
+                d = diagnose(target_run, explain=self.system2.available())
+                sp.done("ok" if d.found else "warn", d.cause or "no run to diagnose", run=d.run_id,
+                        code=[c.model_dump() for c in d.code], failing_step=d.failing_step)
+            return finish(d.found, d.to_text(), "diagnose")
 
         # 1. Tier 1: a compound request whose every clause parses needs no LLM.
         compound = self.tier1.propose_compound(self.goal)
@@ -291,7 +374,7 @@ class CascadeRouter:
                 if not agentic:
                     n = len(records)
                     shown = [r.output for r in records if r.output]
-                    reply = f"Done — {n} step{'s' if n != 1 else ''} completed."
+                    reply = _summary_reply(records)
                     if shown:
                         reply += "\n\n" + "\n\n".join(shown)
                     return finish(True, reply, route)
@@ -367,6 +450,7 @@ class CascadeRouter:
 
             skipped = False
             outputs: List[str] = []
+            unconfirmed: List[str] = []
             for step in steps:
                 if self.abort_event.is_set():
                     progress(i, "fail", "stopped")
@@ -375,12 +459,16 @@ class CascadeRouter:
                 with tr.span("tier", f"Step · {describe_step(step)}", tier="router", command=command) as sp:
                     out = self._execute(step)
                     sp.done("ok" if out.success else "fail", out.error or "", tier=out.tier)
-                records.append(StepRecord(command=command, tool=step.tool_name, tier=out.tier, success=out.success,
+                records.append(StepRecord(command=command, tool=step.tool_name, call=describe_step(step),
+                                          tier=out.tier, success=out.success,
                                           error=out.error, latency_ms=int((time.perf_counter() - t_step) * 1000),
-                                          output=out.output))
+                                          output=out.output,
+                                          verification=out.verification if out.success else "failed", note=out.note))
                 if out.success:
                     if out.output:
                         outputs.append(out.output)
+                    if out.verification == "unconfirmed":
+                        unconfirmed.append(out.note or "effect not visible")
                     continue
                 if self._skip_requested:
                     self._skip_requested = False
@@ -397,6 +485,11 @@ class CascadeRouter:
             if skipped:
                 progress(i, "skipped", "skipped by you")
                 completed.append(f"(skipped by the user) {command}")
+            elif unconfirmed:
+                progress(i, "unconfirmed", "; ".join(unconfirmed))
+                # System 2 must check the screen rather than assume this worked.
+                completed.append(command + f" [ran, NOT confirmed: {'; '.join(unconfirmed)}]"
+                                 + "".join(f"\n  output:\n{_indent(o)}" for o in outputs))
             else:
                 progress(i, "ok")
                 # System 2 sees what a command printed or a file contains, so it can act on it.
@@ -444,6 +537,8 @@ class CascadeRouter:
         if tool in system_tools.SYSTEM_TOOLS:
             return self._system(step)
         if tool in BROWSER_TOOLS:
+            if settings.browser_mode == "user":
+                return self._user_browser_nav(step)
             return self._browser_nav(step)
         if tool in BROWSER_CAPABLE and self.context == "browser" and self._browser_open():
             return self._browser_action(step)
@@ -460,6 +555,11 @@ class CascadeRouter:
     def _desktop(self, step: PlanStep) -> StepOutcome:
         if step.tool_name in ("launch_app", "close_window"):
             self.context = "desktop"
+        if step.tool_name == "launch_app":
+            from servo.cognition.user_browser import is_browser_name
+            app = str(step.arguments.get("app_name") or "")
+            if is_browser_name(app):
+                self.recent_browser = app.lower()
         coord = SystemHandoffCoordinator(
             target_hwnd=self.hwnd,
             fast_mode=settings.fast_mode,
@@ -482,7 +582,7 @@ class CascadeRouter:
         self._follow_dialog()
         kind = None if rep.success else ("abort" if summary.aborted else classify_error(rep.error or ""))
         return StepOutcome(success=rep.success, kind=kind, error=rep.error, tier=rep.perception_source or "uia",
-                           reports=[rep])
+                           reports=[rep], verification=rep.verification if rep.success else "failed", note=rep.note)
 
     def _follow_dialog(self) -> None:
         """If the step opened a dialog (Save As, a prompt), make it the target window.
@@ -571,6 +671,55 @@ class CascadeRouter:
         self._report(step, True, res.summary)
         return StepOutcome(success=True, tier="system", output=res.output)
 
+    def _user_browser_nav(self, step: PlanStep) -> StepOutcome:
+        """open_url / web_search in the user's own browser (see servo/cognition/user_browser.py)."""
+        from urllib.parse import quote_plus
+        from servo.cognition import user_browser as ub
+
+        args = step.arguments
+        if step.tool_name == "open_url":
+            from servo.cognition.needle import normalize_url
+            url = normalize_url(str(args.get("url") or ""))
+        else:
+            url = settings.search_url.format(q=quote_plus(str(args.get("query") or "")))
+        call = describe_step(step)
+        problem = ub.url_problem(url, self.goal)
+        if problem:
+            self.tracer.emit("decision", "Address refused", problem, tier="kev", status="fail")
+            return StepOutcome(success=False, kind="policy", tier="browser", error=problem)
+
+        name, why = ub.choose_browser(str(args.get("browser") or ""), self.recent_browser)
+        stop = self._gate(step.rationale or call, call, url, name, process_name=ub.browser_process(name) or name)
+        if stop:
+            return stop
+        self.tracer.emit("route", f"Your browser · {name}", why, tier="browser")
+        launcher = self.app_launcher
+        if launcher is None:
+            from servo.daemon.copilot import launch_or_focus_app as launcher
+        hwnd, title = launcher(name)
+        own = self.exclude_hwnds() if self.exclude_hwnds else set()
+        if not hwnd or hwnd in own or "servo copilot" in str(title).lower():
+            return StepOutcome(success=False, kind="perception", tier="browser",
+                               error=f"Couldn't open {name}: {title}")
+        self.tracer.emit("action", call, f"New tab in {name}, type the address, Enter", tier="browser")
+        t0 = time.perf_counter()
+        try:
+            verdict, page_title, note = ub.navigate(hwnd, url)
+        except Exception as e:
+            return StepOutcome(success=False, kind="error", tier="browser", error=f"Navigation in {name} failed: {e}")
+        fg = windows.get_foreground_window()
+        self.hwnd = fg if fg and windows.get_process_name(fg) == windows.get_process_name(hwnd) else hwnd
+        self.title = page_title
+        self.context = "desktop"   # the page is now a window driven through UI Automation
+        self.recent_browser = name
+        status = {"confirmed": "ok", "unconfirmed": "warn", "failed": "fail"}[verdict]
+        self.tracer.emit("verify", f"Page · {page_title}", note or f"Address bar shows {url}", tier="browser",
+                         status=status, verdict=verdict, duration_ms=int((time.perf_counter() - t0) * 1000))
+        self._report(step, verdict != "failed", call, note or None)
+        if verdict == "failed":
+            return StepOutcome(success=False, kind="verify", tier="browser", error=note)
+        return StepOutcome(success=True, tier="browser", verification=verdict, note=note or None)
+
     def _browser_nav(self, step: PlanStep) -> StepOutcome:
         args = step.arguments
         call = describe_step(step)
@@ -603,10 +752,13 @@ class CascadeRouter:
             self.tracer.emit("action", call, "Playwright keyboard", tier="browser")
             before, after = self.browser.press(keys)
             delta = browser_mod.snapshot_delta(before, after)
-            self.tracer.emit("verify", "Page " + ("changed" if delta["has_changed"] else "unchanged (key accepted)"),
-                             f"{after.title} <{after.url}>", tier="browser", status="ok")
+            changed = bool(delta["has_changed"])
+            self.tracer.emit("verify", "Page " + ("changed" if changed else "unchanged — effect not visible"),
+                             f"{after.title} <{after.url}>", tier="browser", status="ok" if changed else "warn",
+                             verdict="confirmed" if changed else "unconfirmed")
             self._report(step, True, call)
-            return StepOutcome(success=True, tier="browser")
+            return StepOutcome(success=True, tier="browser", verification="confirmed" if changed else "unconfirmed",
+                               note=None if changed else f"Pressed {'+'.join(keys)}; the page did not visibly change")
 
         for_input = tool == "type_text"
         target = str(args.get("target") or ("" if for_input else ""))
@@ -657,12 +809,15 @@ class CascadeRouter:
         delta = SceneDelta(**browser_mod.snapshot_delta(before, after))
         post = self.kev.evaluate_post_transition(step.rationale or call, delta, expected_outcome=call,
                                                  typed_text=str(step.arguments.get("text") or "") if step.tool_name == "type_text" else "")
-        self.tracer.emit("verify", "Kev post-check · " + ("change confirmed" if post.transition_ok else "expected change not seen"),
-                         post.explanation, tier="kev", status="ok" if post.transition_ok else "fail",
-                         confidence=post.confidence, delta=delta.model_dump())
+        title = {"confirmed": "confirmed", "unconfirmed": "ran, effect not visible", "failed": "expected change not seen"}
+        self.tracer.emit("verify", "Post-check · " + title[post.verdict],
+                         post.explanation, tier="kev",
+                         status={"confirmed": "ok", "unconfirmed": "warn", "failed": "fail"}[post.verdict],
+                         confidence=post.confidence, delta=delta.model_dump(), verdict=post.verdict)
         self._report(step, post.transition_ok, call, None if post.transition_ok else post.explanation)
         if post.transition_ok:
-            return StepOutcome(success=True, tier="browser")
+            return StepOutcome(success=True, tier="browser", verification=post.verdict,
+                               note=post.explanation if post.verdict == "unconfirmed" else None)
         return StepOutcome(success=False, kind="verify", tier="browser", error=post.explanation)
 
     def _browser_mirage_click(self, step: PlanStep, target: str) -> StepOutcome:
@@ -710,8 +865,8 @@ class CascadeRouter:
             elif self.hwnd and windows.is_window(self.hwnd):
                 from servo.perception.uia_sensor import UIASensor
                 scene = UIASensor(self.hwnd).sense()
-                labels = [f"{e.role}: {e.label}" for e in list(scene.elements.values())[:120]]
-                parts.append(f"Active window: {scene.window_title}\nControls:\n" + "\n".join(labels))
+                parts.append(describe_scene(scene, app_identity.window_label(
+                    self.hwnd, windows.get_process_name(self.hwnd))))
                 if failure_kind == "perception":
                     from servo.perception.mirage_sensor import MirageSensor, summarize
                     ms = MirageSensor(self.hwnd)
@@ -743,11 +898,14 @@ class CascadeRouter:
                 "(anthropic, openai for Ollama, gemini or cactus), or give me one direct command such as "
                 "“click Save” or “search the web for …”.")
 
-    def _report(self, step: PlanStep, success: bool, desc: str, error: Optional[str] = None) -> None:
+    def _report(self, step: PlanStep, success: bool, desc: str, error: Optional[str] = None,
+                source: Optional[str] = None) -> None:
+        source = source or ("system" if step.tool_name in system_tools.SYSTEM_TOOLS else "browser")
         self._reports.append(StepExecutionReport(
             step_index=len(self._reports) + 1, action_type=step.tool_name,
-            target=str(step.arguments.get("target") or step.arguments.get("url") or step.arguments.get("query") or ""),
-            description=desc, success=success, latency_ms=0, error=error, perception_source="browser",
+            target=str(step.arguments.get("target") or step.arguments.get("url") or step.arguments.get("query")
+                       or step.arguments.get("path") or step.arguments.get("command") or ""),
+            description=desc, success=success, latency_ms=0, error=error, perception_source=source,
         ))
 
     def _record_telemetry(self, out: RunOutcome) -> None:

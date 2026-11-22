@@ -47,7 +47,8 @@ class TraceEvent(BaseModel):
     tier: str = "router"
     title: str
     detail: str = ""
-    status: Literal["info", "ok", "warn", "fail", "running", "skipped"] = "info"
+    # "unconfirmed": a step ran but its effect couldn't be observed (see PostTransitionResult)
+    status: Literal["info", "ok", "warn", "fail", "running", "skipped", "unconfirmed"] = "info"
     confidence: Optional[float] = None
     duration_ms: Optional[int] = None
     data: Dict[str, Any] = Field(default_factory=dict)

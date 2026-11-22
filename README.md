@@ -67,9 +67,12 @@ any model.
 
 Ask in plain language:
 * *"open notepad and write hello world"*
-* *"search the web for weather in Kathmandu"* (Playwright drives the browser)
+* *"search youtube for kanye"*, *"open gmail in chrome"* (opens in **your** browser)
+* *"increase the volume a bit"*, *"mute"*, *"next track"*
 * *"click Save"* (acts on the window you were last using, never on the copilot)
 * *"open notepad, write a haiku about rain and save it"* (multi-step: goes to System 2)
+* *"dia is my default browser"* (remembered, not executed)
+* *"why did that fail?"* (diagnoses the last failed run, down to the code)
 
 Requests run through a cost-and-latency cascade: the command grammar and Cactus Needle
 handle direct commands on-device, UIA or the browser DOM find the target, Mirage looks at
@@ -78,6 +81,45 @@ requests that need reasoning reach the LLM. Each run shows a **reasoning trace**
 tier handled what and why, confidences, Kev's verdicts, the exact LLM prompt and its
 visible reasoning, and every action and verification. Medium- and high-risk actions ask
 for approval inside the copilot. See [docs/COGNITIVE_CASCADE.md](docs/COGNITIVE_CASCADE.md).
+
+#### Honest results
+
+Every step ends **confirmed** (the effect was observed, e.g. typed text read back from
+the control), **not confirmed** (it ran but the effect isn't visible, like a click on a
+playing video), or **failed** (the effect is provably absent). Unconfirmed steps don't
+trigger blind retries; the reply names them ("Ran 3 steps, but I couldn't confirm…"),
+and System 2 is told to check the screen. Launching never "succeeds" by focusing the
+copilot, and closing an app that isn't open no longer launches it first.
+
+#### Web pages in your browser
+
+Web steps open a **new tab in your own browser**: the one you name in the request, else
+the one the request just opened, else your saved preference (*"dia is my default
+browser"*), else the Windows default. Servo types the address like a person would and
+verifies it in the address bar, then drives the page through UI Automation like any
+desktop app. Local and private-network addresses (where Servo's own copilot lives) are
+refused unless your request names them. Set `SERVO_BROWSER_MODE=playwright` to use
+Servo's separate automation browser instead.
+
+#### Knowledge: recipes
+
+[`knowledge/recipes/`](knowledge/recipes/) holds short, tested procedures (YouTube,
+Spotify, Notepad, volume, brightness, battery and system facts, Settings pages, web
+research to notes, sign-ins, files and folders, browser tabs). The best matches for a
+request are injected into the planner's prompt. Add your own: drop a `.md` file with
+`id`, `title` and `triggers` frontmatter; it's picked up on the next request.
+Credentials pasted into a request are replaced with `[redacted]` before memory, traces
+or any model see them; Servo never types passwords.
+
+#### Runs, traces and self-diagnosis
+
+Each run card shows the story first (how it was routed, the planner's thinking and the
+recipes it used, an honest checklist, an outcome line with the reason for a failure)
+and the full trace one click away. The **Runs** tab lists past runs; open one to replay
+its trace, or press **Diagnose** on a failed one. Diagnosis reads the saved run record
+and the code graph and points to the function that produced the error, with file and
+line (also: *"why did that fail?"*, or `python -m servo.cognition.diagnose [run_id]`).
+Full run records live in `~/.servo/traces/runs/` (newest 500).
 
 #### Files and shell, without the GUI
 
@@ -187,7 +229,11 @@ Configure runtime options via environment variables (prefix `SERVO_`):
 | `SERVO_NEEDLE_CONFIDENCE_THRESHOLD` | `0.7` | Minimum Needle confidence to act without System 2. |
 | `SERVO_MIRAGE_MATCH_THRESHOLD` | `0.72` | Minimum Mirage label match to click a visual target. |
 | `SERVO_MAX_REPLANS` | `2` | How many times System 2 may re-plan after a failure. |
+| `SERVO_BROWSER_MODE` | `user` | `user` opens web pages in your own browser; `playwright` uses Servo's separate automation browser. |
+| `SERVO_PREFERRED_BROWSER` | *(empty)* | `dia`, `chrome`, `edge`, `arc`, … Empty = the Windows default. Also set by saying *"X is my default browser"*. |
 | `SERVO_BROWSER_CHANNEL` | `msedge` | Browser for the Playwright tier: `msedge`, `chrome`, or `chromium`. |
+| `SERVO_HOME` | `~/.servo` | Where Servo keeps its token, settings, traces, memory, graph and schedule. |
+| `SERVO_DIAGNOSE_SEND_CODE` | `false` | Let self-diagnosis send code snippets (not just function names) to the planner model. |
 | `SERVO_OPENAI_BASE_URL` | `http://localhost:11434/v1` | URL for local Ollama or OpenAI-compatible service. |
 | `SERVO_FAST_MODE` | `false` | When `true`, snaps cursor directly to targets (for automated CI). |
 | `SERVO_SYSTEM_TOOLS` | `true` | Allow the gated file and shell commands (never available in harness mode). |
@@ -208,6 +254,24 @@ pytest -v
 # Run live Windows desktop tests (drives real windows like Notepad)
 pytest -v -m desktop
 ```
+
+Unit tests run in a private `SERVO_HOME` and never touch your real `~/.servo` or your browser.
+
+### Real-desktop task suite
+
+The pass rate that matters: real requests run on your desktop, each checked by an
+independent probe (Notepad's actual text, Calculator's display, the browser's address
+bar, WMI brightness, the battery level), never by Servo's own report. A task where Servo
+said "done" but the probe disagrees is reported as **LIE**.
+
+```powershell
+python -m servo.evals.task_suite           # on-device tasks (no LLM)
+python -m servo.evals.task_suite --llm     # plus tasks that need System 2 (uses your planner API)
+python -m servo.evals.task_suite --only notepad_hello youtube_search
+```
+
+It moves the mouse, types, and opens apps and browser tabs, so run it when you're not
+using the machine. Results are saved to `~/.servo/evals/`.
 
 ---
 

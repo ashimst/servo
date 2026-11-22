@@ -43,6 +43,27 @@ def _to_str_or_none(val: Any) -> Optional[str]:
     return str(val) if not isinstance(val, str) else val
 
 
+def _fresh_notepad_tab(hwnd: int) -> bool:
+    """Windows 11 Notepad reopens earlier tabs, so "open notepad and write X" used to type
+    into (append to) whatever document the user had open. If the visible document has
+    content, open a new tab first. Returns True if a new tab was opened."""
+    if sys.platform != "win32" or windows.get_process_name(hwnd) != "notepad.exe":
+        return False
+    try:
+        from servo.perception.uia_sensor import UIASensor
+        from servo.actuation.needle_tools import NeedleToolSurface
+        scene = UIASensor(hwnd).sense()
+        docs = [e for e in scene.elements.values() if e.role == "Document"]
+        if not docs or not (docs[0].value or "").strip():
+            return False
+        NeedleToolSurface(hwnd, fast_mode=True).hotkey(["ctrl", "n"])
+        time.sleep(0.5)
+        return True
+    except Exception as e:
+        logger.debug("fresh notepad tab skipped: %s", e)
+        return False
+
+
 class StepExecutionReport(BaseModel):
     step_index: int
     action_type: str
@@ -55,6 +76,9 @@ class StepExecutionReport(BaseModel):
     perception_source: Optional[str] = None
     jev_risk: Optional[str] = None
     confirmation: Optional[str] = None
+    # confirmed | unconfirmed | failed: what the post-check could actually observe.
+    verification: str = "confirmed"
+    note: Optional[str] = None
 
 
 class PlanExecutionSummary(BaseModel):
@@ -96,6 +120,10 @@ class SystemHandoffCoordinator:
         self.target_hwnd = target_hwnd
         self.tracer = tracer or NullTracer()
         # Windows that must never be adopted as the target (the copilot itself).
+        # Servo's own windows are never a target. Without a list from the copilot
+        # (CLI, task suite, another process) fall back to finding them by title.
+        if exclude_hwnds is None:
+            from servo.actuation.overlay import own_windows as exclude_hwnds
         self.exclude_hwnds = exclude_hwnds
         self.fast_mode = fast_mode
         self.confirmation_callback = confirmation_callback
@@ -211,7 +239,15 @@ class SystemHandoffCoordinator:
                     hwnd, title = launch_or_focus_app(app_target)
 
                 step_latency = int((time.perf_counter() - step_t0) * 1000)
+                own = set(self.exclude_hwnds() if self.exclude_hwnds else ())
+                if hwnd and (hwnd in own or "servo copilot" in str(title).lower()):
+                    # Never report "launched" for focusing the copilot itself.
+                    title = (f"found only the Servo Copilot window, not '{app_target}'. "
+                             f"'{app_target}' may not be installed under that name.")
+                    hwnd = None
                 if hwnd and windows.is_window(hwnd):
+                    if _fresh_notepad_tab(hwnd):
+                        title = windows.get_window_title(hwnd) or title
                     current_hwnd = hwnd
                     current_title = title
                     self.target_hwnd = hwnd
@@ -241,30 +277,75 @@ class SystemHandoffCoordinator:
                     break
                 continue
 
+            # 1b. System media keys (volume, play/pause): global, no target window needed.
+            if action.action_type == CanonicalActionType.HOTKEY:
+                from servo.actuation.needle_tools import NeedleToolSurface, media_key_vk
+                if media_key_vk(list(action.keys or [])) is not None:
+                    try:
+                        NeedleToolSurface(current_hwnd or 0).hotkey(list(action.keys))
+                        rep = StepExecutionReport(
+                            step_index=step.step_index, action_type=action.action_type.value,
+                            target="+".join(action.keys), description=f"Pressed {'+'.join(action.keys)} (system media key)",
+                            success=True, latency_ms=int((time.perf_counter() - step_t0) * 1000),
+                            perception_source="system",
+                        )
+                    except Exception as e:
+                        rep = StepExecutionReport(
+                            step_index=step.step_index, action_type=action.action_type.value,
+                            target="+".join(action.keys), description="Media key failed", success=False,
+                            latency_ms=int((time.perf_counter() - step_t0) * 1000), error=str(e),
+                            verification="failed",
+                        )
+                    reports.append(rep)
+                    self._emit_step_progress(step, rep)
+                    if not rep.success:
+                        overall_success = False
+                        break
+                    continue
+
             # 2. Handle Application Closing
             if action.action_type == CanonicalActionType.CLOSE:
                 app_target = action.app_name or current_title
                 close_hwnd = current_hwnd
                 if action.app_name:
-                    from servo.daemon.copilot import launch_or_focus_app
-                    h, _ = launch_or_focus_app(action.app_name)
-                    if h:
-                        close_hwnd = h
+                    # Find, never launch: closing an app that isn't open must not open it.
+                    from servo.daemon.copilot import find_app_window
+                    close_hwnd = find_app_window(action.app_name)
+                own = set(self.exclude_hwnds() if self.exclude_hwnds else ())
+                close_title = windows.get_window_title(close_hwnd) if close_hwnd and windows.is_window(close_hwnd) else ""
 
-                step_latency = int((time.perf_counter() - step_t0) * 1000)
-                if close_hwnd and windows.is_window(close_hwnd):
+                if close_hwnd and (close_hwnd in own or "servo copilot" in close_title.lower()):
+                    rep = StepExecutionReport(
+                        step_index=step.step_index, action_type=action.action_type.value, target=app_target,
+                        description="Refused to close the Servo Copilot window.", success=False,
+                        latency_ms=int((time.perf_counter() - step_t0) * 1000),
+                        error="The window to close is Servo's own copilot.", verification="failed",
+                    )
+                elif close_hwnd and windows.is_window(close_hwnd):
                     if sys.platform == "win32":
                         import win32gui, win32con
                         win32gui.PostMessage(close_hwnd, win32con.WM_CLOSE, 0, 0)
+                    gone = False
+                    # Up to 4 s for the window to go away. Apps like WhatsApp and Teams hide
+                    # to the tray instead of destroying the window, so invisible counts too.
+                    for _ in range(80):
+                        time.sleep(0.05)
+                        if not windows.is_window(close_hwnd) or not windows.is_visible(close_hwnd) \
+                                or not windows.get_window_title(close_hwnd):
+                            gone = True
+                            break
                     rep = StepExecutionReport(
                         step_index=step.step_index,
                         action_type=action.action_type.value,
                         target=app_target,
-                        description=f"Closed window '{current_title}'",
+                        description=(f"Closed '{close_title}'" if gone else
+                                     f"Asked '{close_title}' to close; it is still open (it may be asking to save)"),
                         success=True,
-                        latency_ms=step_latency,
+                        latency_ms=int((time.perf_counter() - step_t0) * 1000),
+                        verification="confirmed" if gone else "unconfirmed",
+                        note=None if gone else "Window still open after the close request; check for a save prompt.",
                     )
-                    if close_hwnd == current_hwnd:
+                    if gone and close_hwnd == current_hwnd:
                         current_hwnd = None
                         current_title = ""
                         self.target_hwnd = None
@@ -273,9 +354,11 @@ class SystemHandoffCoordinator:
                         step_index=step.step_index,
                         action_type=action.action_type.value,
                         target=app_target,
-                        description="No window found to close.",
+                        description=f"Nothing to close: no open window for '{app_target}'.",
                         success=True,
-                        latency_ms=step_latency,
+                        latency_ms=int((time.perf_counter() - step_t0) * 1000),
+                        verification="unconfirmed",
+                        note=f"No open window matched '{app_target}', so nothing was closed.",
                     )
                 reports.append(rep)
                 self._emit_step_progress(step, rep)
@@ -466,6 +549,9 @@ class SystemHandoffCoordinator:
                 perception_source=_to_str_or_none(getattr(step_log, "perception_source", None)),
                 jev_risk=_to_str_or_none(getattr(step_log, "jev_pre_risk", None)),
                 confirmation=_to_str_or_none(getattr(step_log, "confirmation", None)),
+                verification=(_to_str_or_none(getattr(step_log, "verification", None)) or
+                              ("confirmed" if res.success else "failed")),
+                note=_to_str_or_none(getattr(step_log, "note", None)),
             )
             reports.append(rep)
             self._emit_step_progress(step, rep)

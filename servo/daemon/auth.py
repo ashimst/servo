@@ -22,7 +22,8 @@ _token: Optional[str] = None
 
 
 def token_path() -> Path:
-    return Path.home() / ".servo" / "api_token"
+    from servo.paths import servo_home
+    return servo_home() / "api_token"
 
 
 def get_api_token() -> str:

@@ -136,16 +136,46 @@ def test_graph_memory_query_and_prompt_formatting(tmp_path):
     assert len(edge_quirks) >= 1
     assert any(q.id == "edge_app_mode_mic" for q in edge_quirks)
 
-    # Test prompt formatting for System 2
+    # Prompt formatting for System 2: the Edge mic quirk is about Servo's own copilot
+    # window (scope: servo-internal), so it must NOT leak into a user's Edge task.
     prompt_ctx = gm.format_context_for_prompt(
         goal="open edge and record voice command",
         active_app="msedge.exe",
         surface_type="electron",
     )
     assert "[Knowledge Graph Context]" in prompt_ctx
-    assert "Edge App Mode Microphone Permission Suppression" in prompt_ctx
-    assert "--use-fake-ui-for-media-stream" in prompt_ctx
-    assert "Safety Guardrail" in prompt_ctx
+    assert "Electron" in prompt_ctx
+    assert "Edge App Mode Microphone" not in prompt_ctx
+
+    # Task-scoped quirks for the focused app do appear.
+    wpf_ctx = gm.format_context_for_prompt(goal="select a row", active_app="wpf_generic")
+    assert "WPF VirtualizingStackPanel" in wpf_ctx
+
+    # Recovery advice follows the actual failure, not words in the goal.
+    assert "Recovery" not in gm.format_context_for_prompt(goal="fix the error dialog", active_app="notepad.exe")
+    failed = gm.format_context_for_prompt(goal="play it", active_app="notepad.exe",
+                                          failure={"kind": "perception", "error": "No UI element found"})
+    assert "Recovery for this failure (perception)" in failed
+
+    # Nothing applicable -> no block at all (no boilerplate noise).
+    assert gm.format_context_for_prompt(goal="hello", active_app="") == ""
+
+
+def test_graph_rebuilds_when_knowledge_changes(tmp_path):
+    import os, shutil, time
+    from servo.cognition.graph_memory import DEFAULT_KNOWLEDGE_DIR
+    kdir = tmp_path / "knowledge"
+    shutil.copytree(DEFAULT_KNOWLEDGE_DIR, kdir)
+    gm = GraphMemory(graph_path=tmp_path / "g.json", knowledge_dir=kdir)
+    assert not gm.is_stale()
+    assert "recipe_youtube" in gm.graph.nodes
+    new = kdir / "recipes" / "zz_test.md"
+    new.write_text("---\nid: zz_test\ntitle: Test recipe\ntriggers: [zzz]\n---\nDo it.\n", encoding="utf-8")
+    future = time.time() + 5
+    os.utime(new, (future, future))
+    assert gm.is_stale()
+    gm2 = GraphMemory(graph_path=tmp_path / "g.json", knowledge_dir=kdir)
+    assert "recipe_zz_test" in gm2.graph.nodes
 
 
 def test_graph_memory_record_learned_quirk(tmp_path):

@@ -257,7 +257,12 @@ class MirageSensor:
         if b.width <= 1 or b.height <= 1:
             return None
         try:
-            return ImageGrab.grab(bbox=(b.left, b.top, b.right, b.bottom), all_screens=True)
+            # The copilot panel sits on top of the app; without moving it aside, the
+            # vision model was shown the copilot instead of the controls beneath it.
+            from servo.actuation.overlay import stand_aside
+            box = (b.left, b.top, b.right, b.bottom)
+            with stand_aside(area=box, exclude=[self.hwnd], settle=0.12):
+                return ImageGrab.grab(bbox=box, all_screens=True)
         except Exception:
             return None
 

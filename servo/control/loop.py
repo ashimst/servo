@@ -60,6 +60,9 @@ class StepLog(BaseModel):
     error: Optional[str] = None
     # None when no confirmation was needed; otherwise "approved" or "rejected".
     confirmation: Optional[str] = None
+    # confirmed | unconfirmed | failed (see PostTransitionResult.verdict)
+    verification: str = "failed"
+    note: Optional[str] = None  # why an unconfirmed step could not be confirmed
 
 
 class ExecutionResult(BaseModel):
@@ -579,15 +582,25 @@ class ServoControlLoop:
                 explanation=f"Wait of {duration_seconds}s completed.",
             )
         else:
+            observed_text: Optional[str] = None
+            if action_type == "type" and target_el is not None:
+                try:
+                    observed_text = self.tools.read_text(scene, target_el.element_id)
+                except Exception:
+                    observed_text = None
             post_eval = self.jev.evaluate_post_transition(
                 sub_goal, delta, expected_outcome, typed_text=text_to_type if action_type == "type" else "",
+                observed_text=observed_text,
             )
 
+        title = {"confirmed": "confirmed", "unconfirmed": "ran, effect not visible", "failed": "expected change not seen"}
         self.tracer.emit(
             "verify",
-            "Kev post-check · " + ("change confirmed" if post_eval.transition_ok else "expected change not seen"),
-            post_eval.explanation, tier="kev", status="ok" if post_eval.transition_ok else "fail",
-            confidence=post_eval.confidence, delta=delta.model_dump(),
+            "Post-check · " + title[post_eval.verdict],
+            post_eval.explanation, tier="kev",
+            status={"confirmed": "ok", "unconfirmed": "warn", "failed": "fail"}[post_eval.verdict],
+            confidence=post_eval.confidence, delta=delta.model_dump(), verdict=post_eval.verdict,
+            source=post_eval.source,
         )
         return ExecutionResult(
             success=post_eval.transition_ok,
@@ -603,6 +616,8 @@ class ServoControlLoop:
                 latency_ms=0,
                 error=None if post_eval.transition_ok else post_eval.explanation,
                 confirmation=confirmation,
+                verification=post_eval.verdict,
+                note=post_eval.explanation if post_eval.verdict == "unconfirmed" else None,
             ),
             escalation_required=not post_eval.transition_ok,
             actuated=True,

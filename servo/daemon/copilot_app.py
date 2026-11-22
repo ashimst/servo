@@ -115,6 +115,9 @@ class CopilotSession:
         self._unsub = bus.subscribe(self._on_trace)
         # Queue + schedule. The firing thread starts in run_copilot(), not here.
         self.scheduler = Scheduler(self._start_scheduled, notify=self._notice)
+        # Clicks and screenshots under the copilot panel move it aside first.
+        from servo.actuation.overlay import register_own_windows
+        register_own_windows(self.own_hwnds)
 
     # ---------------------------------------------------------------- plumbing
 
@@ -269,8 +272,8 @@ class CopilotSession:
             self.abort.clear()
             run_id = new_run_id()
             self.current_run = run_id
-        self.memory.add_turn("user", text, run_id=run_id)
-        self.history = self.memory.get_recent_history()
+        # The router records both turns (redacted, with route); recording here too saved
+        # every turn twice and fed duplicates to System 2.
         self.broadcast({"type": "run_started", "run_id": run_id, "text": text})
         threading.Thread(target=self._run, args=(run_id, text), name=f"servo-run-{run_id}", daemon=True).start()
         return run_id
@@ -308,7 +311,6 @@ class CopilotSession:
             self.context = getattr(router, "context", self.context)
             self.brain.active_hwnd = self.target_hwnd
             if outcome is not None:
-                self.memory.add_turn("assistant", outcome.reply, run_id=run_id, route=outcome.route)
                 self.history = self.memory.get_recent_history()
         except Exception as e:
             logger.exception("run failed")
@@ -532,6 +534,32 @@ def create_app(session: CopilotSession) -> FastAPI:
             return session.submit(body.text)
         except (ValueError, RuntimeError) as e:
             raise HTTPException(status_code=409, detail=str(e))
+
+    @app.get("/api/runs")
+    def get_runs(limit: int = 50, failed: bool = False,
+                 x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        from servo.telemetry.run_record import list_runs
+        return {"runs": list_runs(limit=max(1, min(limit, 500)), failed_only=failed)}
+
+    @app.get("/api/runs/{run_id}")
+    def get_run(run_id: str, x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        from servo.telemetry.run_record import load_run
+        rec = load_run(run_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"No run {run_id}.")
+        return rec
+
+    @app.get("/api/runs/{run_id}/diagnose")
+    def diagnose_run(run_id: str, explain: bool = False,
+                     x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        from servo.cognition.diagnose import diagnose
+        d = diagnose(run_id, explain=explain)
+        if not d.found:
+            raise HTTPException(status_code=404, detail=d.cause)
+        return {**d.model_dump(), "text": d.to_text()}
 
     @app.get("/api/schedule")
     def get_schedule(x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
@@ -887,7 +915,8 @@ def run_copilot(open_window: bool = True, port: Optional[int] = None) -> None:
             return
         edge = _find_edge()
         if edge:
-            profile = Path.home() / ".servo" / "copilot-shell"
+            from servo.paths import servo_home
+            profile = servo_home() / "copilot-shell"
             _ensure_edge_mic_permission(profile, url)
             proc = subprocess.Popen([
                 edge, f"--app={url}", f"--user-data-dir={profile}", "--no-first-run",

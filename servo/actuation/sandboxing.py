@@ -105,6 +105,53 @@ def check_target_allowed(hwnd: int, mode: str) -> None:
     )
 
 
+def activate_window(hwnd: int) -> bool:
+    """Bring a window to the foreground; True only if it verifiably got there.
+
+    Windows frequently refuses SetForegroundWindow (foreground lock). Synthetic
+    keystrokes always go to the foreground window, so if activation failed we
+    must not type: the keys would land in some other application.
+    """
+    if sys.platform != "win32":
+        return True
+    target = windows.get_root_window(hwnd)
+    if windows.get_foreground_window() == target:
+        return True
+    user32 = ctypes.windll.user32
+
+    def became_foreground(tries: int = 15) -> bool:
+        for _ in range(tries):
+            if windows.get_foreground_window() == target:
+                return True
+            time.sleep(0.02)
+        return False
+
+    if user32.IsIconic(target):
+        user32.ShowWindow(target, 9)  # SW_RESTORE
+    user32.SetForegroundWindow(target)
+    if became_foreground():
+        return True
+    # Foreground lock: a process that didn't receive the last input may not take
+    # focus. A synthetic Alt tap lifts the lock (documented SetForegroundWindow rule).
+    user32.keybd_event(0x12, 0, 0, 0)        # VK_MENU down
+    user32.keybd_event(0x12, 0, 2, 0)        # VK_MENU up
+    user32.SetForegroundWindow(target)
+    user32.BringWindowToTop(target)
+    if became_foreground():
+        return True
+    # Last resort: share the foreground window's input state for one call.
+    fg = windows.get_foreground_window()
+    fg_thread = user32.GetWindowThreadProcessId(fg, None)
+    me = ctypes.windll.kernel32.GetCurrentThreadId()
+    if fg_thread and fg_thread != me and user32.AttachThreadInput(me, fg_thread, True):
+        try:
+            user32.SetForegroundWindow(target)
+            user32.BringWindowToTop(target)
+        finally:
+            user32.AttachThreadInput(me, fg_thread, False)
+    return became_foreground(25)
+
+
 class InputSandbox:
     """Enforces target window boundary checks and hotkey restrictions."""
 
@@ -142,20 +189,11 @@ class InputSandbox:
     def ensure_target_in_foreground(self) -> None:
         """Bring the target to the foreground and VERIFY it got there.
 
-        Windows frequently refuses SetForegroundWindow (foreground lock). Synthetic
-        keystrokes always go to the foreground window, so if activation failed we
-        must not type: the keys would land in some other application.
+        Synthetic keystrokes always go to the foreground window, so if activation failed
+        we must not type: the keys would land in some other application.
         """
-        if sys.platform != "win32":
+        if activate_window(self.hwnd):
             return
-        target = windows.get_root_window(self.hwnd)
-        if windows.get_foreground_window() == target:
-            return
-        ctypes.windll.user32.SetForegroundWindow(target)
-        for _ in range(10):
-            if windows.get_foreground_window() == target:
-                return
-            time.sleep(0.02)
         raise SandboxViolationException(
             f"Could not bring HWND {self.hwnd} to the foreground; refusing to send keystrokes to another window."
         )

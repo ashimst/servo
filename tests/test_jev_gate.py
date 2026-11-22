@@ -38,7 +38,25 @@ def test_jev_post_transition_heuristic():
     assert unmatched.transition_ok is True
     assert unmatched.confidence < 0.6
 
-    assert gate.evaluate_post_transition("Open dialog", SceneDelta(has_changed=False)).transition_ok is False
+    # No visible change is not proof of failure (a video starting changes nothing in the
+    # accessibility tree): the step continues, but is reported as unconfirmed.
+    none = gate.evaluate_post_transition("Open dialog", SceneDelta(has_changed=False))
+    assert none.transition_ok is True and none.verdict == "unconfirmed"
+
+
+def test_readback_decides_typing_verdict():
+    gate = JevGate(use_fallback=True)
+    nothing = SceneDelta(has_changed=False)
+    ok = gate.evaluate_post_transition("type", nothing, typed_text="hello world",
+                                       observed_text="## Old notes\r\nhello   world")
+    assert ok.verdict == "confirmed" and ok.source == "readback"
+    bad = gate.evaluate_post_transition("type", SceneDelta(has_changed=True, added_labels=["x"]),
+                                        typed_text="hello world", observed_text="hello wor")
+    assert bad.verdict == "failed" and "hello wor" in bad.explanation
+    # Unreadable control + some change: honest "unconfirmed", not a guess either way.
+    unk = gate.evaluate_post_transition("type", SceneDelta(has_changed=True, added_labels=["x"]),
+                                        typed_text="hello")
+    assert unk.verdict == "unconfirmed"
 
 
 def test_jev_post_transition_checks_typed_text():
@@ -47,3 +65,10 @@ def test_jev_post_transition_checks_typed_text():
     assert gate.evaluate_post_transition("type", ok, typed_text="bluetooth").transition_ok is True
     wrong = SceneDelta(has_changed=True, value_changes={"Search": {"old_value": "", "new_value": "blue"}})
     assert gate.evaluate_post_transition("type", wrong, typed_text="bluetooth").transition_ok is False
+
+
+def test_readback_treats_carriage_returns_as_line_breaks():
+    gate = JevGate(use_fallback=True)
+    typed = "Rain falls soft,\nA silver hush.\n\nPitter-patter on the roof"
+    notepad = "Rain falls soft,\rA silver hush.\r\rPitter-patter on the roof"   # how Notepad stores it
+    assert gate.evaluate_post_transition("type", SceneDelta(), typed_text=typed, observed_text=notepad).verdict == "confirmed"

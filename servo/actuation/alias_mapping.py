@@ -152,6 +152,24 @@ ACTION_ALIAS_MAP: Dict[str, CanonicalActionType] = {
     "inspect_scene": CanonicalActionType.INSPECT,
 }
 
+_NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
+_SYMBOL_WORDS = {
+    "+": ("plus", "add"), "-": ("minus", "subtract"), "*": ("multiply by", "multiply", "times"),
+    "x": ("multiply by",), "/": ("divide by", "divide"), "=": ("equals",), ".": ("decimal separator",),
+    "%": ("percent",),
+}
+
+
+def _label_synonyms(q: str) -> Tuple[str, ...]:
+    """Other spellings of a short target: '7' -> 'seven', 'seven' -> '7', '+' -> 'plus'."""
+    q = q.strip().lower()
+    if q.isdigit() and len(q) == 1:
+        return (_NUMBER_WORDS[int(q)],)
+    if q in _NUMBER_WORDS:
+        return (str(_NUMBER_WORDS.index(q)),)
+    return _SYMBOL_WORDS.get(q, ())
+
+
 # Generic target categories that fall back to common control types if exact label is missing
 ROLE_FALLBACK_ALIASES = {
     "editor": ("Document", "Edit"),
@@ -456,6 +474,13 @@ class AliasMapper:
         if len(word_matches) == 1:
             return word_matches[0], None
 
+        # 4b. Spoken-form synonyms: Calculator labels its keys "Seven", "Plus", "Equals".
+        for alt in _label_synonyms(clean_q):
+            alt_matches = [el for el in scene.elements.values()
+                           if re.sub(r"[\.\:\'\"\…]+$", "", el.label.strip().lower()).strip() == alt]
+            if len(alt_matches) == 1:
+                return alt_matches[0], None
+
         # 5. Role-based alias fallback
         if q in ROLE_FALLBACK_ALIASES:
             roles = ROLE_FALLBACK_ALIASES[q]
@@ -475,6 +500,21 @@ class AliasMapper:
                 best = max(pool, key=_area)
                 if _area(best) > 0:
                     return best, None
+
+        # 5a. Typing "into Notepad" names the WINDOW, not a control: use its editor.
+        if action_type == CanonicalActionType.TYPE and len(q) >= 3:
+            title = (scene.window_title or "").lower()
+            if q in title or q.replace(" ", "") in title.replace(" ", ""):
+                el, _ = AliasMapper.resolve_element(scene, "editor", action_type=action_type)
+                if el is not None:
+                    return el, None
+
+        # 5b. "the Save button" / "wifi icon": retry without the control-type word.
+        stripped = re.sub(r"\s+(?:button|icon|link|tab|menu|field|box|checkbox)$", "", q).strip()
+        if stripped and stripped != q:
+            el, _ = AliasMapper.resolve_element(scene, stripped, action_type=action_type)
+            if el is not None:
+                return el, None
 
         # 6. Ambiguity vs Not Found Diagnostics
         if len(partial_matches) > 1:

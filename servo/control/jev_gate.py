@@ -50,12 +50,41 @@ class PreRiskResult(BaseModel):
     probabilities: Dict[str, float] = {}
 
 
+Verdict = Literal["confirmed", "unconfirmed", "failed"]
+
+
 class PostTransitionResult(BaseModel):
-    """Post-action state transition verification result."""
+    """Post-action state transition verification result.
+
+    ``verdict`` is the honest three-way answer:
+      * confirmed   - the effect was observed (e.g. typed text read back from the control)
+      * unconfirmed - the action ran but its effect could not be observed either way
+                      (a click that changes nothing the accessibility tree exposes)
+      * failed      - the effect is provably absent
+    ``transition_ok`` (kept for callers) is True unless the verdict is "failed".
+    Unconfirmed steps continue, and are reported as such instead of as done.
+    """
     transition_ok: bool
     confidence: float
     explanation: str
-    source: Literal["kev", "heuristic"] = "heuristic"
+    source: Literal["kev", "heuristic", "readback"] = "heuristic"
+    verdict: Verdict = "confirmed"
+
+
+def _post(verdict: Verdict, confidence: float, explanation: str, source: str = "heuristic") -> PostTransitionResult:
+    return PostTransitionResult(transition_ok=verdict != "failed", confidence=confidence,
+                                explanation=explanation, source=source, verdict=verdict)  # type: ignore[arg-type]
+
+
+def normalize_text(s: str) -> str:
+    """Collapse whitespace and line endings so CRLF/LF and wrapped text compare equal."""
+    # \r is a line break (Notepad stores newlines as \r): turn it into whitespace, never
+    # delete it, or "bring.\nPitter" reads back as "bring.Pitter" and never matches.
+    return re.sub(r"\s+", " ", (s or "").replace("\r\n", "\n").replace("\r", "\n")).strip()
+
+
+def text_contains(observed: str, typed: str) -> bool:
+    return bool(typed.strip()) and normalize_text(typed) in normalize_text(observed)
 
 
 class GoalAssessment(BaseModel):
@@ -278,7 +307,18 @@ class JevGate:
         model may raise the risk of an innocuous-sounding action, but never lower one
         the floor flags.
         """
-        combined_text = f"{sub_goal} {tool_call} {element_label}"
+        # The keyword floor judges the ACTION, not the content being typed: a poem with
+        # "each drop a note" or an email saying "send me the order" is not a risky act.
+        # (Typed shell commands are still judged, by _shell_risk below.)
+        typed = _typed_text(tool_call)
+        scan = f"{sub_goal} {tool_call} {element_label}"
+        if typed:
+            plain = typed.replace("\\n", "\n").replace("\\t", "\t").replace("\\'", "'")
+            # longest first, so a prefix never breaks a full-text match
+            for chunk in sorted({typed, typed[:59], typed[:40], plain, plain[:59], plain[:40]}, key=len, reverse=True):
+                if len(chunk) >= 3:
+                    scan = scan.replace(chunk, " ")
+        combined_text = scan
         kw_level, kw_reason = _keyword_risk(combined_text)
         sh_level, sh_reason = _shell_risk(tool_call, target_process)
         if _RISK_ORDER[sh_level] > _RISK_ORDER[kw_level]:
@@ -329,8 +369,20 @@ class JevGate:
         delta: SceneDelta,
         expected_outcome: str = "",
         typed_text: str = "",
+        observed_text: Optional[str] = None,
     ) -> PostTransitionResult:
-        """Verify whether observed scene changes correspond to the expected sub-goal outcome."""
+        """Verify whether observed scene changes correspond to the expected sub-goal outcome.
+
+        ``observed_text`` is the target control's text read back after typing. It is
+        direct evidence, so it decides the verdict before any model or diff heuristic.
+        """
+        if typed_text and observed_text is not None:
+            if text_contains(observed_text, typed_text):
+                return _post("confirmed", 0.97, "Typed text read back from the target control", "readback")
+            tail = normalize_text(observed_text)[-160:]
+            return _post("failed", 0.9, f"Typed text is not in the target control. It now reads: “{tail or '(empty)'}”",
+                         "readback")
+
         answers = self._ask(
             {
                 "sub_goal": sub_goal,
@@ -356,35 +408,28 @@ class JevGate:
             p = _noul(answers, "transition_ok")
             if p is not None:
                 ok = p >= 0.5
-                return PostTransitionResult(
-                    transition_ok=ok, confidence=p if ok else 1 - p,
-                    explanation=f"Kev verified transition (P(ok)={p:.2f})", source="kev",
-                )
+                return _post("confirmed" if ok else "failed", p if ok else 1 - p,
+                             f"Kev verified transition (P(ok)={p:.2f})", "kev")
             logger.warning("Kev returned malformed post-transition answer; using heuristic gate.")
 
         # ---- Heuristic fallback ----
         if typed_text:
             for change in delta.value_changes.values():
-                if typed_text in (change.get("new_value") or ""):
-                    return PostTransitionResult(
-                        transition_ok=True, confidence=0.95,
-                        explanation="Typed text observed in control value (Heuristic)",
-                    )
-            if not delta.value_changes and delta.has_changed:
-                return PostTransitionResult(
-                    transition_ok=True, confidence=0.5,
-                    explanation="UI changed but the target exposes no readable value (Heuristic, unverified)",
-                )
-            return PostTransitionResult(
-                transition_ok=False, confidence=0.8,
-                explanation="Typed text was not observed in any control value after actuation (Heuristic)",
-            )
+                if text_contains(change.get("new_value") or "", typed_text):
+                    return _post("confirmed", 0.95, "Typed text observed in control value (Heuristic)")
+            if delta.value_changes:
+                # A value changed, and it isn't what we typed: evidence of failure.
+                return _post("failed", 0.8, "A field changed, but not to the typed text (Heuristic)")
+            if delta.has_changed:
+                return _post("unconfirmed", 0.5,
+                             "The UI changed, but the typed text could not be read back (Heuristic)")
+            return _post("failed", 0.8, "Typed text was not observed in any control value after actuation (Heuristic)")
 
         if not delta.has_changed:
-            return PostTransitionResult(
-                transition_ok=False, confidence=0.85,
-                explanation="No UI state mutation detected after actuation (Heuristic)",
-            )
+            # Many real effects are invisible to the accessibility tree (a video starting,
+            # a sound, a page scrolled by a key). No change is not proof of failure.
+            return _post("unconfirmed", 0.4,
+                         "The action ran, but no change was visible in the accessibility tree (Heuristic)")
 
         if expected_outcome:
             observed = " ".join(
@@ -393,19 +438,10 @@ class JevGate:
             ).lower()
             words = [w for w in re.findall(r"\w{4,}", expected_outcome.lower())]
             if words and any(w in observed for w in words):
-                return PostTransitionResult(
-                    transition_ok=True, confidence=0.85,
-                    explanation="UI changed and the change mentions the expected outcome (Heuristic)",
-                )
-            return PostTransitionResult(
-                transition_ok=True, confidence=0.55,
-                explanation="UI changed but could not be matched to the expected outcome (Heuristic, unverified)",
-            )
+                return _post("confirmed", 0.85, "UI changed and the change mentions the expected outcome (Heuristic)")
+            return _post("confirmed", 0.55, "UI changed right after the action (Heuristic; change not matched to the goal)")
 
-        return PostTransitionResult(
-            transition_ok=True, confidence=0.7,
-            explanation="UI state mutation observed; no expected outcome to compare (Heuristic)",
-        )
+        return _post("confirmed", 0.7, "UI state mutation observed; no expected outcome to compare (Heuristic)")
 
     # ---------------------------------------------------------------- routing
 

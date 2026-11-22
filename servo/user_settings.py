@@ -16,11 +16,13 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("servo.user_settings")
 
-PATH = Path.home() / ".servo" / "settings.json"
+from servo.paths import servo_home
+
+PATH = servo_home() / "settings.json"
 
 PLAIN_FIELDS = (
     "planner_provider", "anthropic_model", "openai_base_url", "openai_model", "gemini_model",
-    "kev_url", "browser_channel",
+    "kev_url", "browser_channel", "preferred_browser", "browser_mode",
 )
 SECRET_FIELDS = ("anthropic_api_key", "openai_api_key", "gemini_api_key", "kev_api_key")
 

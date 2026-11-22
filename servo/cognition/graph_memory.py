@@ -36,7 +36,9 @@ from servo.config import settings
 logger = logging.getLogger("servo.cognition.graph_memory")
 
 DEFAULT_KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent.parent / "knowledge"
-DEFAULT_GRAPH_PATH = Path.home() / ".servo" / "graph.json"
+from servo.paths import servo_home
+
+DEFAULT_GRAPH_PATH = servo_home() / "graph.json"
 
 
 # ===================================================================== Models
@@ -93,6 +95,36 @@ class KnowledgeGraph(BaseModel):
 
 
 # ========================================================= Codebase AST Parser
+
+def _literal_fragments(fn: ast.AST, limit: int = 60) -> List[str]:
+    """Distinct string literals (and constant parts of f-strings) of 12+ chars in a function."""
+    out: List[str] = []
+    seen: Set[str] = set()
+    for node in ast.walk(fn):
+        if node is not fn and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            s = " ".join(node.value.split())
+            if len(s) >= 12 and s not in seen and not s.startswith(("http", "\\")):
+                seen.add(s)
+                out.append(s[:220])
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _called_names(fn: ast.AST, limit: int = 80) -> List[str]:
+    names: List[str] = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
+            if name and name not in names:
+                names.append(name)
+                if len(names) >= limit:
+                    break
+    return names
+
 
 class ServoASTVisitor(ast.NodeVisitor):
     """Parses Python source AST into modules, classes, functions, and import edges."""
@@ -154,7 +186,15 @@ class ServoASTVisitor(ast.NodeVisitor):
             name=node.name,
             description=doc.split("\n")[0] if doc else "",
             file_path=self.file_path,
-            attributes={"args": args, "is_method": self.current_class is not None},
+            attributes={
+                "args": args, "is_method": self.current_class is not None,
+                "lineno": node.lineno, "end_lineno": getattr(node, "end_lineno", node.lineno),
+                # Literal text in the function (message fragments, f-string parts). Error
+                # messages are built from these, so a run's error text can be traced back
+                # to the function that produced it (see servo/cognition/diagnose.py).
+                "strings": _literal_fragments(node),
+                "calls": _called_names(node),
+            },
         ))
         self.graph.add_edge(GraphEdge(source=parent, target=fn_id, type="defines"))
         self.generic_visit(node)
@@ -327,6 +367,9 @@ def parse_knowledge_documents(knowledge_root: Path, graph: KnowledgeGraph) -> No
                     "root_cause": root_cause,
                     "mitigation": mitigation,
                     "body": body[:500],
+                    # "servo-internal" quirks describe Servo's own plumbing (e.g. the copilot
+                    # window's mic permissions) and never go into task-planning prompts.
+                    "scope": str(fm.get("scope") or "task"),
                 },
             ))
 
@@ -340,6 +383,22 @@ def parse_knowledge_documents(knowledge_root: Path, graph: KnowledgeGraph) -> No
             # Explicit related nodes in frontmatter
             for rel in fm.get("related_nodes", []):
                 graph.add_edge(GraphEdge(source=qid, target=rel, type="mitigates"))
+
+    # 6. Task recipes (knowledge/recipes): the procedures System 2 actually follows.
+    try:
+        from servo.cognition.recipes import RecipeBook
+        for r in RecipeBook(knowledge_root / "recipes").recipes():
+            graph.add_node(GraphNode(
+                id=f"recipe_{r.id}", type="Recipe", name=r.title,
+                description=r.body.splitlines()[0][:200] if r.body else r.title,
+                tags=list(r.triggers), file_path=r.path,
+                attributes={"apps": list(r.apps), "body": r.body[:1500]},
+            ))
+            for app in r.apps:
+                graph.add_edge(GraphEdge(source=f"recipe_{r.id}", target=f"app:{app.removesuffix('.exe')}",
+                                         type="applies_to_app"))
+    except Exception as e:
+        logger.debug("recipe ingestion skipped: %s", e)
 
 
 # ======================================================= Graph Memory Manager
@@ -361,7 +420,7 @@ class GraphMemory:
 
     def _load_or_build(self) -> None:
         """Load compiled graph from JSON if available, otherwise compile from sources."""
-        if self.graph_path.is_file():
+        if self.graph_path.is_file() and not self.is_stale():
             try:
                 data = json.loads(self.graph_path.read_text(encoding="utf-8"))
                 self.graph = KnowledgeGraph.model_validate(data)
@@ -369,6 +428,30 @@ class GraphMemory:
             except Exception as e:
                 logger.warning("Failed to load cached graph.json (%s), rebuilding...", e)
         self.rebuild_graph()
+
+    def _source_files(self) -> List[Path]:
+        files: List[Path] = []
+        if self.knowledge_dir.is_dir():
+            files += list(self.knowledge_dir.rglob("*.md"))
+        if self.servo_root.is_dir():
+            files += list(self.servo_root.rglob("*.py"))
+        return files
+
+    def is_stale(self) -> bool:
+        """True if any knowledge doc or source file changed since graph.json was built.
+
+        Previously the cache was trusted forever, so edits to knowledge/*.md never
+        reached the planner without a manual rebuild.
+        """
+        try:
+            built = self.graph_path.stat().st_mtime
+        except OSError:
+            return True
+        return any(f.stat().st_mtime > built for f in self._source_files() if f.exists())
+
+    def refresh_if_stale(self) -> None:
+        if self.is_stale():
+            self.rebuild_graph()
 
     def rebuild_graph(self) -> KnowledgeGraph:
         """Parse codebase AST and knowledge markdown to produce a fresh graph.json."""
@@ -429,56 +512,45 @@ class GraphMemory:
         active_app: Optional[str] = None,
         surface_type: Optional[str] = None,
         limit_quirks: int = 3,
+        failure: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Render a concise [Knowledge Graph Context] block for System 2 planning."""
-        sections: List[str] = ["[Knowledge Graph Context]"]
+        """Render a concise [Knowledge Graph Context] block for System 2 planning.
 
-        # 1. Matched App Quirks
-        quirks: List[GraphNode] = []
-        if active_app:
-            quirks = self.get_app_quirks(active_app)
-        if not quirks and goal:
-            # Query-based quirk matching
-            words = [w for w in re.split(r"\W+", goal.lower()) if len(w) > 3]
-            for w in words:
-                quirks.extend(self.search_nodes(w, node_type="Quirk", limit=2))
-                if len(quirks) >= limit_quirks:
-                    break
+        Only what applies right now: quirks for the focused app (never servo-internal
+        ones), the UI surface of that app, and recovery advice for the failure that
+        actually happened. Empty when nothing applies, so it never adds noise.
+        Procedures for tasks come from knowledge/recipes (see servo/cognition/recipes.py).
+        """
+        sections: List[str] = []
 
-        seen_quirks: Set[str] = set()
-        deduped_quirks = [q for q in quirks if not (q.id in seen_quirks or seen_quirks.add(q.id))]
+        # 1. Quirks for the app the user is in
+        app = (active_app or "").lower().removesuffix(".exe")
+        quirks = [q for q in self.get_app_quirks(app) if q.attributes.get("scope", "task") != "servo-internal"] if app else []
+        if quirks:
+            sections.append("Known quirks of the active app:")
+            for q in quirks[:limit_quirks]:
+                sections.append(f"  * {q.name}: {q.attributes.get('mitigation') or q.description}")
 
-        if deduped_quirks:
-            sections.append("Learned Application Quirks & Mitigations:")
-            for q in deduped_quirks[:limit_quirks]:
-                mitigation = q.attributes.get("mitigation") or q.description
-                sections.append(f"  * [{q.name}] Root cause: {q.attributes.get('root_cause', 'N/A')}")
-                sections.append(f"    -> Mitigation: {mitigation}")
+        # 2. UI surface of the active app (or as given)
+        surface = (surface_type or _surface_for_app(app) or "").lower()
+        surf_node = f"surface_{surface}" if surface else ""
+        if surf_node in self.graph.nodes:
+            node = self.graph.nodes[surf_node]
+            line = f"Active app's UI surface: {node.name}: {node.description}"
+            kind = str((failure or {}).get("kind") or "")
+            fallbacks = [n for edge, n in self.graph.get_neighbors(surf_node) if edge.type == "falls_back_to"]
+            if kind == "perception" and fallbacks:
+                line += f" If labels are missing, System 1 falls back to {fallbacks[0].name}."
+            sections.append(line)
 
-        # 2. UI Surface & Fallback Paths
-        if surface_type:
-            surf_node = f"surface_{surface_type.lower()}"
-            if surf_node in self.graph.nodes:
-                node = self.graph.nodes[surf_node]
-                sections.append(f"UI Surface Profile: {node.name}")
-                sections.append(f"  * Details: {node.description}")
-                # Check fallback bridges
-                fallbacks = [n for edge, n in self.graph.get_neighbors(surf_node) if edge.type == "falls_back_to"]
-                if fallbacks:
-                    sections.append(f"  * Fallback Required: If UIA misses, fallback to {fallbacks[0].name}")
+        # 3. Recovery advice for the failure that just happened
+        if failure:
+            advice = _RECOVERY.get(str(failure.get("kind") or "error"), _RECOVERY["error"])
+            sections.append(f"Recovery for this failure ({failure.get('kind') or 'error'}): {advice}")
 
-        # 3. Behavioral Playbook Suggestions
-        if "fail" in goal.lower() or "error" in goal.lower() or "not found" in goal.lower():
-            pb = self.graph.nodes.get("playbook_failure_recovery")
-            if pb:
-                sections.append(f"Active Playbook: {pb.name} (Check coordinates/OCR before retrying same action)")
-
-        # Mandatory Safety Invariant Guardrail Reminder
-        sections.append("Safety Guardrail: Hard risk boundaries (Kev Gate) and harness sandboxes are enforced in code.")
-
-        if len(sections) == 2:  # Only header and safety guardrail
+        if not sections:
             return ""
-        return "\n".join(sections)
+        return "\n".join(["[Knowledge Graph Context]", *sections])
 
     # -------------------------------------------------- Compounding Learning
 
@@ -714,6 +786,30 @@ class GraphMemory:
             "checks": checks,
             "summary": f"Graph Consistency: {score}% ({status.upper()}). {len(checks)} audits evaluated.",
         }
+
+
+_BROWSER_APPS = {"chrome", "msedge", "dia", "arc", "firefox", "brave", "opera", "vivaldi"}
+_ELECTRON_APPS = {"code", "slack", "discord", "teams", "ms-teams", "spotify", "whatsapp", "notion", "obsidian"}
+_WPF_APPS = {"devenv", "visualstudio"}
+
+
+def _surface_for_app(app: str) -> str:
+    if app in _BROWSER_APPS or app in _ELECTRON_APPS:
+        return "electron"
+    if app in _WPF_APPS:
+        return "wpf"
+    return ""
+
+
+_RECOVERY = {
+    "perception": "the label wasn't on screen. Pick a label that the screen description actually lists "
+                  "(shorter or partial labels work), or scroll/open the menu that contains it first.",
+    "verify": "the action ran but the expected change wasn't seen. Look at the screen: it may have worked, "
+              "or a dialog may be in the way. Don't repeat the same command blindly.",
+    "reasoning": "System 1 couldn't interpret the command. Rewrite it strictly in the command grammar.",
+    "policy": "the user declined or the action was refused. Don't retry it; explain or ask in reply.",
+    "error": "the step errored. Read the error text, change the approach, and stop after two failed approaches.",
+}
 
 
 # Global singleton instance

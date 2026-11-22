@@ -96,8 +96,62 @@ def normalize_url(u: str) -> str:
     return u
 
 
+def _site_or_url(x: str) -> Optional[str]:
+    from servo.cognition.user_browser import site_url
+    x = x.strip().strip("'\"")
+    if _URLISH.match(x) and "." in x:
+        return normalize_url(x)
+    return site_url(x)
+
+
+def parse_site_intent(text: str) -> Optional[MacroPlan]:
+    """'open gmail in chrome', 'search youtube for kanye', 'find X on amazon in dia'."""
+    from servo.cognition.user_browser import _BROWSER_NAME_RE, site_search_url
+
+    t = text.strip().rstrip(".")
+    browser = ""
+    m = re.match(rf"^(.+?)\s+(?:in|on|using|with)\s+({_BROWSER_NAME_RE})$", t, re.I)
+    if m:
+        t, browser = m.group(1).strip(), m.group(2).lower()
+
+    def step(url: str, why: str) -> MacroPlan:
+        args = {"url": url, **({"browser": browser} if browser else {})}
+        return MacroPlan(goal=text.strip(), steps=[_step(1, "open_url", args, why + (f" in {browser}" if browser else ""))])
+
+    m = (re.match(r"^(?:search|look\s+up|find)\s+(?:on\s+)?(\w[\w ]*?)\s+for\s+(.+)$", t, re.I)
+         or None)
+    if m:
+        url = site_search_url(m.group(1), m.group(2).strip("'\""))
+        if url:
+            return step(url, f"Search {m.group(1)} for '{m.group(2)}'")
+    m = re.match(r"^(?:search(?:\s+for)?|look\s+up|find)\s+(.+?)\s+(?:on|in)\s+(\w[\w ]*?)$", t, re.I)
+    if m:
+        url = site_search_url(m.group(2), m.group(1).strip("'\""))
+        if url:
+            return step(url, f"Search {m.group(2)} for '{m.group(1)}'")
+    # "go to youtube": web verbs are unambiguous ("open spotify" may mean the desktop app).
+    m = re.match(r"^(?:go\s+to|visit|navigate\s+to|browse\s+to)\s+(\w[\w ]*?)$", t, re.I)
+    if m and not browser:
+        from servo.cognition.user_browser import site_url
+        url = site_url(m.group(1))
+        if url:
+            return step(url, f"Open {url}")
+    if browser:
+        m = re.match(r"^(?:open|go\s+to|visit|navigate\s+to|browse\s+to|load|show)\s+(.+)$", t, re.I)
+        if m:
+            url = _site_or_url(m.group(1))
+            if url:
+                return step(url, f"Open {url}")
+            if re.fullmatch(r"(?:it|a\s+new\s+tab|new\s+tab|the\s+browser)", m.group(1).strip(), re.I):
+                return None
+    return None
+
+
 def parse_web_intent(text: str) -> Optional[MacroPlan]:
-    """Grammar for browser commands (handled by the Playwright tier)."""
+    """Grammar for browser commands (your browser, or the Playwright tier in that mode)."""
+    plan = parse_site_intent(text)
+    if plan:
+        return plan
     t = text.strip().rstrip(".")
     m = re.match(rf"^(?:open|launch|start)\s+{_BROWSER_APPS}\s+and\s+(?:search(?:\s+the\s+web)?\s+for|google|look\s+up)\s+(.+)$", t, re.I)
     if m:
@@ -133,7 +187,12 @@ def _plausible(plan: MacroPlan) -> bool:
             val = str(s.arguments.get(key) or "")
             if second_action.search(val):
                 return False
-            if key in ("app_name", "target") and (len(val.split()) > 6 or re.search(r"\b(after|before|if)\b", val, re.I)):
+            # App names are short; a long one swallowed a clause ("open notepad after lunch").
+            # Click targets can legitimately be long link/video titles ("Kanye West - Runaway
+            # (Video Version) ft. Pusha T 4 minutes, 38 seconds", "If I Ruled the World").
+            if key == "app_name" and (len(val.split()) > 6 or re.search(r"\b(after|before|if)\b", val, re.I)):
+                return False
+            if key == "target" and len(val.split()) > 30:
                 return False
         if s.tool_name == "launch_app" and re.search(r"\band\b", str(s.arguments.get("app_name", "")), re.I):
             return False
@@ -182,12 +241,74 @@ def parse_save(t: str) -> Optional[MacroPlan]:
     return None
 
 
+def _unescape_typed(text: str) -> str:
+    """Models often double-escape line breaks inside JSON ('\\\\n'); type real newlines/tabs."""
+    text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    # ...and unicode escapes: an em dash arrived as the six characters "—".
+    return re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
+
+
+_MAX_REPEAT = 25
+
+
+def _repeat_key(goal: str, key: str, n: int, why: str) -> MacroPlan:
+    n = max(1, min(int(n), _MAX_REPEAT))
+    return MacroPlan(goal=goal, steps=[_step(i, "send_hotkey", {"keys": [key]}, f"{why} ({i}/{n})" if n > 1 else why)
+                                      for i in range(1, n + 1)])
+
+
+def parse_media_intent(text: str) -> Optional[MacroPlan]:
+    """Volume and playback by system media keys (each volume key press is about 2%).
+
+    'increase the volume a bit', 'turn the volume down by 20%', 'mute', 'pause the music',
+    'press volumeup 3 times', 'next track'.
+    """
+    t = text.strip().rstrip(".!").lower()
+    m = re.match(r"^press\s+(\w[\w+\-]*)\s+(\d{1,2})\s+times$", t)
+    if m:
+        from servo.planner.tool_calling import _is_hotkey_argument
+        if _is_hotkey_argument(m.group(1)):
+            return _repeat_key(text.strip(), m.group(1), int(m.group(2)), f"Press {m.group(1)}")
+    up = re.match(r"^(?:(?:increase|raise|turn\s+up|bump\s+up|boost)\s+(?:the\s+|my\s+)?(?:volume|sound)|"
+                  r"(?:turn|make)\s+(?:the\s+|my\s+)?(?:volume|sound|it)\s+up|louder|volume\s+up)(.*)$", t)
+    down = re.match(r"^(?:(?:decrease|lower|reduce|turn\s+down)\s+(?:the\s+|my\s+)?(?:volume|sound)|"
+                    r"(?:turn|make)\s+(?:the\s+|my\s+)?(?:volume|sound|it)\s+down|quieter|softer|volume\s+down)(.*)$", t)
+    for mm, key in ((up, "volumeup"), (down, "volumedown")):
+        if mm:
+            rest = mm.group(1)
+            pct = re.search(r"(\d{1,3})\s*(?:%|percent)", rest)
+            steps_n = re.search(r"(\d{1,2})\s*(?:steps?|notches?|times)", rest)
+            if pct:
+                n = round(int(pct.group(1)) / 2)
+            elif steps_n:
+                n = int(steps_n.group(1))
+            elif re.search(r"\b(?:a\s+lot|much|way)\b", rest):
+                n = 12
+            elif rest.strip() in ("", "a bit", "a little", "a little bit", "slightly", "a tad") or "bit" in rest:
+                n = 5
+            else:
+                return None
+            return _repeat_key(text.strip(), key, n, f"Volume {'up' if key == 'volumeup' else 'down'}")
+    if re.match(r"^(?:mute|unmute)(?:\s+(?:the\s+)?(?:volume|sound|audio|computer|pc|laptop))?$", t):
+        return _repeat_key(text.strip(), "volumemute", 1, "Toggle mute")
+    if re.match(r"^(?:pause|resume|play|unpause)\s+(?:the\s+)?(?:music|song|audio|media|playback)$", t):
+        return _repeat_key(text.strip(), "playpause", 1, "Play/pause media")
+    if re.match(r"^(?:next|skip)\s+(?:the\s+)?(?:track|song)$|^skip\s+(?:this\s+)?song$", t):
+        return _repeat_key(text.strip(), "nexttrack", 1, "Next track")
+    if re.match(r"^(?:previous|prev|last)\s+(?:track|song)$", t):
+        return _repeat_key(text.strip(), "prevtrack", 1, "Previous track")
+    return None
+
+
 def parse_grammar(text: str, user_name: str = "User") -> Optional[MacroPlan]:
     # System tools first: grammar-only (never Needle), and their quoted text is literal.
     sys_intent = parse_system_intent(text)
     if sys_intent:
         tool, args = sys_intent
         return MacroPlan(goal=text.strip(), steps=[_step(1, tool, args, f"{tool.replace('_', ' ').capitalize()}")])
+    media = parse_media_intent(text)
+    if media:
+        return media
     t = text.strip().rstrip(".")
     plan = parse_web_intent(t)
     if plan and _plausible(plan):
@@ -203,11 +324,20 @@ def parse_grammar(text: str, user_name: str = "User") -> Optional[MacroPlan]:
         tool = "double_click" if kind == "double" else "right_click"
         return MacroPlan(goal=t, steps=[_step(1, tool, {"target": target}, f"{kind.capitalize()}-click '{target}'")])
     # `type "x" into y` with explicit quotes keeps text containing " into " intact.
-    m = re.match(r'^(?:type|write|enter)\s+"([^"]+)"\s+(?:in|into|on)\s+(.+)$', t, re.I)
+    m = re.match(r'^(?:type|write|enter)\s+"([^"]+)"\s+(?:in|into|on)\s+(.+)$', t, re.I | re.S)
     if m:
-        txt, target = m.group(1), m.group(2).strip().strip("'\"")
-        return MacroPlan(goal=t, steps=[_step(1, "type_text", {"text": txt, "target": target}, f"Type '{txt}' into '{target}'")])
-    if _describes_text_to_write(t):
+        txt, target = _unescape_typed(m.group(1)), m.group(2).strip().strip("'\"")
+        return MacroPlan(goal=t, steps=[_step(1, "type_text", {"text": txt, "target": target}, f"Type '{_clip(txt)}' into '{target}'")])
+    # `type "x"` (quoted, no target): the WHOLE quoted text goes to the focused editor.
+    # Without this, a composed poem fell through to a rule that split it at the word "in".
+    m = re.match(r'^(?:type|write|enter)\s+"(.*)"$', text.strip(), re.I | re.S)
+    if m and m.group(1).strip():
+        txt = _unescape_typed(m.group(1))
+        return MacroPlan(goal=t, steps=[_step(1, "type_text", {"text": txt, "target": "editor"}, f"Type '{_clip(txt)}'")])
+    # Any clause that describes text to compose ("write a short poem about rain") needs
+    # System 2. Checking only the whole sentence missed "open notepad and write a poem…",
+    # which then typed the literal words "a short poem about rain".
+    if any(_describes_text_to_write(c) for c in split_clauses(t)):
         return None
     plan = parse_deterministic_intent(t, user_name=user_name)
     if plan and plan.steps and _plausible(plan):
@@ -357,6 +487,13 @@ class Tier1Intent:
                 _step(i, str(c.get("name")), dict(c.get("arguments") or {}), f"Needle: {c.get('name')}")
                 for i, c in enumerate(calls, start=1)
             ]
+            mismatch = _verb_mismatch(text, steps)
+            if mismatch:
+                # e.g. "pause the video" -> close_window. A confident wrong action is worse
+                # than escalating, so refuse it and let System 2 decide.
+                sp.done("warn", f"Needle proposed {mismatch}, which the request never asks for — rejected",
+                        confidence=conf_f)
+                return None
             for s in steps:
                 if s.tool_name == "open_url" and "url" in s.arguments:
                     s.arguments["url"] = normalize_url(str(s.arguments["url"]))
@@ -368,6 +505,23 @@ class Tier1Intent:
             )
             return Tier1Proposal(steps=steps, confidence=conf_f, source="needle",
                                  reasoning=str(resp.get("reasoning") or ""), raw=resp)
+
+
+# Tools that change or destroy state must be literally asked for. Needle maps "pause the
+# video" to close_window with high confidence; this guard makes that a reasoning miss.
+_REQUIRED_VERBS = {
+    "close_window": r"\b(close|quit|exit|kill|shut|end)\b",
+    "launch_app": r"\b(open|launch|start|run|go\s+to|switch\s+to|bring\s+up|show)\b",
+    "type_text": r"\b(type|write|enter|input|fill|put|note|search|say|paste|add)\b",
+}
+
+
+def _verb_mismatch(text: str, steps: List[PlanStep]) -> Optional[str]:
+    for s in steps:
+        pattern = _REQUIRED_VERBS.get(s.tool_name)
+        if pattern and not re.search(pattern, text, re.I):
+            return s.tool_name
+    return None
 
 
 def _clip(s: str, n: int = 60) -> str:

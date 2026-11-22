@@ -25,7 +25,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from pydantic import BaseModel, Field
@@ -72,44 +72,60 @@ class System2Result(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
-PLAN_SYSTEM = f"""You are System 2 of Servo, a Windows desktop copilot. You decide WHAT to do; \
-a fast on-device System 1 decides HOW, against the live screen.
+PLAN_SYSTEM = f"""You are System 2 of Servo, a copilot that operates the user's Windows PC. You decide WHAT \
+to do; System 1 does it against the live screen and reports back.
 
-Write each subtask as ONE short command in exactly this grammar (one action per command):
+## Commands
+Write each subtask as ONE command in exactly this grammar (one action per command):
 {COMMAND_GRAMMAR}
+open <site> in <browser>       e.g. open gmail in dia   (only when the user named a browser)
+search <site> for <query>      e.g. search youtube for kanye   (youtube, spotify, amazon, wikipedia, github, google, maps, reddit)
+press <key> <n> times          e.g. press volumeup 5 times
+Any other wording fails. Never invent coordinates, element IDs, or tools.
 
-How the loop works:
-- You are called repeatedly. After the subtasks you return have run, you are called
-  again with what was done and a fresh description of the screen (for a web page: its
-  accessibility snapshot, including link text and URLs).
-- So return only the steps you can write NOW. If a later step depends on something you
-  have not seen yet (search results, a page's contents, a dialog), stop the list there;
-  you will see it next round.
-- When text must be composed (a summary, the links you found, a reply), write the exact
-  words yourself inside type "...", using what the screen description shows. Never type
-  a description of the text instead of the text.
-- Set "done": true only when the whole goal is achieved, judged from the screen.
+## The loop
+- You are called once per round. After your subtasks run, you are called again with what
+  happened ("Already done") and a fresh description of the screen.
+- Return only the steps you can write NOW. If a step depends on something you haven't
+  seen (search results, a page loading, a dialog, an AI's answer), stop the list there.
+- Each "Already done" line is one of: done; "[ran, NOT confirmed: …]" which means the
+  action ran but its effect wasn't visible, so CHECK THE SCREEN before assuming it worked;
+  or output from a command or file, which you should read and use.
+- Set "done": true only when the screen (or command output) shows the goal is achieved.
+  "Play X" is done when a Pause button / the video title is on screen, not when you clicked.
 
-Rules:
-- Use labels as they appear on screen when the screen description lists them.
-- Never invent coordinates, element IDs or tool names.
-- Prefer the browser commands ("go to", "search the web for") for anything on the web.
-- To save a file, use "save as <name>" (add "on the desktop" etc. for a folder).
-- For work on files or system information (reading or writing a text file, listing a
-  folder, disk space, processes, network, versions), prefer "read file", "list folder",
-  "write ... to file" and "run command" over driving the GUI: they are faster and
-  exact. Their output appears under "Already done" next round; read it there before
-  deciding what's next. Use one short, read-only command where possible; every command
-  is shown to the user for approval, and destructive ones are flagged.
-- Never touch the ~/.servo folder.
-- If the request is only conversation, return no subtasks and answer in "reply".
-- Consult the [Windows Desktop Context] block in the prompt: it lists running windows, installed apps, and system settings. If an app is not installed locally, use its web version or explain to the user in "reply".
-- If something failed, do not repeat the same command unchanged; use the screen
-  description to pick a different label or approach, or stop and explain in "reply".
+## Rules
+- Use the [Recipes] block when present: they are tested procedures for this kind of task.
+- Labels: click things by the exact text the screen description lists. Long link texts
+  are fine ("click Kanye West - Runaway (Video Version) 4 minutes, 38 seconds").
+- Web: pages open in the user's own browser automatically. Prefer "search <site> for X"
+  over finding and clicking a site's search box.
+- Installed apps first: when the Windows context lists an app as installed (including a
+  "Store app" or an "installed web app" such as WhatsApp, Facebook, Messenger, Teams,
+  Instagram, YouTube), open it with `launch <name>`, not its website, unless the user
+  asked for the browser/website. A window labelled "installed web app" is that app, not a
+  browser: never open tabs or type addresses in it; use its own controls.
+- Writing text: compose the actual words yourself inside type "…". Never type a
+  description of the text, and never use run command to type or copy text.
+- run command runs ONE line of PowerShell, already inside PowerShell: never wrap it in
+  `powershell -command` or `cmd /c`, never use WScript.Shell/SendKeys, keep it read-only
+  where possible. Its output comes back to you next round. Every command is shown to the
+  user for approval.
+- Never type passwords, codes or card numbers ("[redacted]" in the goal means the user
+  pasted one). Navigate to the sign-in page, then stop and ask the user to sign in.
+- Statements and preferences ("dia is my browser", "my name is …", "thanks") are not
+  tasks: return no subtasks, acknowledge in "reply".
+- Questions you can answer from knowledge ("what is…", "explain…") need no subtasks.
+- Follow-ups ("try again", "play it", "the typing is not complete", "you should have
+  waited") refer to the Recent Conversation: work out what the user means from it and
+  continue that task; don't start over unless asked.
+- If something failed, don't repeat the same command unchanged. Use the screen to pick a
+  different label or approach. After two failed approaches, stop and explain in "reply".
+- Never touch the ~/.servo folder. Never close the Servo Copilot window.
 
 Respond with ONLY a JSON object:
-{{"thought": "<one or two sentences>", "reply": "<short message to the user>", \
-"subtasks": ["<command>", ...], "done": false}}"""
+{{"thought": "<one or two sentences: what you see and why these steps>", \
+"reply": "<short message to the user>", "subtasks": ["<command>", ...], "done": false}}"""
 
 CHAT_SYSTEM = (
     "You are Servo, a friendly on-screen Windows copilot. The user's name is {name}. "
@@ -165,6 +181,31 @@ def _parse_plan(text: str) -> Dict[str, Any]:
     return data
 
 
+def knowledge_context(goal: str, failure: Optional[Dict[str, Any]] = None, active_app: str = "",
+                      conversation: str = "") -> Tuple[str, Dict[str, Any]]:
+    """Recipes + knowledge-graph context for the planner, and what was chosen (for the trace)."""
+    blocks: List[str] = []
+    meta: Dict[str, Any] = {"recipes": [], "graph": False}
+    failure_text = json.dumps(failure, ensure_ascii=False) if failure else ""
+    try:
+        from servo.cognition.recipes import recipe_book
+        block, ids = recipe_book.prompt_block(" ".join([goal, failure_text, conversation[-600:]]), active_app)
+        if block:
+            blocks.append(block)
+            meta["recipes"] = ids
+    except Exception as e:
+        logger.debug("recipes unavailable: %s", e)
+    try:
+        from servo.cognition.graph_memory import graph_memory
+        g = graph_memory.format_context_for_prompt(goal=goal, active_app=active_app or None, failure=failure)
+        if g:
+            blocks.append(g)
+            meta["graph"] = True
+    except Exception as e:
+        logger.debug("graph context unavailable: %s", e)
+    return "\n\n".join(blocks), meta
+
+
 def build_plan_prompt(
     goal: str,
     screen: str = "",
@@ -173,6 +214,7 @@ def build_plan_prompt(
     user_name: str = "User",
     round_no: int = 1,
     memory_context: Optional[str] = None,
+    meta_out: Optional[Dict[str, Any]] = None,
 ) -> str:
     from servo.cognition.needle import known_folder
     from servo.cognition.windows_context import windows_context
@@ -187,29 +229,25 @@ def build_plan_prompt(
         except Exception:
             memory_context = ""
 
-    graph_block = ""
-    try:
-        from servo.cognition.graph_memory import graph_memory
-        active_app = None
-        if ctx.active_windows:
-            active_app = ctx.active_windows[0].get("process")
-        graph_block = graph_memory.format_context_for_prompt(
-            goal=goal,
-            active_app=active_app,
-        )
-    except Exception:
-        graph_block = ""
+    focused = next((w for w in ctx.active_windows if w.get("is_focused")), None) or \
+        (ctx.active_windows[0] if ctx.active_windows else {})
+    active_app = str(focused.get("process") or "")
+    knowledge, meta = knowledge_context(goal, failure, active_app, memory_context or "")
+    meta["active_app"] = active_app
+    if meta_out is not None:
+        meta_out.update(meta)
 
     lines = [
         f"User name: {user_name}",
         f"Today: {time.strftime('%A %d %B %Y, %H:%M')}",
         f"Desktop folder: {known_folder('desktop')}  |  Documents: {known_folder('documents')}",
+        f"Preferred browser: {settings.preferred_browser or '(Windows default)'}",
         f"Goal: {goal}",
         f"Round: {round_no}",
         ctx_block,
     ]
-    if graph_block:
-        lines.append(graph_block)
+    if knowledge:
+        lines.append(knowledge)
     if memory_context:
         lines.append(memory_context)
     if completed:
@@ -340,7 +378,9 @@ class System2:
         failure: Optional[Dict[str, Any]] = None,
         round_no: int = 1,
     ) -> System2Result:
-        prompt = build_plan_prompt(goal, screen, completed, failure, self.user_name, round_no)
+        knowledge_meta: Dict[str, Any] = {}
+        prompt = build_plan_prompt(goal, screen, completed, failure, self.user_name, round_no,
+                                   meta_out=knowledge_meta)
         if failure:
             title = "System 2 · re-plan after failure"
         elif completed:
@@ -364,7 +404,7 @@ class System2:
                 confidence=res.meta.get("confidence"),
                 provider=res.provider, model=res.model, latency_ms=res.latency_ms,
                 system=PLAN_SYSTEM, prompt=prompt, response=res.raw, reasoning=res.reasoning,
-                subtasks=res.subtasks, meta=res.meta,
+                subtasks=res.subtasks, meta=res.meta, knowledge=knowledge_meta,
             )
             if res.reasoning:
                 self.tracer.emit("model", "Model reasoning", res.reasoning, tier="system2", reasoning=True)

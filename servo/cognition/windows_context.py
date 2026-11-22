@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pydantic import BaseModel, Field
 
-from servo.perception import windows
+from servo.perception import app_identity, windows
 
 logger = logging.getLogger("servo.cognition.windows_context")
 
@@ -38,10 +38,14 @@ class AppInfo(BaseModel):
     aliases: List[str] = Field(default_factory=list)
     executable: Optional[str] = None
     app_id: Optional[str] = None
+    # Every AppUserModelID that belongs to this app (Facebook can be both a Store app
+    # and an Edge web app). Windows are matched to the app through these.
+    app_ids: List[str] = Field(default_factory=list)
+    kind: str = "desktop"  # "desktop" | "store" | "web_app"
     is_installed: bool = True
     is_running: bool = False
     hwnd: Optional[int] = None
-    source: str = "system"  # "system" | "start_menu" | "registry" | "uwp" | "web"
+    source: str = "system"  # "system" | "start_menu" | "registry" | "store" | "web_app" | "web"
     web_fallback: Optional[str] = None
 
 
@@ -74,7 +78,8 @@ class WindowsContextResult(BaseModel):
             lines.append("Running Windows:")
             for w in self.active_windows[:5]:
                 focus = " [Focused]" if w.get("is_focused") else ""
-                lines.append(f"  * \"{w.get('title')}\" (process: {w.get('process')}, HWND: {w.get('hwnd')}){focus}")
+                who = f"app: {w['app']}" if w.get("app") else f"process: {w.get('process')}"
+                lines.append(f"  * \"{w.get('title')}\" ({who}, HWND: {w.get('hwnd')}){focus}")
         else:
             lines.append("Running Windows: None detected.")
 
@@ -83,7 +88,11 @@ class WindowsContextResult(BaseModel):
             lines.append("Installed Apps matching request:")
             for a in self.matched_installed_apps[:4]:
                 state = " (Currently Open)" if a.is_running else ""
-                loc = f" at {a.executable}" if a.executable else (f" (AppID: {a.app_id})" if a.app_id else "")
+                if a.kind in ("store", "web_app"):
+                    kind = "installed web app" if a.kind == "web_app" else "Store app"
+                    loc = f" ({kind}; open it with: launch {a.name})"
+                else:
+                    loc = f" at {a.executable}" if a.executable else (f" (AppID: {a.app_id})" if a.app_id else "")
                 lines.append(f"  * \"{a.name}\"{loc}{state}")
 
         # 3. Uninstalled Apps with Web Fallbacks
@@ -226,6 +235,14 @@ WINDOWS_CAPABILITIES: List[WindowsCapability] = [
 ]
 
 
+_CONTEXT_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "from", "into", "onto", "about", "send", "open", "launch", "start",
+    "close", "click", "type", "write", "find", "search", "show", "play", "make", "new", "app", "apps",
+    "please", "can", "you", "my", "me", "it", "to", "on", "in", "of", "a", "an", "is", "do", "go",
+    "get", "set", "turn", "what", "how", "this", "that", "message", "hi", "hello", "microsoft", "windows",
+})
+
+
 # ==================================================== Core WindowsContextEngine
 
 class WindowsContextEngine:
@@ -297,6 +314,30 @@ class WindowsContextEngine:
                                 source="start_menu",
                             )
 
+            # 2b. Store apps and installed web apps (WhatsApp, Teams, Facebook, YouTube…).
+            # They have no shortcut or exe we can start, only an AppUserModelID; before this
+            # "open whatsapp" said "not installed" and opened the website instead.
+            for sa in self._start_apps():
+                kind = sa.kind
+                if kind == "desktop" or not app_identity.safe_app_id(sa.app_id):
+                    continue
+                low = sa.name.lower()
+                existing = catalog.get(low)
+                if existing is not None:
+                    if sa.app_id not in existing.app_ids:
+                        existing.app_ids.append(sa.app_id)
+                    if existing.source == "start_menu":
+                        existing.kind = kind
+                    continue
+                aliases = [low, re.sub(r"[\s\-_]+", "", low)]
+                short = re.sub(r"^(?:microsoft|windows)\s+", "", low)
+                if short != low and len(short) >= 3:
+                    aliases.append(short)
+                catalog[low] = AppInfo(
+                    name=sa.name, aliases=aliases, executable=app_identity.launch_target(sa.app_id),
+                    app_id=sa.app_id, app_ids=[sa.app_id], kind=kind, is_installed=True, source=kind,
+                )
+
             # 3. Registry App Paths (HKLM and HKCU)
             if sys.platform == "win32":
                 import winreg
@@ -328,6 +369,13 @@ class WindowsContextEngine:
 
             self._app_catalog = catalog
             self._last_scan = now
+
+    def _start_apps(self):
+        try:
+            return app_identity.start_apps()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Start apps unavailable: %s", e)
+            return []
 
     def _resolve_known_path(self, exe: str) -> Optional[str]:
         if sys.platform != "win32":
@@ -365,10 +413,14 @@ class WindowsContextEngine:
             if any(a.lower() == q or re.sub(r"[\s\-_]+", "", a.lower()) == clean_q for a in app.aliases):
                 return app.is_installed, app
 
-        # 3. Substring match
-        for app in self._app_catalog.values():
-            if q in app.name.lower() or app.name.lower() in q:
-                return app.is_installed, app
+        # 3. The query names part of an app ("studio" -> "Visual Studio Code"), on word
+        # boundaries. Never the reverse ("app name inside the query"): that matched
+        # "gmail in chrome" to Chrome and "email in dia" to Dia, and reported success.
+        if len(q) >= 3:
+            word = re.compile(r"\b" + re.escape(q) + r"\b")
+            for app in self._app_catalog.values():
+                if word.search(app.name.lower()):
+                    return app.is_installed, app
 
         # 4. Check if it's in PATH or executable directly
         which_p = shutil.which(f"{q}.exe") or shutil.which(q)
@@ -407,10 +459,15 @@ class WindowsContextEngine:
                 if not title or "servo copilot" in title.lower():
                     continue
                 hwnd = int(w.get("hwnd") or 0)
+                proc = str(w.get("process") or w.get("process_name") or "")
+                aid = app_identity.window_app_id(hwnd, proc)
+                label = app_identity.window_label(hwnd, proc, aid)
                 active_windows.append({
                     "hwnd": hwnd,
                     "title": title,
-                    "process": w.get("process") or w.get("process_name") or "",
+                    "process": proc,
+                    "app_id": aid,
+                    "app": label if label != proc.lower() else "",
                     "is_focused": hwnd == fg,
                 })
         except Exception as e:
@@ -420,14 +477,25 @@ class WindowsContextEngine:
         matched_installed: List[AppInfo] = []
         uninstalled: List[AppInfo] = []
 
-        # Check explicitly referenced app words
+        # Apps the request names. Filler words don't count: "send hi to mom on whatsapp"
+        # used to match "Send to OneNote", "On-Screen Keyboard" and "Click to Do" and push
+        # WhatsApp off the list. Best matches (share of the app's name mentioned) first.
+        meaningful = {w for w in words if len(w) >= 3 and w not in _CONTEXT_STOPWORDS}
+        scored: List[Tuple[float, AppInfo]] = []
         for app in self._app_catalog.values():
-            app_words = set(re.findall(r"\w+", app.name.lower()))
-            overlap = words.intersection(app_words)
-            if overlap or app.name.lower() in q:
+            app_words = {w for w in re.findall(r"\w+", app.name.lower()) if w not in _CONTEXT_STOPWORDS}
+            overlap = meaningful.intersection(app_words)
+            whole = len(app.name) >= 3 and re.search(r"\b" + re.escape(app.name.lower()) + r"\b", q)
+            if overlap or whole:
+                scored.append((2.0 if whole else len(overlap) / max(len(app_words), 1), app))
+        scored.sort(key=lambda t: -t[0])
+        for _score, app in scored:
                 if app.is_installed:
                     # Check if running
-                    running_w = [w for w in active_windows if app.name.lower() in w["title"].lower() or (app.executable and os.path.basename(app.executable).lower() in w["process"].lower())]
+                    running_w = [w for w in active_windows
+                                 if (w.get("app_id") and w["app_id"] in app.app_ids)
+                                 or (not w.get("app") and (app.name.lower() in w["title"].lower()
+                                     or (app.executable and os.path.basename(app.executable).lower() in w["process"].lower())))]
                     app.is_running = bool(running_w)
                     if running_w:
                         app.hwnd = running_w[0]["hwnd"]

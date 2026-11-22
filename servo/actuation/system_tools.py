@@ -66,7 +66,8 @@ class ToolResult:
 # ------------------------------------------------------------------ paths
 
 def servo_home() -> Path:
-    return (Path.home() / ".servo").resolve()
+    from servo.paths import servo_home as _home
+    return _home().resolve()
 
 
 def resolve_path(raw: str) -> Path:

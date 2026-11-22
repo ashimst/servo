@@ -15,6 +15,7 @@ from servo.config import settings
 def home(tmp_path, monkeypatch):
     """Point the home folder (and so ~/.servo) at a temp dir."""
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("SERVO_HOME", str(tmp_path / ".servo"))
     monkeypatch.setattr(settings, "mode", "assistant")
     monkeypatch.setattr(settings, "system_tools", True)
     (tmp_path / ".servo").mkdir()

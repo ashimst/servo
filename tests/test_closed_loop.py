@@ -121,12 +121,14 @@ def test_unmatched_hint_never_clicks_an_arbitrary_element(loop, monkeypatch, sce
     assert loop.clicks == []
 
 
-def test_failed_verification_does_not_actuate_twice(loop, monkeypatch, scene):
+def test_unverifiable_click_is_unconfirmed_and_not_repeated(loop, monkeypatch, scene):
     _settle_unchanged(loop, monkeypatch, scene)
     result = loop.execute_subgoal(1, "Open the help page", "Help")
-    assert result.success is False
+    # No visible change: reported as "ran, not confirmed", never clicked a second time.
+    assert result.success is True
+    assert result.step_log.verification == "unconfirmed"
+    assert result.step_log.note
     assert result.actuated is True
-    assert result.escalation_required is True
     assert loop.clicks == [2]  # exactly one click
 
 

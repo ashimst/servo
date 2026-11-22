@@ -2,6 +2,7 @@
 id: edge_app_mode_mic
 title: Edge App Mode Microphone Permission Suppression
 app: msedge
+scope: servo-internal
 surface: Electron
 symptom: Microphone recording aborts immediately upon launch in standalone Edge app mode without prompting the user.
 root_cause: In standalone app mode (--app=http://...), Edge hides the omnibar and suppresses standard permission popups, causing getUserMedia to reject with NotAllowedError immediately.

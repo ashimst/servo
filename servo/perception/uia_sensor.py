@@ -8,11 +8,53 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import List, Optional
+import time
+from typing import List, Optional, Set
 from servo.perception.viewport import ViewportTransform
 from servo.perception.scene_index import SceneIndex, SceneElement
 
 logger = logging.getLogger(__name__)
+
+# A browser-hosted window with fewer interactive controls than this is probably showing
+# only its frame (back/refresh/close) because page accessibility is still off.
+_CHROMIUM_EMPTY = 15
+_nudged: Set[int] = set()
+
+
+def _is_chromium_host(hwnd: int) -> bool:
+    try:
+        from servo.perception import windows
+        from servo.perception.app_identity import BROWSER_PROCESSES
+        proc = windows.get_process_name(hwnd)
+        return proc in BROWSER_PROCESSES and proc != "firefox.exe"
+    except Exception:
+        return False
+
+
+def _request_accessibility(hwnd: int) -> bool:
+    """Ask for the window's MSAA client object, as screen readers do.
+
+    Chromium treats this request as "an assistive tool is running" and builds the
+    page's accessibility tree, which UI Automation then exposes.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        import comtypes
+        iid = comtypes.GUID("{618736E0-3C3D-11CF-810C-00AA00389B71}")  # IID_IAccessible
+        ptr = ctypes.c_void_p()
+        ctypes.oledll.oleacc.AccessibleObjectFromWindow(
+            hwnd, ctypes.c_long(-4), ctypes.byref(iid), ctypes.byref(ptr))  # OBJID_CLIENT
+        if ptr.value:
+            # Release the reference we were handed (IUnknown::Release is vtable slot 2).
+            vtbl = ctypes.cast(ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))[0],
+                               ctypes.POINTER(ctypes.c_void_p))
+            ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])(ptr)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Accessibility request failed for HWND %s: %s", hwnd, e)
+        return False
 
 # Whitelisted interactive control roles for UIA filtering
 INTERACTIVE_CONTROL_TYPES = {
@@ -39,7 +81,30 @@ class UIASensor:
         self.viewport = ViewportTransform(hwnd)
 
     def sense(self) -> SceneIndex:
-        """Query accessibility tree and return normalized SceneIndex."""
+        """Query accessibility tree and return normalized SceneIndex.
+
+        Chromium (Edge, Chrome, installed web apps such as Facebook) keeps a page's
+        accessibility tree switched off until it believes an assistive tool is asking.
+        Until then only the window frame is visible (7 controls for a full Facebook
+        feed). If a browser-hosted window looks empty, ask once the way screen readers
+        do, then sense again.
+        """
+        scene = self._sense_once()
+        page_hidden = len(scene.elements) < _CHROMIUM_EMPTY or not any(
+            e.role == "Document" for e in scene.elements.values())
+        if page_hidden and self.hwnd not in _nudged and _is_chromium_host(self.hwnd):
+            _nudged.add(self.hwnd)
+            if _request_accessibility(self.hwnd):
+                for _ in range(4):
+                    time.sleep(0.35)
+                    again = self._sense_once()
+                    if len(again.elements) > len(scene.elements):
+                        logger.info("Chromium page accessibility enabled for HWND %s (%d -> %d controls)",
+                                    self.hwnd, len(scene.elements), len(again.elements))
+                        return again
+        return scene
+
+    def _sense_once(self) -> SceneIndex:
         self.viewport.refresh()
         elements_map = {}
         window_title = "Unknown Window"

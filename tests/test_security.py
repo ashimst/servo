@@ -116,3 +116,12 @@ def test_shell_patterns_do_not_fire_on_prose(text):
 def test_typing_into_ordinary_app_unchanged():
     res = GATE.evaluate_pre_risk("Type hello", "type_text(element_id=0, text='hello')", "Text editor", "notepad.exe")
     assert res.risk_level == "low"
+
+
+def test_typed_prose_is_not_judged_by_keywords():
+    poem = "Rain falls soft upon the glass,\nEach drop a note, send me the order."
+    res = GATE.evaluate_pre_risk(f"Type '{poem[:59]}…'", f"type_text(element_id=0, text={poem!r})", "Text editor", "notepad.exe")
+    assert res.risk_level == "low", res.reason
+    # ...but typing into a shell is still judged by what it says
+    res = GATE.evaluate_pre_risk("Type", "type_text(element_id=0, text='del /s /q C:\\x')", "Terminal", "cmd.exe")
+    assert res.risk_level == "high"

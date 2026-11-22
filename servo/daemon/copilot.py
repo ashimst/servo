@@ -26,7 +26,7 @@ from servo.config import settings
 from servo.control.handoff import PlanExecutionSummary, StepExecutionReport, SystemHandoffCoordinator
 from servo.control.loop import ServoControlLoop
 from servo.daemon.worker import worker
-from servo.perception import windows
+from servo.perception import app_identity, windows
 from servo.perception.scene_index import SceneIndex
 from servo.perception.uia_sensor import UIASensor
 from servo.planner.tool_calling import (
@@ -139,16 +139,50 @@ _PROCESS_ALIASES: Dict[str, Tuple[str, ...]] = {
 }
 
 
-def _matches_app(w: Dict[str, Any], app_key: str, exe_filename: str) -> bool:
-    """Match a window to an app by its PROCESS, not its title.
+def _app_record(app_name: str):
+    """Catalog entry for the app (with its AppUserModelIDs), or None."""
+    try:
+        from servo.cognition.windows_context import windows_context
+        installed, info = windows_context.is_installed(app_name)
+        return info if installed else None
+    except Exception:
+        return None
+
+
+def _app_ids(info: Any) -> Tuple[str, ...]:
+    if info is None:
+        return ()
+    ids = list(getattr(info, "app_ids", None) or [])
+    if getattr(info, "app_id", None) and info.app_id not in ids:
+        ids.append(info.app_id)
+    return tuple(ids)
+
+
+def _matches_app(w: Dict[str, Any], app_key: str, exe_filename: str, app_ids: Tuple[str, ...] = ()) -> bool:
+    """Match a window to an app by its APP IDENTITY or PROCESS, not its title.
 
     Title matching made "open notepad" focus an Edge tab whose title contained the
     word "notepad". Titles are used only when the process name is unknown.
+
+    Installed web apps (Facebook, YouTube…) run inside msedge.exe/chrome.exe. Such a
+    window matches only its own app, through its AppUserModelID; it is never "Edge"
+    (before, "open edge" could pick the Facebook app and type URLs into it).
     """
     proc = str(w.get("process") or w.get("process_name") or "").lower()
     title = str(w.get("title") or "").lower()
     if "servo copilot" in title:
         return False
+    hwnd = int(w.get("hwnd") or 0)
+    aid = None
+    if hwnd and (app_ids or proc in app_identity.BROWSER_PROCESSES):
+        aid = w.get("app_id")
+        if aid is None:
+            aid = app_identity.window_app_id(hwnd, proc)
+            w["app_id"] = aid
+        if app_ids and aid and aid in app_ids:
+            return True
+        if app_identity.is_web_app_window(hwnd, proc, aid):
+            return False
     if proc:
         if proc in _PROCESS_ALIASES.get(app_key, ()):
             return True
@@ -162,6 +196,22 @@ def _matches_app(w: Dict[str, Any], app_key: str, exe_filename: str) -> bool:
 _UNSAFE_APP_NAME = re.compile(r'["&|^<>%;`$\r\n]')
 
 
+def find_app_window(app_name: str) -> Optional[int]:
+    """HWND of an already-open window for the app, or None. Never launches anything."""
+    if _UNSAFE_APP_NAME.search(app_name):
+        return None
+    app_key = app_name.strip().lower()
+    try:
+        exe_filename = os.path.basename(resolve_app_executable(app_name)).lower()
+    except Exception:
+        exe_filename = f"{app_key}.exe"
+    ids = _app_ids(_app_record(app_name))
+    for w in windows.list_windows():
+        if _matches_app(w, app_key, exe_filename, ids):
+            return int(w["hwnd"])
+    return None
+
+
 def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
     """Find an existing window for the app or launch it and return (hwnd, title)."""
     if _UNSAFE_APP_NAME.search(app_name):
@@ -169,18 +219,22 @@ def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
     app_key = app_name.strip().lower()
     full_exe_path = resolve_app_executable(app_name)
     exe_filename = os.path.basename(full_exe_path).lower()
+    record = _app_record(app_name)
+    ids = _app_ids(record)
 
     def _focus(w: Dict[str, Any]) -> Tuple[int, str]:
         hwnd = int(w["hwnd"])
         if sys.platform == "win32":
-            import ctypes
-            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE if minimized
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            # Plain SetForegroundWindow is often refused (foreground lock): the app was
+            # found but stayed behind, and the next step typed into another window.
+            from servo.actuation.sandboxing import activate_window
+            if not activate_window(hwnd):
+                logger.info("Found %s (HWND %s) but Windows kept it in the background", app_name, hwnd)
         return hwnd, str(w.get("title") or app_name)
 
     # 1. Already open?
     for w in windows.list_windows():
-        if _matches_app(w, app_key, exe_filename):
+        if _matches_app(w, app_key, exe_filename, ids):
             return _focus(w)
 
     # 1.5. If the app is not installed, fail fast without waiting 8 seconds
@@ -194,9 +248,18 @@ def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
             except Exception:
                 pass
 
-    # 2. Launch it
+    # 2. Launch it. Store apps and installed web apps start through their AppUserModelID,
+    #    like the Start menu does: they have no exe of their own (web apps) or one under
+    #    WindowsApps that Windows refuses to start directly.
+    by_id = bool(ids) and (
+        getattr(record, "kind", "desktop") in ("store", "web_app")
+        or "\\windowsapps\\" in full_exe_path.lower()
+        or not (os.path.isabs(full_exe_path) and os.path.exists(full_exe_path))
+    )
     try:
-        if sys.platform == "win32":
+        if by_id:
+            app_identity.launch(ids[0])
+        elif sys.platform == "win32":
             if os.path.isabs(full_exe_path) and os.path.exists(full_exe_path):
                 subprocess.Popen([full_exe_path])
             else:
@@ -212,7 +275,7 @@ def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
     for _ in range(40):
         time.sleep(0.2)
         for w in windows.list_windows():
-            if _matches_app(w, app_key, exe_filename):
+            if _matches_app(w, app_key, exe_filename, ids):
                 return _focus(w)
 
     return None, f"Window for '{app_name}' did not appear in time."

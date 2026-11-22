@@ -29,7 +29,9 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("servo.cognition.memory")
 
-DEFAULT_MEMORY_PATH = Path.home() / ".servo" / "chat_memory.json"
+from servo.paths import servo_home
+
+DEFAULT_MEMORY_PATH = servo_home() / "chat_memory.json"
 
 
 # ===================================================================== Models
