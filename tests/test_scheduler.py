@@ -5,7 +5,7 @@ from datetime import datetime
 
 import pytest
 
-from servo.daemon.scheduler import MISSED_GRACE_S, Scheduler, parse_schedule
+from servo.daemon.scheduler import MISSED_GRACE_S, Scheduler, WhenError, parse_schedule, parse_when
 
 NOW = datetime(2026, 11, 21, 10, 0, 0)
 
@@ -168,3 +168,24 @@ def test_schedule_api(session):
     assert len(jobs) == 1
     assert c.post("/api/schedule/cancel", json={"id": jobs[0]["id"]}, headers=h).json()["cancelled"] == 1
     assert c.get("/api/schedule", headers=h).json()["jobs"] == []
+
+
+@pytest.mark.parametrize("phrase,expected_kind,expected_delta_s,expected_interval,expected_tod", [
+    ("in 10 minutes", "once", 600, 0, ""),
+    ("at noon", "once", 7200, 0, ""),
+    ("at midnight", "once", 14 * 3600, 0, ""),
+    ("every 30 minutes", "interval", 1800, 1800, ""),
+    ("every day at 9:00", "daily", 23 * 3600, 0, "09:00"),
+])
+def test_parse_when_valid(phrase, expected_kind, expected_delta_s, expected_interval, expected_tod):
+    kind, next_run, interval_s, tod = parse_when(phrase, now=NOW)
+    assert kind == expected_kind
+    assert next_run - NOW.timestamp() == pytest.approx(expected_delta_s)
+    assert interval_s == expected_interval
+    assert tod == expected_tod
+
+
+def test_parse_when_invalid():
+    with pytest.raises(WhenError):
+        parse_when("in a few minutes", now=NOW)
+

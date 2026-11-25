@@ -2,40 +2,23 @@
 
 The floating UI lives in servo.daemon.copilot_app; routing lives in
 servo.cognition.router. This module keeps the conversational shortcuts, the legacy
-process_message API, and Windows app resolution/launching.
+and Windows app resolution/launching.
 """
 
 from __future__ import annotations
 
 import getpass
-import json
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
 
-from servo.actuation.alias_mapping import AliasMapper, CanonicalAction, CanonicalActionType
-from servo.config import settings
-from servo.control.handoff import PlanExecutionSummary, StepExecutionReport, SystemHandoffCoordinator
-from servo.control.loop import ServoControlLoop
-from servo.daemon.worker import worker
 from servo.perception import app_identity, windows
-from servo.perception.scene_index import SceneIndex
-from servo.perception.uia_sensor import UIASensor
-from servo.planner.tool_calling import (
-    MacroPlan,
-    PlanStep,
-    SYSTEM_PROMPT_TEMPLATE,
-    build_tool_planning_prompt,
-    parse_llm_tool_plan,
-)
 
 logger = logging.getLogger("servo.copilot")
 
@@ -198,6 +181,21 @@ def _matches_app(w: Dict[str, Any], app_key: str, exe_filename: str, app_ids: Tu
 _UNSAFE_APP_NAME = re.compile(r'["&|^<>%;`$\r\n]')
 
 
+def _app_windows() -> List[Dict[str, Any]]:
+    """Top-level windows, with Store apps' inner CoreWindow after their frame.
+
+    A Store app such as Settings briefly has two top-level windows: the frame
+    (ApplicationFrameWindow) and its content (Windows.UI.Core.CoreWindow). Picking the inner
+    one gave a scene with a single element and no controls.
+    """
+    ws = windows.list_windows()
+    try:
+        import win32gui
+        return sorted(ws, key=lambda w: win32gui.GetClassName(int(w["hwnd"])) == "Windows.UI.Core.CoreWindow")
+    except Exception:
+        return ws
+
+
 def find_app_window(app_name: str) -> Optional[int]:
     """HWND of an already-open window for the app, or None. Never launches anything."""
     if _UNSAFE_APP_NAME.search(app_name):
@@ -208,16 +206,75 @@ def find_app_window(app_name: str) -> Optional[int]:
     except Exception:
         exe_filename = f"{app_key}.exe"
     ids = _app_ids(_app_record(app_name))
-    for w in windows.list_windows():
+    for w in _app_windows():
         if _matches_app(w, app_key, exe_filename, ids):
             return int(w["hwnd"])
     return None
+
+
+_SETTINGS_URI = re.compile(r"^ms-settings:[a-z0-9\-]*$", re.I)
+
+
+def _settings_page(app_name: str) -> Optional[str]:
+    """'ms-settings:colors' (a Windows Settings page link), else None."""
+    name = app_name.strip()
+    return name if _SETTINGS_URI.match(name) else None
+
+
+def _open_settings_page(uri: str) -> Tuple[Optional[int], str]:
+    """Open a Settings page directly. Harmless and read-only to open, so no command (and no
+    approval prompt) is needed; before, this went through "run command Start-Process …"."""
+    from servo.actuation.sandboxing import activate_window
+    was_open = find_app_window("settings")
+    before = _page_fingerprint(was_open) if was_open else None
+    try:
+        os.startfile(uri)  # type: ignore[attr-defined]
+    except Exception as e:
+        return None, f"Couldn't open {uri}: {e}"
+    hwnd = None
+    for _ in range(40):
+        time.sleep(0.2)
+        hwnd = find_app_window("settings")
+        if hwnd:
+            break
+    if not hwnd:
+        return None, f"Settings did not open for {uri}"
+    activate_window(hwnd)
+    # Settings navigates asynchronously: wait for the page to change and settle, or the
+    # planner is shown the PREVIOUS page (it saw Accessibility after opening the taskbar page).
+    last, stable, changed = None, 0, before is None
+    for _ in range(12):
+        time.sleep(0.35)
+        fp = _page_fingerprint(hwnd)
+        changed = changed or (fp != before)
+        stable = stable + 1 if fp == last else 0
+        last = fp
+        if changed and stable >= 1:
+            break
+    title = windows.get_window_title(hwnd) or "Settings"
+    if not changed:
+        return hwnd, f"{title} (the page did not change: '{uri}' may not be a real Settings page; " \
+                     f"use the 'Find a setting' search box)"
+    return hwnd, title
+
+
+def _page_fingerprint(hwnd: int) -> Tuple[str, ...]:
+    """What page a window shows: its visible labels (cheap enough to poll a few times)."""
+    try:
+        from servo.perception.uia_sensor import UIASensor
+        scene = UIASensor(hwnd).sense()
+        return tuple(sorted(f"{e.role}:{e.label}" for e in scene.elements.values()))[:200]
+    except Exception:
+        return ()
 
 
 def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
     """Find an existing window for the app or launch it and return (hwnd, title)."""
     if _UNSAFE_APP_NAME.search(app_name):
         return None, f"Refusing to launch '{app_name}': app names cannot contain shell characters."
+    page = _settings_page(app_name)
+    if page is not None:
+        return _open_settings_page(page)
     app_key = app_name.strip().lower()
     full_exe_path = resolve_app_executable(app_name)
     exe_filename = os.path.basename(full_exe_path).lower()
@@ -235,7 +292,7 @@ def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
         return hwnd, str(w.get("title") or app_name)
 
     # 1. Already open?
-    for w in windows.list_windows():
+    for w in _app_windows():
         if _matches_app(w, app_key, exe_filename, ids):
             return _focus(w)
 
@@ -277,7 +334,7 @@ def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
     #    process than the stub we launched, so match by name, for up to 8 s).
     for _ in range(40):
         time.sleep(0.2)
-        for w in windows.list_windows():
+        for w in _app_windows():
             if _matches_app(w, app_key, exe_filename, ids):
                 return _focus(w)
 
@@ -285,11 +342,9 @@ def launch_or_focus_app(app_name: str) -> Tuple[Optional[int], str]:
 
 
 def resolve_default_user_name() -> str:
-    """Detect current user name from environment or git defaults."""
+    """The signed-in account's name; "User" when Windows doesn't give a personal one."""
     env_user = os.environ.get("USERNAME") or os.environ.get("USER") or getpass.getuser()
-    if env_user and env_user.lower() not in ("user", "default", "administrator", "acer"):
-        return env_user
-    return "Ashim"
+    return env_user if env_user and env_user.lower() not in ("user", "default", "administrator") else "User"
 
 
 class CopilotBrain:
@@ -306,332 +361,3 @@ class CopilotBrain:
         self.active_hwnd: Optional[int] = None
         self.active_title: str = ""
 
-    def query_llm_for_plan(self, prompt: str, scene: Optional[SceneIndex] = None) -> Optional[MacroPlan]:
-        """Attempt to generate a structured tool plan using configured System 2 LLM planner."""
-        try:
-            from servo.planner import get_planner
-
-            planner = get_planner(self.planner_provider)
-            if hasattr(planner, "decompose_macro"):
-                plan = planner.decompose_macro(prompt, initial_scene=scene)
-                if plan and plan.steps:
-                    if self.user_name and self.user_name != "User":
-                        for step in plan.steps:
-                            if step.arguments.get("text") in ("User", "my name", "my username"):
-                                step.arguments["text"] = self.user_name
-                                if step.canonical_action:
-                                    step.canonical_action.text = self.user_name
-                    return plan
-            elif hasattr(planner, "decompose"):
-                subgoals = list(planner.decompose(prompt, scene or SceneIndex(hwnd=0, window_title="", source="uia")))
-                if subgoals:
-                    steps = []
-                    for sg in subgoals:
-                        tool_name = (
-                            "type_text" if sg.action_type == "type"
-                            else ("click_element" if sg.action_type == "click"
-                            else (sg.tool_name if sg.tool_name and sg.tool_name != "click_element" else sg.action_type))
-                        )
-                        arguments = dict(sg.arguments) if sg.arguments else {}
-                        if sg.action_type == "type":
-                            if sg.target_element_hint and "target" not in arguments:
-                                arguments["target"] = sg.target_element_hint
-                            if sg.text_to_type and "text" not in arguments:
-                                arguments["text"] = sg.text_to_type
-                        elif sg.action_type == "click":
-                            if sg.target_element_hint and "target" not in arguments:
-                                arguments["target"] = sg.target_element_hint
-                        else:
-                            if sg.target_element_hint and "target" not in arguments:
-                                arguments["target"] = sg.target_element_hint
-                            if sg.text_to_type and "text" not in arguments:
-                                arguments["text"] = sg.text_to_type
-
-                        canon = sg.canonical_action
-                        if canon is None:
-                            try:
-                                canon = AliasMapper.canonicalize_action(raw_action=tool_name, **arguments)
-                            except Exception:
-                                canon = None
-
-                        steps.append(
-                            PlanStep(
-                                step_index=sg.step_index,
-                                tool_name=tool_name,
-                                arguments=arguments,
-                                rationale=sg.instruction,
-                                canonical_action=canon,
-                            )
-                        )
-                    plan = MacroPlan(goal=prompt, steps=steps)
-                    if self.user_name:
-                        for step in plan.steps:
-                            if step.arguments.get("text") in ("User", "my name", "my username"):
-                                step.arguments["text"] = self.user_name
-                                if step.canonical_action:
-                                    step.canonical_action.text = self.user_name
-                    return plan
-        except Exception as e:
-            logger.debug(
-                "System 2 planner query failed (%s: %s); falling back to deterministic intent parser.",
-                e.__class__.__name__,
-                e,
-            )
-        return None
-
-    def query_llm_for_chat(self, prompt: str) -> Optional[str]:
-        """Attempt to converse via configured LLM endpoints for general questions."""
-        base_url = settings.openai_base_url.rstrip("/")
-        api_key = settings.openai_api_key
-        model = settings.openai_model or "llama3"
-
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        system_prompt = (
-            f"You are Servo, a helpful and friendly on-screen desktop copilot companion. "
-            f"The user's name is {self.user_name}. You live in a compact floating desktop widget. "
-            f"Answer concisely, warmly, and helpfully in 1-3 sentences."
-        )
-
-        messages = [{"role": "system", "content": system_prompt}]
-        for m in self.history[-4:]:
-            messages.append({"role": m["role"], "content": m["text"]})
-        messages.append({"role": "user", "content": prompt})
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 200,
-        }
-
-        try:
-            with httpx.Client(timeout=3.0) as client:
-                res = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
-                if res.status_code == 200:
-                    data = res.json()
-                    return data["choices"][0]["message"]["content"].strip()
-        except Exception:
-            pass
-        return None
-
-    def conversational_reply(self, prompt: str) -> Optional[str]:
-        """Answer identity, small talk and desktop introspection locally (no model, no actuation)."""
-        p = prompt.strip()
-        p_lower = p.lower()
-
-        m_name = re.search(r"^(?:my name is|call me|i am|i'm)\s+([a-zA-Z0-9_\s]+)$", p, re.I)
-        if m_name and "how" not in p_lower and "what" not in p_lower:
-            name = m_name.group(1).strip()
-            self.user_name = name
-            return f"Nice to meet you, {name}! I'll remember that. What would you like me to do on your computer?"
-
-        if any(q in p_lower for q in ["what is my name", "what's my name", "who am i", "do you know my name"]):
-            return f"Your name is {self.user_name}! Let me know what you'd like me to help you with."
-
-        if any(w in p_lower for w in ["what windows are open", "what's on my screen", "what is on my screen", "list windows", "what is open", "show windows"]):
-            wins = windows.list_windows()
-            if not wins:
-                return "I couldn't find any visible application windows right now."
-            lines = ["Here are the open windows on your screen:"]
-            for w in wins[:6]:
-                marker = " (active target)" if w.get("hwnd") == self.active_hwnd else ""
-                lines.append(f"• {w.get('title', 'Untitled')}{marker}")
-            if len(wins) > 6:
-                lines.append(f"…and {len(wins) - 6} more.")
-            return "\n".join(lines)
-
-        if re.match(r"^(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|howdy)\b", p_lower):
-            return f"Hello {self.user_name}! I'm Servo. Tell me what to do on your computer, or just ask me something."
-
-        if re.match(r"^(?:how are you|how's it going|how are you doing)\b", p_lower):
-            return "All systems are running. What should we do?"
-
-        if re.match(r"^(?:who are you|what are you)\b", p_lower):
-            return ("I'm Servo, a local-first desktop copilot. Simple commands run on small on-device models; "
-                    "anything that needs reasoning goes to a larger model, and you can watch every decision in the trace.")
-
-        if re.match(r"^(?:what can you do|help|capabilities)\b", p_lower):
-            return (
-                "Try:\n"
-                "• open notepad and write hello world\n"
-                "• open calculator and click 7\n"
-                "• search the web for weather in Kathmandu\n"
-                "• go to github.com\n"
-                "• what windows are open?"
-            )
-        return None
-
-    def offline_chat_reply(self, prompt: str) -> str:
-        p_lower = prompt.lower()
-        if "joke" in p_lower:
-            return "Why do programmers prefer dark mode? Because light attracts bugs."
-        if "thank" in p_lower:
-            return "You're welcome."
-        return ("I can act on your screen — try “open notepad and write …”, “click …” or “search the web for …”. "
-                "For open-ended chat, configure a System 2 model (SERVO_PLANNER_PROVIDER).")
-
-    def process_message(
-        self,
-        prompt: str,
-        scene: Optional[SceneIndex] = None,
-    ) -> Tuple[str, Optional[MacroPlan]]:
-        """Legacy entry point: a reply, or a MacroPlan. Cheap tiers first.
-
-        The copilot UI uses servo.cognition.router.CascadeRouter instead; this remains for
-        API callers and tests. Order: local conversation → command grammar → System 2 LLM.
-        """
-        p = prompt.strip()
-        quick = self.conversational_reply(p)
-        if quick:
-            return quick, None
-
-        plan = self._parse_deterministic_plan(p)
-        if plan and plan.steps:
-            return f"Decomposed goal into {len(plan.steps)} execution steps:", plan
-
-        llm_plan = self.query_llm_for_plan(p, scene=scene)
-        if llm_plan and llm_plan.steps:
-            return f"Decomposed goal into {len(llm_plan.steps)} execution steps:", llm_plan
-
-        llm_chat = self.query_llm_for_chat(p)
-        if llm_chat:
-            return llm_chat, None
-        return self.offline_chat_reply(p), None
-
-    def _parse_deterministic_plan(self, p: str) -> Optional[MacroPlan]:
-        """Deterministic System 2 plan decomposition for offline and edge execution."""
-        from servo.planner.tool_calling import parse_deterministic_intent
-
-        parsed = parse_deterministic_intent(p, user_name=self.user_name)
-        if parsed and parsed.steps:
-            return parsed
-
-        p_strip = p.strip()
-        steps: List[PlanStep] = []
-
-        # 1. "open <app> and (write|type) <text>"
-        m_open_type = re.search(r"^(?:open|launch|start)\s+([a-zA-Z0-9_\s]+?)\s+and\s+(?:write|type|enter)\s+(.+)$", p_strip, re.I)
-        if m_open_type:
-            app = m_open_type.group(1).strip()
-            raw_text = m_open_type.group(2).strip().strip('"\'')
-            text = self.user_name if raw_text.lower() in ("my name", "my username") else raw_text
-            steps.append(PlanStep(
-                step_index=1,
-                tool_name="launch_app",
-                arguments={"app_name": app},
-                rationale=f"Launch application '{app}'",
-                canonical_action=AliasMapper.canonicalize_action("launch_app", app_name=app),
-            ))
-            steps.append(PlanStep(
-                step_index=2,
-                tool_name="type_text",
-                arguments={"text": text, "target": "editor"},
-                rationale=f"Type '{text}' into editor",
-                canonical_action=AliasMapper.canonicalize_action("type_text", text=text, target="editor"),
-            ))
-            return MacroPlan(goal=p, steps=steps)
-
-        # 2. "open <app> and click <target>"
-        m_open_click = re.search(r"^(?:open|launch|start)\s+([a-zA-Z0-9_\s]+?)\s+and\s+(?:click|press)\s+(.+)$", p_strip, re.I)
-        if m_open_click:
-            app = m_open_click.group(1).strip()
-            target = m_open_click.group(2).strip().strip('"\'')
-            steps.append(PlanStep(
-                step_index=1,
-                tool_name="launch_app",
-                arguments={"app_name": app},
-                rationale=f"Launch application '{app}'",
-                canonical_action=AliasMapper.canonicalize_action("launch_app", app_name=app),
-            ))
-            steps.append(PlanStep(
-                step_index=2,
-                tool_name="click_element",
-                arguments={"target": target},
-                rationale=f"Click '{target}'",
-                canonical_action=AliasMapper.canonicalize_action("click_element", target=target),
-            ))
-            return MacroPlan(goal=p, steps=steps)
-
-        # 3. "close <app>" or "close window"
-        m_close = re.search(r"^(?:close|quit|exit)\s*([a-zA-Z0-9_\s]*)$", p_strip, re.I)
-        if m_close:
-            app = m_close.group(1).strip() or None
-            steps.append(PlanStep(
-                step_index=1,
-                tool_name="close_window",
-                arguments={"app_name": app} if app else {},
-                rationale=f"Close application '{app or 'active window'}'",
-                canonical_action=AliasMapper.canonicalize_action("close_window", app_name=app),
-            ))
-            return MacroPlan(goal=p, steps=steps)
-
-        # 4. "open <app>"
-        m_open_only = re.search(r"^(?:open|launch|start|switch to)\s+([a-zA-Z0-9_\s]+)$", p_strip, re.I)
-        if m_open_only:
-            app = m_open_only.group(1).strip()
-            if app.lower() in APP_EXECUTABLE_MAP or not any(w in app.lower() for w in ["what", "how", "why"]):
-                steps.append(PlanStep(
-                    step_index=1,
-                    tool_name="launch_app",
-                    arguments={"app_name": app},
-                    rationale=f"Launch application '{app}'",
-                    canonical_action=AliasMapper.canonicalize_action("launch_app", app_name=app),
-                ))
-                return MacroPlan(goal=p, steps=steps)
-
-        # 5. "write <text> into <target>"
-        m_type_into = re.search(r"^(?:write|type|enter)\s+(.+?)\s+(?:in|into|on)\s+(.+)$", p_strip, re.I)
-        if m_type_into:
-            raw_text = m_type_into.group(1).strip().strip('"\'')
-            target = m_type_into.group(2).strip().strip('"\'')
-            text = self.user_name if raw_text.lower() in ("my name", "my username") else raw_text
-            steps.append(PlanStep(
-                step_index=1,
-                tool_name="type_text",
-                arguments={"text": text, "target": target},
-                rationale=f"Type '{text}' into '{target}'",
-                canonical_action=AliasMapper.canonicalize_action("type_text", text=text, target=target),
-            ))
-            return MacroPlan(goal=p, steps=steps)
-
-        # 6. "write <text>"
-        m_type_only = re.search(r"^(?:write|type|enter)\s+(.+)$", p_strip, re.I)
-        if m_type_only:
-            raw_text = m_type_only.group(1).strip().strip('"\'')
-            text = self.user_name if raw_text.lower() in ("my name", "my username") else raw_text
-            steps.append(PlanStep(
-                step_index=1,
-                tool_name="type_text",
-                arguments={"text": text, "target": "editor"},
-                rationale=f"Type '{text}'",
-                canonical_action=AliasMapper.canonicalize_action("type_text", text=text, target="editor"),
-            ))
-            return MacroPlan(goal=p, steps=steps)
-
-        # 7. "click <target>"
-        m_click = re.search(r"^(?:click|press|select)\s+(.+)$", p_strip, re.I)
-        if m_click:
-            target = m_click.group(1).strip().strip('"\'')
-            steps.append(PlanStep(
-                step_index=1,
-                tool_name="click_element",
-                arguments={"target": target},
-                rationale=f"Click '{target}'",
-                canonical_action=AliasMapper.canonicalize_action("click_element", target=target),
-            ))
-            return MacroPlan(goal=p, steps=steps)
-
-        return None
-
-
-def launch_copilot() -> None:
-    """Entrypoint for the floating on-screen copilot (web UI in a native window)."""
-    from servo.daemon.copilot_app import run_copilot
-    run_copilot()
-
-
-if __name__ == "__main__":
-    launch_copilot()

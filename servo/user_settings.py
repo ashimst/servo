@@ -11,7 +11,6 @@ import base64
 import json
 import logging
 import os
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("servo.user_settings")
@@ -22,9 +21,9 @@ PATH = servo_home() / "settings.json"
 
 PLAIN_FIELDS = (
     "planner_provider", "anthropic_model", "openai_base_url", "openai_model", "gemini_model",
-    "kev_url", "browser_channel", "preferred_browser", "browser_mode",
+    "laya_url", "preferred_browser", "needle_intent_weights", "needle_intent_threshold",
 )
-SECRET_FIELDS = ("anthropic_api_key", "openai_api_key", "gemini_api_key", "kev_api_key")
+SECRET_FIELDS = ("anthropic_api_key", "openai_api_key", "gemini_api_key", "laya_api_key")
 
 
 def _disabled() -> bool:
@@ -81,8 +80,8 @@ def apply(settings: Any) -> None:
         if value not in (None, ""):
             try:
                 setattr(settings, name, value)
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001 - one bad saved value must not stop the copilot
+                logger.warning("Saved setting %s=%r ignored: %s", name, value, e)
 
 
 def save(settings: Any, updates: Dict[str, Any], mark_done: bool = True) -> None:

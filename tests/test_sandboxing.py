@@ -6,6 +6,7 @@ from servo.actuation.sandboxing import (
     is_hotkey_blacklisted,
     InputSandbox,
     SandboxViolationException,
+    split_hotkeys,
 )
 from servo.perception.viewport import WindowBounds
 
@@ -36,8 +37,28 @@ def test_send_keys_escaping_and_hotkey_mapping():
     assert escape_send_keys("{}") == "{{}{}}"
     assert build_hotkey_sequence(["ctrl", "shift", "s"]) == "^+s"
     assert build_hotkey_sequence(["Control", "F5"]) == "^{F5}"
+    assert build_hotkey_sequence(["ctrl", ","]) == "^,"
+    assert build_hotkey_sequence(["ctrl", "+"]) == "^{+}"
+    assert build_hotkey_sequence(["ctrl", "-"]) == "^-"
+    assert build_hotkey_sequence(["ctrl", "["]) == "^{[}"
+    assert build_hotkey_sequence(["ctrl", "]"]) == "^{]}"
     with pytest.raises(Exception):
         build_hotkey_sequence(["ctrl", "a", "b"])
+
+
+def test_split_hotkeys():
+    assert split_hotkeys("ctrl+c") == ["ctrl", "c"]
+    assert split_hotkeys("ctrl+shift+s") == ["ctrl", "shift", "s"]
+    assert split_hotkeys("ctrl-alt-del") == ["ctrl", "alt", "del"]
+    assert split_hotkeys("ctrl alt del") == ["ctrl", "alt", "del"]
+    assert split_hotkeys("ctrl, alt, del") == ["ctrl", "alt", "del"]
+    assert split_hotkeys("ctrl+,") == ["ctrl", ","]
+    assert split_hotkeys("ctrl + ,") == ["ctrl", ","]
+    assert split_hotkeys("ctrl++") == ["ctrl", "+"]
+    assert split_hotkeys("ctrl+-") == ["ctrl", "-"]
+    assert split_hotkeys("+") == ["+"]
+    assert split_hotkeys("-") == ["-"]
+    assert split_hotkeys(",") == [","]
 
 
 def _sandbox():

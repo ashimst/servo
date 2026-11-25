@@ -40,3 +40,8 @@ Desktop.ini
 # Graphify Output
 graphify-out/
 */graphify-out/
+
+# Local model training artifacts & binaries
+needle_model/eval_*.json
+decision_model/policy/heads.npz
+run_wsl_train.sh

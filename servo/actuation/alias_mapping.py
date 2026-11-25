@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from servo.perception.scene_index import SceneElement, SceneIndex
-from servo.actuation.sandboxing import normalize_keys
-from servo.actuation.needle_tools import NeedleToolSurface
+from servo.actuation.sandboxing import normalize_keys, split_hotkeys
 
 
 class CanonicalActionType(str, Enum):
@@ -30,6 +29,11 @@ class CanonicalActionType(str, Enum):
     CLOSE = "close"
     WAIT = "wait"
     INSPECT = "inspect"
+    # Set an outcome, verified by reading the control back (servo.actuation.patterns).
+    SET_TOGGLE = "set_toggle"
+    SET_EXPANDED = "set_expanded"
+    SELECT_OPTION = "select_option"
+    SET_VALUE = "set_value"
 
 
 class CanonicalAction(BaseModel):
@@ -44,10 +48,18 @@ class CanonicalAction(BaseModel):
     press_enter: bool = False
     duration_seconds: float = 0.0
     description: str = ""
+    state: str = ""   # set_toggle: on/off · set_expanded: expand/collapse
 
 
 # Comprehensive dictionary of natural language & tool aliases mapping to CanonicalActionType
 ACTION_ALIAS_MAP: Dict[str, CanonicalActionType] = {
+    "set_toggle": CanonicalActionType.SET_TOGGLE,
+    "set_expanded": CanonicalActionType.SET_EXPANDED,
+    "select_option": CanonicalActionType.SELECT_OPTION,
+    "set_value": CanonicalActionType.SET_VALUE,
+    "clear": CanonicalActionType.SET_VALUE,
+    "clear_field": CanonicalActionType.SET_VALUE,
+    "clear_text": CanonicalActionType.SET_VALUE,
     # Click family
     "click": CanonicalActionType.CLICK,
     "press": CanonicalActionType.CLICK,
@@ -158,6 +170,85 @@ _SYMBOL_WORDS = {
     "x": ("multiply by",), "/": ("divide by", "divide"), "=": ("equals",), ".": ("decimal separator",),
     "%": ("percent",),
 }
+
+
+def _norm_label(s: str) -> str:
+    s = " ".join(str(s or "").lower().split())
+    return re.sub(r"[\.\:'\"…]+$", "", s).strip()
+
+
+_EDITABLE = ("Edit", "Document")
+_GENERIC_EDITOR_HINTS = {"editor", "text editor", "the editor", "focused field", "text box", "input", "document",
+                         "text area", "focused editor"}
+
+
+def _area(e: SceneElement) -> int:
+    return max(0, e.bbox_screen[2] - e.bbox_screen[0]) * max(0, e.bbox_screen[3] - e.bbox_screen[1])
+
+
+_ROLES = {r.lower(): r for r in (
+    "Button", "CheckBox", "ComboBox", "Custom", "DataItem", "Document", "Edit", "Group", "Hyperlink", "List",
+    "ListItem", "Menu", "MenuItem", "Pane", "RadioButton", "Slider", "Spinner", "SplitButton", "Tab", "TabItem",
+    "Text", "ToolBar", "TreeItem")}
+_ROLE_PREFIX = re.compile(r"^([A-Za-z]+):\s*(\S.*)$")
+
+
+def _contains(outer: SceneElement, inner: SceneElement) -> bool:
+    a, b = outer.bbox_screen, inner.bbox_screen
+    return a[0] <= b[0] and a[1] <= b[1] and b[2] <= a[2] and b[3] <= a[3]
+
+
+def _fits(e: SceneElement, action_type: CanonicalActionType) -> bool:
+    t = action_type
+    if t in (CanonicalActionType.TYPE, CanonicalActionType.SET_VALUE):
+        return e.role in _EDITABLE or e.role in ("ComboBox", "Spinner", "Slider") or \
+            (t == CanonicalActionType.SET_VALUE and e.role == "Custom")
+    if t == CanonicalActionType.SET_TOGGLE:
+        return getattr(e, "toggle", None) is not None or e.role in ("CheckBox", "RadioButton")
+    if t == CanonicalActionType.SET_EXPANDED:
+        return getattr(e, "expanded", None) is not None
+    if t == CanonicalActionType.SELECT_OPTION:
+        return e.role in ("ComboBox", "List") or getattr(e, "expanded", None) is not None
+    return getattr(e, "interactive", True)
+
+
+def _prefer(cands: List[SceneElement], action_type: CanonicalActionType) -> Optional[SceneElement]:
+    """One element from same-labelled candidates, or None if they are genuinely different."""
+    pool = [e for e in cands if getattr(e, "enabled", True)] or list(cands)
+    fit = [e for e in pool if _fits(e, action_type)]
+    pool = fit or pool
+    if len(pool) == 1:
+        return pool[0]
+    if action_type in (CanonicalActionType.TYPE, CanonicalActionType.SET_VALUE):
+        edits = [e for e in pool if e.role in _EDITABLE]
+        if len(edits) == 1:
+            return edits[0]
+    # Nested duplicates (a combo box and the edit inside it) are one control: typing goes
+    # to the innermost, anything else to the outermost.
+    if all(_contains(pool[0], e) or _contains(e, pool[0]) for e in pool[1:]):
+        inner = action_type in (CanonicalActionType.TYPE, CanonicalActionType.SET_VALUE)
+        return (min if inner else max)(pool, key=_area)
+    return None
+
+
+def _row_partner(texts: List[SceneElement], controls: List[SceneElement], q: str,
+                 action_type: CanonicalActionType) -> Optional[SceneElement]:
+    """The control that a text label on the same row names ("File name:" -> its box)."""
+    labels = [t for t in texts if _norm_label(t.label) == q] or              [t for t in texts if _norm_label(t.label).startswith(q) and len(q) >= 4]
+    if len(labels) != 1:
+        return None
+    lab = labels[0]
+    cy = (lab.bbox_screen[1] + lab.bbox_screen[3]) / 2
+    row = [c for c in controls
+           if c.bbox_screen[1] - 8 <= cy <= c.bbox_screen[3] + 8 and c.bbox_screen[0] >= lab.bbox_screen[0] - 4]
+    below = [c for c in controls
+             if 0 <= c.bbox_screen[1] - lab.bbox_screen[3] <= 40
+             and c.bbox_screen[0] <= lab.bbox_screen[2] and lab.bbox_screen[0] <= c.bbox_screen[2]]
+    for group in (row, below):
+        fit = [c for c in group if _fits(c, action_type)] or group
+        if fit:
+            return min(fit, key=lambda c: abs(c.bbox_screen[0] - lab.bbox_screen[2]) + abs(c.bbox_screen[1] - lab.bbox_screen[1]))
+    return None
 
 
 def _label_synonyms(q: str) -> Tuple[str, ...]:
@@ -298,7 +389,7 @@ class AliasMapper:
         hotkeys: List[str] = []
         if keys is not None:
             if isinstance(keys, str):
-                hotkeys = [k.strip() for k in re.split(r"[\+\s,\-]+", keys) if k.strip()]
+                hotkeys = split_hotkeys(keys)
             elif isinstance(keys, Iterable):
                 for k in keys:
                     if not isinstance(k, str):
@@ -313,8 +404,22 @@ class AliasMapper:
         except Exception as e:
             raise ValueError(f"Failed to normalize keys: {e}") from e
 
+        state = str(extra_kwargs.get("state") or "").strip().lower()
+        if canon_type in (CanonicalActionType.SELECT_OPTION, CanonicalActionType.SET_VALUE) and not text:
+            text = str(extra_kwargs.get("option") or extra_kwargs.get("value") or "")
+
         # Parameter validation
-        if canon_type == CanonicalActionType.TYPE:
+        if canon_type in (CanonicalActionType.SET_TOGGLE, CanonicalActionType.SET_EXPANDED,
+                          CanonicalActionType.SELECT_OPTION, CanonicalActionType.SET_VALUE):
+            if not target:
+                raise ValueError(f"Action '{canon_type.value}' requires a non-empty 'target' parameter.")
+            # An explicit empty value is "clear this field"; a missing one is an error.
+            clearing = canon_type == CanonicalActionType.SET_VALUE and (
+                extra_kwargs.get("value") == "" or norm_name in ("clear", "clear_field", "clear_text")
+            )
+            if canon_type in (CanonicalActionType.SELECT_OPTION, CanonicalActionType.SET_VALUE) and not text and not clearing:
+                raise ValueError(f"Action '{canon_type.value}' requires the option/value to set.")
+        elif canon_type == CanonicalActionType.TYPE:
             if not text:
                 raise ValueError("Action 'type' requires a non-empty 'text' parameter.")
         elif canon_type == CanonicalActionType.HOTKEY:
@@ -361,71 +466,93 @@ class AliasMapper:
             press_enter=press_enter,
             duration_seconds=duration_seconds,
             description=desc,
+            state=state,
         )
 
     @staticmethod
-    def map_to_needle_tool(
-        action: CanonicalAction,
-        tools: NeedleToolSurface,
+    def resolve_element(
         scene: SceneIndex,
-        element_id: Optional[int] = None,
-    ) -> Tuple[Callable[[], str], str]:
-        """Deterministically resolve a CanonicalAction to an executable callable on NeedleToolSurface and description."""
-        action_type = action.action_type
-        if action_type in (CanonicalActionType.CLICK, CanonicalActionType.DOUBLE_CLICK, CanonicalActionType.RIGHT_CLICK):
-            if element_id is None:
-                raise ValueError(f"Action '{action_type.value}' requires an element_id.")
-            button = action.button
-            if action_type == CanonicalActionType.DOUBLE_CLICK:
-                button = "double"
-            elif action_type == CanonicalActionType.RIGHT_CLICK:
-                button = "right"
-            call = lambda eid=element_id, b=button: tools.click(scene, eid, button=b)
-            sig = f"click({element_id}, button='{button}')"
-            return call, sig
+        target_hint: Optional[str],
+        action_type: CanonicalActionType = CanonicalActionType.CLICK,
+    ) -> Tuple[Optional[SceneElement], Optional[str]]:
+        """Resolve a label to one control: real controls first, then row labels, then text.
 
-        elif action_type == CanonicalActionType.INVOKE:
-            if element_id is None:
-                raise ValueError("Action 'invoke' requires an element_id.")
-            call = lambda eid=element_id: tools.invoke(scene, eid)
-            sig = f"invoke({element_id})"
-            return call, sig
+        * "Show more settings (Taskbar behaviors)" - a repeated label with its row context.
+        * Duplicates (the Save dialog's "File name:" combo box AND the edit inside it) are
+          settled by what the action needs instead of failing as ambiguous.
+        * A row's text label ("Taskbar behaviors", "File name:") stands for the control on
+          that row, as a person reads a form.
+        """
+        if not target_hint or not str(target_hint).strip() or (
+                action_type == CanonicalActionType.TYPE and _norm_label(target_hint) in _GENERIC_EDITOR_HINTS):
+            # Untargeted typing goes where the keyboard focus is (a rename box that just
+            # opened), not to whichever text field is biggest (the address bar).
+            if action_type == CanonicalActionType.TYPE:
+                focused = [e for e in scene.elements.values() if getattr(e, "has_focus", False)
+                           and e.role in ("Edit", "Document", "ComboBox")]
+                if len(focused) == 1:
+                    return focused[0], None
+            if not target_hint or not str(target_hint).strip():
+                return AliasMapper._resolve_core(scene, target_hint, action_type)
+        # The screen description lists controls as "TabItem: Details"; planners copy that.
+        m = _ROLE_PREFIX.match(str(target_hint).strip())
+        if m and m.group(1).lower() in _ROLES:
+            role, rest = _ROLES[m.group(1).lower()], m.group(2).strip()
+            same_role = {i: e for i, e in scene.elements.items() if e.role == role}
+            if same_role:
+                el, _ = AliasMapper.resolve_element(scene.model_copy(update={"elements": same_role}), rest, action_type)
+                if el is not None:
+                    return el, None
+            return AliasMapper.resolve_element(scene, rest, action_type)
+        q = _norm_label(target_hint)
+        controls = [e for e in scene.elements.values() if getattr(e, "interactive", True)]
+        texts = [e for e in scene.elements.values() if not getattr(e, "interactive", True)]
 
-        elif action_type == CanonicalActionType.TYPE:
-            if element_id is None:
-                raise ValueError("Action 'type' requires an element_id.")
-            call = lambda eid=element_id, t=action.text, pe=action.press_enter, cf=action.clear_first: tools.type_text(
-                scene, eid, text=t, press_enter=pe, clear_first=cf
-            )
-            sig = f"type_text({element_id}, text={action.text!r})"
-            return call, sig
+        by_display =[e for e in controls if _norm_label(getattr(e, "display_label", e.label)) == q]
+        if by_display:
+            pick = _prefer(by_display, action_type)
+            if pick is not None:
+                return pick, None
+        exact = [e for e in controls if _norm_label(e.label) == q]
+        if len(exact) > 1:
+            pick = _prefer(exact, action_type)
+            if pick is not None:
+                return pick, None
+            # Genuinely different controls with one name: say so (with their row context)
+            # instead of silently taking the first.
+            names = [getattr(e, "display_label", e.label) for e in exact[:5]]
+            return None, (f"Ambiguous target '{target_hint}': {len(exact)} controls have this label "
+                          f"({'; '.join(names)}). Use the label with its context in brackets.")
 
-        elif action_type == CanonicalActionType.HOTKEY:
-            call = lambda k=list(action.keys): tools.hotkey(k)
-            sig = f"hotkey({action.keys})"
-            return call, sig
+        view = scene.model_copy(update={"elements": {e.element_id: e for e in controls}})
+        el, diag = AliasMapper._resolve_core(view, target_hint, action_type)
+        if el is not None:
+            return el, None
 
-        elif action_type == CanonicalActionType.SCROLL:
-            if element_id is None:
-                raise ValueError("Action 'scroll' requires an element_id.")
-            direction = "down"
-            amount = 3
-            call = lambda eid=element_id, d=direction, a=amount: tools.scroll(scene, eid, direction=d, amount=a)
-            sig = f"scroll({element_id}, direction='{direction}', amount={amount})"
-            return call, sig
-
-        elif action_type == CanonicalActionType.WAIT:
-            call = lambda d=action.duration_seconds: tools.wait(d)
-            sig = f"wait({action.duration_seconds})"
-            return call, sig
-
-        else:
-            raise ValueError(
-                f"Action type '{action_type.value}' cannot be dispatched directly to NeedleToolSurface."
-            )
+        by_context = [e for e in controls if getattr(e, "context", None) and _norm_label(e.context) == q]
+        if by_context:
+            pick = _prefer(by_context, action_type)
+            if pick is not None:
+                return pick, None
+        partner = _row_partner(texts, controls, q, action_type)
+        if partner is not None:
+            return partner, None
+        if texts:
+            el2, _ = AliasMapper._resolve_core(scene, target_hint, action_type)
+            if el2 is not None:
+                return el2, None
+        # Planners describe where a control is: "System in Settings left navigation",
+        # "Save on the toolbar". Try the label without the location.
+        bare = re.sub(r"\s+(?:in|on|from|under|at|inside|within)\s+(?:the\s+)?\S.*$", "", str(target_hint).strip(),
+                      flags=re.I)
+        if bare and bare != str(target_hint).strip() and len(bare) >= 2:
+            el3, _ = AliasMapper.resolve_element(scene, bare, action_type)
+            if el3 is not None:
+                return el3, None
+        return None, diag
 
     @staticmethod
-    def resolve_element(
+    def _resolve_core(
         scene: SceneIndex,
         target_hint: Optional[str],
         action_type: CanonicalActionType = CanonicalActionType.CLICK,

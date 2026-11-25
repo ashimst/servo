@@ -1,13 +1,14 @@
-"""Kev decision gate: calibrated, non-autoregressive decisions for System 1.
+"""Laya decision gate: calibrated, non-autoregressive decisions for System 1.
 
-Kev (https://github.com/jaredpalmer/kev) is an open, self-hostable implementation of
+Laya (https://github.com/NandhaKishorM/laya, Convai Innovations, Apache-2.0) is an open,
+self-hostable, Jev-compatible implementation of
 TypeSafe's "System One" decision model (Jev is TypeSafe's hosted model with the same
 API). It never generates text: each question is answered in one forward pass with a
 calibrated probability over the allowed answers.
 
-Wire contract (``POST {base}/v1/systemone``), verified against the Kev README::
+Wire contract (``POST {base}/v1/systemone``), served by ``decision_model/server.py serve``::
 
-    request  {"state": ..., "model": "kev-latest",
+    request  {"state": ..., "model": "english",
               "questions": {"<id>": {"type": "noul"|"choice"|"score",
                                      "instructions": "...", "criteria": ...}}}
     response {"answers": {"<id>": {"type": "noul", "noul": 0.93}
@@ -16,14 +17,13 @@ Wire contract (``POST {base}/v1/systemone``), verified against the Kev README::
                                 | {"type": "score", "score": 1.4, "confidence": c,
                                    "legend": {"0": "low", ...}, "probabilities": {"0": p, ...}}}}
 
-Servo asks Kev three kinds of question:
+Servo asks Laya three kinds of question:
   * pre-action risk + scope (safety gate),
   * post-action "did the transition happen" (verification),
   * routing: is this a desktop task, and is it simple enough for System 1.
 
-Without a Kev server every question falls back to deterministic heuristics, and the
-result says so (``source="heuristic"``) so the trace never presents a guess as a model
-verdict.
+There is no rule-based stand-in: without a working Laya server every question raises
+``LayaUnavailable`` and the caller fails the step or the request.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ class PreRiskResult(BaseModel):
     risk_level: Literal["low", "medium", "high"]
     scope_valid: bool
     reason: str
-    source: Literal["kev", "heuristic"] = "heuristic"
+    source: Literal["laya"] = "laya"
     probabilities: Dict[str, float] = {}
 
 
@@ -67,11 +67,11 @@ class PostTransitionResult(BaseModel):
     transition_ok: bool
     confidence: float
     explanation: str
-    source: Literal["kev", "heuristic", "readback"] = "heuristic"
+    source: Literal["laya", "readback"] = "laya"
     verdict: Verdict = "confirmed"
 
 
-def _post(verdict: Verdict, confidence: float, explanation: str, source: str = "heuristic") -> PostTransitionResult:
+def _post(verdict: Verdict, confidence: float, explanation: str, source: str = "laya") -> PostTransitionResult:
     return PostTransitionResult(transition_ok=verdict != "failed", confidence=confidence,
                                 explanation=explanation, source=source, verdict=verdict)  # type: ignore[arg-type]
 
@@ -87,14 +87,26 @@ def text_contains(observed: str, typed: str) -> bool:
     return bool(typed.strip()) and normalize_text(typed) in normalize_text(observed)
 
 
+# The planner agents Laya can route a task to (servo/cognition/planners.py).
+DOMAIN_CRITERIA: Dict[str, str] = {
+    "apps": "Desktop apps such as Notepad, Paint, Calculator, Clock, Photos, Office or LibreOffice.",
+    "settings": "Windows Settings: time, display, sound, Bluetooth, network, personalization, accounts.",
+    "files": "Files and folders: File Explorer, finding, renaming, moving, tagging or reading files.",
+    "web": "Web pages in a browser: websites, searching the web, tabs, online accounts.",
+    "code": "Code editors such as VS Code, the terminal, PowerShell commands, developer tools.",
+}
+
+
 class GoalAssessment(BaseModel):
-    """Kev's routing view of a user goal."""
+    """Laya's routing view of a user goal."""
     desktop_task: bool
     p_desktop_task: float
     complexity: Literal["single", "multi", "ambiguous"]
     complexity_probabilities: Dict[str, float] = {}
     confidence: float
-    source: Literal["kev", "heuristic"] = "heuristic"
+    domain: str = "apps"     # which planner agent handles it (servo/cognition/planners.py)
+    domain_probabilities: Dict[str, float] = {}
+    source: Literal["laya"] = "laya"
     reason: str = ""
 
 
@@ -116,25 +128,6 @@ def _keyword_pattern(keywords: Tuple[str, ...]) -> "re.Pattern[str]":
 
 _HIGH_RE = _keyword_pattern(HIGH_RISK_KEYWORDS)
 _MEDIUM_RE = _keyword_pattern(MEDIUM_RISK_KEYWORDS)
-
-_ACTION_VERBS = re.compile(
-    r"\b(open|launch|start|close|quit|exit|click|press|select|type|write|enter|search|go to|browse|"
-    r"navigate|visit|scroll|switch to|hotkey|shortcut|wait|double click|right click)\b",
-    re.I,
-)
-_MULTI_MARKERS = re.compile(
-    r"\b(then|after that|afterwards|next|finally|until|if|unless|each|every|all of|compare|find|"
-    r"figure out|look up|summari[sz]e|book|schedule|organi[sz]e|reply|draft)\b|,|;",
-    re.I,
-)
-
-
-_QUESTION = re.compile(
-    r"^(what|why|how|who|whom|whose|when|where|which|is|are|was|were|do|does|did|can you (explain|tell)|"
-    r"could you (explain|tell)|explain|tell me (about|why|what|how)|define|describe what)\b",
-    re.I,
-)
-
 
 def _endpoint(url: str) -> str:
     url = url.rstrip("/")
@@ -200,7 +193,33 @@ def _shell_risk(tool_call: str, target_process: str) -> Tuple[str, str]:
     return "low", ""
 
 
-class KevClient:
+def describe_delta(delta: SceneDelta) -> str:
+    """The observed screen change as one plain sentence, the form Laya reads best."""
+    if not delta.has_changed:
+        return f"Nothing on screen changed. The window is still '{delta.new_title}'."
+    if delta.window_closed:
+        return f"The window '{delta.old_title}' closed."
+    parts = []
+    if delta.title_changed:
+        parts.append(f"The window changed to '{delta.new_title}'.")
+    else:
+        parts.append(f"The window is still '{delta.new_title}'.")
+    if delta.added_labels:
+        parts.append("Appeared: " + ", ".join(f"'{x}'" for x in delta.added_labels[:25]) + ".")
+    if delta.removed_labels:
+        parts.append("Disappeared: " + ", ".join(f"'{x}'" for x in delta.removed_labels[:25]) + ".")
+    for label, v in list(delta.value_changes.items())[:10]:
+        parts.append(f"'{label}' changed from '{v.get('old_value', '')}' to '{v.get('new_value', '')}'.")
+    if not (delta.added_labels or delta.removed_labels or delta.value_changes or delta.title_changed):
+        parts.append("No control appeared, disappeared or changed value.")
+    return " ".join(parts)
+
+
+class LayaUnavailable(RuntimeError):
+    """The Laya model is not configured, unreachable, or answered malformed. Callers fail."""
+
+
+class LayaClient:
     """Minimal client for the System One wire contract."""
 
     def __init__(
@@ -210,19 +229,19 @@ class KevClient:
         model: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
     ) -> None:
-        self.base_url = settings.kev_url if endpoint_url is None else endpoint_url
-        self.api_key = settings.kev_api_key if api_key is None else api_key
-        self.model = model or settings.kev_model
+        self.base_url = settings.laya_url if endpoint_url is None else endpoint_url
+        self.api_key = settings.laya_api_key if api_key is None else api_key
+        self.model = model or settings.laya_model
         self.timeout_seconds = settings.jev_timeout_seconds if timeout_seconds is None else timeout_seconds
 
     @property
     def configured(self) -> bool:
         return bool(self.base_url)
 
-    def ask(self, state: Any, questions: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """POST a System One request. Returns the ``answers`` map, or None on any failure."""
+    def ask(self, state: Any, questions: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """POST a System One request. Returns the ``answers`` map; raises LayaUnavailable."""
         if not self.base_url:
-            return None
+            raise LayaUnavailable("Laya is not configured (set SERVO_LAYA_URL)")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -236,10 +255,11 @@ class KevClient:
             res.raise_for_status()
             data = res.json()
             answers = data.get("answers") if isinstance(data, dict) else None
-            return answers if isinstance(answers, dict) else None
         except Exception as e:
-            logger.warning("Kev endpoint %s failed (%s); using heuristics.", self.base_url, e)
-            return None
+            raise LayaUnavailable(f"Laya at {self.base_url} failed: {e.__class__.__name__}: {e}") from e
+        if not isinstance(answers, dict):
+            raise LayaUnavailable(f"Laya at {self.base_url} returned no answers")
+        return answers
 
 
 def _noul(answers: Dict[str, Any], key: str) -> Optional[float]:
@@ -275,24 +295,19 @@ def _choice(answers: Dict[str, Any], key: str, options: Tuple[str, ...]) -> Opti
 
 
 class JevGate:
-    """Kev-backed decision gate with deterministic heuristic fallback."""
+    """Laya-backed decision gate. Every decision comes from the Laya model; there is no
+    rule-based stand-in. Kept deterministic, because they are evidence or safety rather
+    than judgement: the risk floor (a model may raise risk, never lower it) and the typed
+    text read back from the control."""
 
-    def __init__(
-        self,
-        endpoint_url: Optional[str] = None,
-        timeout_seconds: Optional[float] = None,
-        use_fallback: Optional[bool] = None,
-    ) -> None:
-        self.client = KevClient(endpoint_url=endpoint_url, timeout_seconds=timeout_seconds)
+    def __init__(self, endpoint_url: Optional[str] = None, timeout_seconds: Optional[float] = None) -> None:
+        self.client = LayaClient(endpoint_url=endpoint_url, timeout_seconds=timeout_seconds)
         self.endpoint_url = self.client.base_url
-        self.use_fallback = settings.use_heuristic_jev_fallback if use_fallback is None else use_fallback
-        # The model is asked whenever a Kev URL is configured, unless heuristics are forced.
-        # Heuristics remain the per-call fallback when the server fails or answers badly.
-        self.model_enabled = self.client.configured and not self.use_fallback
+        self.model_enabled = self.client.configured
 
-    def _ask(self, state: Any, questions: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if not self.model_enabled:
-            return None
+    def _ask(self, state: Any, questions: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        if not self.client.configured:
+            raise LayaUnavailable("Laya is not configured (set SERVO_LAYA_URL to a running Laya server)")
         return self.client.ask(state, questions)
 
     # ----------------------------------------------------------------- safety
@@ -300,26 +315,25 @@ class JevGate:
     def evaluate_pre_risk(
         self, sub_goal: str, tool_call: str, element_label: str, target_process: str = ""
     ) -> PreRiskResult:
-        """Classify risk (low | medium | high) and scope validity before actuation.
+        """Risk (low | medium | high) and scope validity before actuation, from Laya.
 
-        The final risk is the MAX of Kev's level and the deterministic floor (risky
-        keywords, plus keystrokes into a shell window or destructive shell commands): a
-        model may raise the risk of an innocuous-sounding action, but never lower one
-        the floor flags.
+        The final risk is the MAX of Laya's level and the deterministic floor (risky
+        keywords, keystrokes into a shell window, destructive shell commands).
+        Raises LayaUnavailable when Laya cannot answer.
         """
         # The keyword floor judges the ACTION, not the content being typed: a poem with
         # "each drop a note" or an email saying "send me the order" is not a risky act.
-        # (Typed shell commands are still judged, by _shell_risk below.)
         typed = _typed_text(tool_call)
         scan = f"{sub_goal} {tool_call} {element_label}"
         if typed:
             plain = typed.replace("\\n", "\n").replace("\\t", "\t").replace("\\'", "'")
-            # longest first, so a prefix never breaks a full-text match
             for chunk in sorted({typed, typed[:59], typed[:40], plain, plain[:59], plain[:40]}, key=len, reverse=True):
                 if len(chunk) >= 3:
                     scan = scan.replace(chunk, " ")
-        combined_text = scan
-        kw_level, kw_reason = _keyword_risk(combined_text)
+        # The executor's own name is not evidence: "send_hotkey" would match "send" and make
+        # every keyboard shortcut high risk. The keys themselves are still scanned.
+        scan = scan.replace("send_hotkey", "hotkey")
+        kw_level, kw_reason = _keyword_risk(scan)
         sh_level, sh_reason = _shell_risk(tool_call, target_process)
         if _RISK_ORDER[sh_level] > _RISK_ORDER[kw_level]:
             kw_level, kw_reason = sh_level, sh_reason
@@ -340,28 +354,19 @@ class JevGate:
                 },
             },
         )
-        if answers is not None:
-            level = _score_level(answers, "risk_level", ("low", "medium", "high"))
-            scope = _noul(answers, "scope_valid")
-            if level is not None and scope is not None:
-                model_level, probs = level
-                # Conservative upgrade: substantial mass on "high" counts as high.
-                if probs.get("high", 0.0) >= settings.kev_high_risk_floor:
-                    model_level = "high"
-                final = max(model_level, kw_level, key=lambda r: _RISK_ORDER[r])
-                reason = f"Kev: P(low/med/high)={probs.get('low', 0):.2f}/{probs.get('medium', 0):.2f}/{probs.get('high', 0):.2f}"
-                if final != model_level:
-                    reason += f"; raised by keyword floor ({kw_reason})"
-                return PreRiskResult(
-                    risk_level=final,  # type: ignore[arg-type]
-                    scope_valid=scope >= 0.5,
-                    reason=reason,
-                    source="kev",
-                    probabilities={**probs, "scope_valid": scope},
-                )
-            logger.warning("Kev returned malformed pre-risk answers %r; using heuristic gate.", answers)
-
-        return PreRiskResult(risk_level=kw_level, scope_valid=True, reason=f"{kw_reason} (Heuristic)")  # type: ignore[arg-type]
+        level = _score_level(answers, "risk_level", ("low", "medium", "high"))
+        scope = _noul(answers, "scope_valid")
+        if level is None or scope is None:
+            raise LayaUnavailable(f"Laya returned malformed risk answers: {answers!r}"[:300])
+        model_level, probs = level
+        if probs.get("high", 0.0) >= settings.laya_high_risk_floor:
+            model_level = "high"
+        final = max(model_level, kw_level, key=lambda r: _RISK_ORDER[r])
+        reason = f"Laya: P(low/med/high)={probs.get('low', 0):.2f}/{probs.get('medium', 0):.2f}/{probs.get('high', 0):.2f}"
+        if final != model_level:
+            reason += f"; raised by the safety floor ({kw_reason})"
+        return PreRiskResult(risk_level=final, scope_valid=scope >= 0.5, reason=reason,  # type: ignore[arg-type]
+                             source="laya", probabilities={**probs, "scope_valid": scope})
 
     def evaluate_post_transition(
         self,
@@ -371,11 +376,9 @@ class JevGate:
         typed_text: str = "",
         observed_text: Optional[str] = None,
     ) -> PostTransitionResult:
-        """Verify whether observed scene changes correspond to the expected sub-goal outcome.
-
-        ``observed_text`` is the target control's text read back after typing. It is
-        direct evidence, so it decides the verdict before any model or diff heuristic.
-        """
+        """Did the action do what the sub-goal asked? Typed text read back from the target
+        control is direct evidence and decides first; otherwise Laya judges the observed
+        change. Raises LayaUnavailable when Laya cannot answer."""
         if typed_text and observed_text is not None:
             if text_contains(observed_text, typed_text):
                 return _post("confirmed", 0.97, "Typed text read back from the target control", "readback")
@@ -385,75 +388,45 @@ class JevGate:
 
         answers = self._ask(
             {
-                "sub_goal": sub_goal,
-                "expected_outcome": expected_outcome,
-                "typed_text": typed_text,
-                "observed_delta": {
-                    "has_changed": delta.has_changed,
-                    "title_changed": delta.title_changed,
-                    "new_title": delta.new_title,
-                    "added_elements": delta.added_labels[:50],
-                    "removed_elements": delta.removed_labels[:50],
-                    "value_changes": dict(list(delta.value_changes.items())[:20]),
-                },
+                "action": sub_goal + (f' (typed "{typed_text[:120]}")' if typed_text else ""),
+                "expected": expected_outcome or "(not stated)",
+                "observed": describe_delta(delta),
             },
             {
-                "transition_ok": {
-                    "type": "noul",
-                    "instructions": "Does the observed UI change show that the sub-goal was accomplished?",
+                "outcome": {
+                    "type": "choice",
+                    "instructions": "Judge the action from the observed UI change.",
+                    "criteria": {
+                        "confirmed": "The change shows the sub-goal was accomplished.",
+                        "unconfirmed": "Nothing observable either way (the effect may be invisible to the "
+                                       "accessibility tree, e.g. a sound or video starting).",
+                        "failed": "The change shows the sub-goal was NOT accomplished (wrong thing opened, "
+                                  "error shown, only a menu was dismissed, value is different).",
+                    },
                 }
             },
         )
-        if answers is not None:
-            p = _noul(answers, "transition_ok")
-            if p is not None:
-                ok = p >= 0.5
-                return _post("confirmed" if ok else "failed", p if ok else 1 - p,
-                             f"Kev verified transition (P(ok)={p:.2f})", "kev")
-            logger.warning("Kev returned malformed post-transition answer; using heuristic gate.")
-
-        # ---- Heuristic fallback ----
-        if typed_text:
-            for change in delta.value_changes.values():
-                if text_contains(change.get("new_value") or "", typed_text):
-                    return _post("confirmed", 0.95, "Typed text observed in control value (Heuristic)")
-            if delta.value_changes:
-                # A value changed, and it isn't what we typed: evidence of failure.
-                return _post("failed", 0.8, "A field changed, but not to the typed text (Heuristic)")
-            if delta.has_changed:
-                return _post("unconfirmed", 0.5,
-                             "The UI changed, but the typed text could not be read back (Heuristic)")
-            return _post("failed", 0.8, "Typed text was not observed in any control value after actuation (Heuristic)")
-
-        if not delta.has_changed:
-            # Many real effects are invisible to the accessibility tree (a video starting,
-            # a sound, a page scrolled by a key). No change is not proof of failure.
-            return _post("unconfirmed", 0.4,
-                         "The action ran, but no change was visible in the accessibility tree (Heuristic)")
-
-        if expected_outcome:
-            observed = " ".join(
-                [delta.new_title, *delta.added_labels, *delta.removed_labels,
-                 *(v.get("new_value") or "" for v in delta.value_changes.values())]
-            ).lower()
-            words = [w for w in re.findall(r"\w{4,}", expected_outcome.lower())]
-            if words and any(w in observed for w in words):
-                return _post("confirmed", 0.85, "UI changed and the change mentions the expected outcome (Heuristic)")
-            return _post("confirmed", 0.55, "UI changed right after the action (Heuristic; change not matched to the goal)")
-
-        return _post("confirmed", 0.7, "UI state mutation observed; no expected outcome to compare (Heuristic)")
+        cx = _choice(answers, "outcome", ("confirmed", "unconfirmed", "failed"))
+        if cx is None:
+            raise LayaUnavailable(f"Laya returned a malformed verification answer: {answers!r}"[:300])
+        verdict, probs, conf = cx
+        return _post(verdict, conf, f"Laya: {verdict} (P={probs.get(verdict, conf):.2f})", "laya")  # type: ignore[arg-type]
 
     # ---------------------------------------------------------------- routing
 
-    def assess_goal(self, goal: str, screen_summary: str = "", tier1_parsed: bool = False) -> GoalAssessment:
-        """Routing decision: is this a desktop task, and can System 1 do it directly?"""
+    def assess_goal(self, goal: str, screen_summary: str = "") -> GoalAssessment:
+        """Routing: is this a desktop task, and is it one direct action? Raises LayaUnavailable."""
         answers = self._ask(
             {"user_request": goal, "screen": screen_summary[:4000]},
             {
                 "desktop_task": {
                     "type": "noul",
                     "instructions": "Is the user asking the assistant to operate the computer "
-                                    "(open apps, click, type, browse the web) rather than only chat?",
+                                    "(open apps, click, type, browse the web, change a setting, create, "
+                                    "edit or move files, configure an app) rather than only chat? A polite "
+                                    "request such as 'Can you…', 'Could you help me…' or 'I need to…' that "
+                                    "asks for something to be done on this computer counts as operating it; "
+                                    "asking how or why something works does not.",
                 },
                 "complexity": {
                     "type": "choice",
@@ -464,46 +437,22 @@ class JevGate:
                         "ambiguous": "It is unclear what to act on.",
                     },
                 },
+                "domain": {
+                    "type": "choice",
+                    "instructions": "Which area of the computer does carrying out this request mostly happen in?",
+                    "criteria": DOMAIN_CRITERIA,
+                },
             },
         )
-        if answers is not None:
-            p_task = _noul(answers, "desktop_task")
-            cx = _choice(answers, "complexity", ("single", "multi", "ambiguous"))
-            if p_task is not None and cx is not None:
-                return GoalAssessment(
-                    desktop_task=p_task >= 0.5,
-                    p_desktop_task=p_task,
-                    complexity=cx[0],  # type: ignore[arg-type]
-                    complexity_probabilities=cx[1],
-                    confidence=cx[2],
-                    source="kev",
-                    reason=f"Kev: P(desktop task)={p_task:.2f}, complexity={cx[0]}",
-                )
-
-        # Heuristic: questions are chat, imperatives are tasks; sequencing/lookup words mark
-        # multi-step work.
-        verbs = _ACTION_VERBS.findall(goal)
-        is_question = bool(_QUESTION.match(goal.strip())) or goal.strip().endswith("?")
-        is_task = tier1_parsed or bool(verbs) or not is_question
-        markers = _MULTI_MARKERS.findall(goal)
-        n_and = len(re.findall(r"\band\b", goal, re.I))
-        if tier1_parsed and not markers:
-            cx_label, conf = "single", 0.9
-        elif markers or len(verbs) >= 3 or n_and >= 2 or len(goal.split()) > 18:
-            cx_label, conf = "multi", 0.7
-        elif is_task:
-            cx_label, conf = "single", 0.6
-        else:
-            cx_label, conf = "ambiguous", 0.5
+        p_task = _noul(answers, "desktop_task")
+        cx = _choice(answers, "complexity", ("single", "multi", "ambiguous"))
+        dom = _choice(answers, "domain", tuple(DOMAIN_CRITERIA))
+        if p_task is None or cx is None or dom is None:
+            raise LayaUnavailable(f"Laya returned malformed routing answers: {answers!r}"[:300])
         return GoalAssessment(
-            desktop_task=is_task,
-            p_desktop_task=0.9 if is_task else 0.1,
-            complexity=cx_label,  # type: ignore[arg-type]
-            confidence=conf,
-            source="heuristic",
-            reason=f"Heuristic: {len(verbs)} action verb(s), {len(markers)} sequencing marker(s)",
+            desktop_task=p_task >= 0.5, p_desktop_task=p_task,
+            complexity=cx[0],  # type: ignore[arg-type]
+            complexity_probabilities=cx[1], confidence=cx[2], domain=dom[0], domain_probabilities=dom[1],
+            source="laya", reason=f"Laya: P(desktop task)={p_task:.2f}, complexity={cx[0]}, area={dom[0]}",
         )
 
-
-# Kev is the open implementation; JevGate is kept as the import name for compatibility.
-KevGate = JevGate

@@ -1,25 +1,14 @@
-"""System 2: the LLM tier.
+"""System 2: runs a planner agent's prompt (servo/cognition/planners.py) on a model.
 
-System 2 decides WHAT to do, in plain language; it never emits tool calls. Each subtask
-it writes is a short command in the Tier 1 grammar, which Tier 1 (grammar / Needle)
-turns into a tool call against the *live* screen at execution time. That keeps the
-LLM out of element IDs and coordinates, and lets every subtask be re-grounded.
-
-Escalation context flows up (what was tried, why it failed, what the screen shows now)
-and System 2 answers with a revised list of remaining subtasks.
-
-Every call returns the model's visible reasoning when the provider exposes it, so the
-copilot can show the full trace:
-  * Anthropic: adaptive thinking with ``display: "summarized"``
-  * OpenAI-compatible / Ollama: ``reasoning_content`` / ``reasoning`` fields, or
-    ``<think>...</think>`` blocks in the content
-  * Gemini: parts flagged ``thought: true`` (``thinkingConfig.includeThoughts``)
-  * cactus-engine (local): ``thinking``, plus ``confidence`` / ``cloud_handoff``
+The planner decides WHAT to do; it never emits tool calls. Each step it writes is one of
+the step forms, which a Needle agent turns into a tool call against the live screen.
+That keeps the model out of element IDs and coordinates and lets every step be grounded
+on the screen as it is when the step runs. Tiers: the local planner (Qwen3.5-4B on
+llama-server) and the cloud planner (settings.planner_provider), per settings.planner_mode.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import logging
 import os
@@ -30,29 +19,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from pydantic import BaseModel, Field
 
-from servo.cognition.needle import COMMAND_GRAMMAR
 from servo.cognition.trace import NullTracer, Tracer
 from servo.config import settings
 
 logger = logging.getLogger("servo.system2")
-
-
-def parse_api_keys(raw: Optional[str]) -> List[str]:
-    """Split comma, semicolon, or newline delimited API keys for multi-key pool failover."""
-    if not raw:
-        return []
-    parts = re.split(r"[,;\n\r]+", raw.strip())
-    return [p.strip() for p in parts if p.strip()]
-
-
-@dataclass
-class ProviderCandidate:
-    provider: str
-    api_key: str = ""
-    model: str = ""
-    base_url: str = ""
-    name: str = ""
-
 
 
 class System2Unavailable(RuntimeError):
@@ -64,6 +34,7 @@ class System2Result(BaseModel):
     reply: str = ""
     subtasks: List[str] = Field(default_factory=list)
     done: bool = False
+    next_agent: str = ""  # a planner agent asks to hand the task to another (planners.py)
     reasoning: str = ""
     raw: str = ""
     provider: str = ""
@@ -72,60 +43,8 @@ class System2Result(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
-PLAN_SYSTEM = f"""You are System 2 of Servo, a copilot that operates the user's Windows PC. You decide WHAT \
-to do; System 1 does it against the live screen and reports back.
-
-## Commands
-Write each subtask as ONE command in exactly this grammar (one action per command):
-{COMMAND_GRAMMAR}
-open <site> in <browser>       e.g. open gmail in dia   (only when the user named a browser)
-search <site> for <query>      e.g. search youtube for kanye   (youtube, spotify, amazon, wikipedia, github, google, maps, reddit)
-press <key> <n> times          e.g. press volumeup 5 times
-Any other wording fails. Never invent coordinates, element IDs, or tools.
-
-## The loop
-- You are called once per round. After your subtasks run, you are called again with what
-  happened ("Already done") and a fresh description of the screen.
-- Return only the steps you can write NOW. If a step depends on something you haven't
-  seen (search results, a page loading, a dialog, an AI's answer), stop the list there.
-- Each "Already done" line is one of: done; "[ran, NOT confirmed: …]" which means the
-  action ran but its effect wasn't visible, so CHECK THE SCREEN before assuming it worked;
-  or output from a command or file, which you should read and use.
-- Set "done": true only when the screen (or command output) shows the goal is achieved.
-  "Play X" is done when a Pause button / the video title is on screen, not when you clicked.
-
-## Rules
-- Use the [Recipes] block when present: they are tested procedures for this kind of task.
-- Labels: click things by the exact text the screen description lists. Long link texts
-  are fine ("click Kanye West - Runaway (Video Version) 4 minutes, 38 seconds").
-- Web: pages open in the user's own browser automatically. Prefer "search <site> for X"
-  over finding and clicking a site's search box.
-- Installed apps first: when the Windows context lists an app as installed (including a
-  "Store app" or an "installed web app" such as WhatsApp, Facebook, Messenger, Teams,
-  Instagram, YouTube), open it with `launch <name>`, not its website, unless the user
-  asked for the browser/website. A window labelled "installed web app" is that app, not a
-  browser: never open tabs or type addresses in it; use its own controls.
-- Writing text: compose the actual words yourself inside type "…". Never type a
-  description of the text, and never use run command to type or copy text.
-- run command runs ONE line of PowerShell, already inside PowerShell: never wrap it in
-  `powershell -command` or `cmd /c`, never use WScript.Shell/SendKeys, keep it read-only
-  where possible. Its output comes back to you next round. Every command is shown to the
-  user for approval.
-- Never type passwords, codes or card numbers ("[redacted]" in the goal means the user
-  pasted one). Navigate to the sign-in page, then stop and ask the user to sign in.
-- Statements and preferences ("dia is my browser", "my name is …", "thanks") are not
-  tasks: return no subtasks, acknowledge in "reply".
-- Questions you can answer from knowledge ("what is…", "explain…") need no subtasks.
-- Follow-ups ("try again", "play it", "the typing is not complete", "you should have
-  waited") refer to the Recent Conversation: work out what the user means from it and
-  continue that task; don't start over unless asked.
-- If something failed, don't repeat the same command unchanged. Use the screen to pick a
-  different label or approach. After two failed approaches, stop and explain in "reply".
-- Never touch the ~/.servo folder. Never close the Servo Copilot window.
-
-Respond with ONLY a JSON object:
-{{"thought": "<one or two sentences: what you see and why these steps>", \
-"reply": "<short message to the user>", "subtasks": ["<command>", ...], "done": false}}"""
+# Planner prompts are per agent (servo/cognition/planners.py).
+from servo.cognition.planners import DEFAULT_AGENT, plan_system  # noqa: E402
 
 CHAT_SYSTEM = (
     "You are Servo, a friendly on-screen Windows copilot. The user's name is {name}. "
@@ -185,7 +104,7 @@ def knowledge_context(goal: str, failure: Optional[Dict[str, Any]] = None, activ
                       conversation: str = "") -> Tuple[str, Dict[str, Any]]:
     """Recipes + knowledge-graph context for the planner, and what was chosen (for the trace)."""
     blocks: List[str] = []
-    meta: Dict[str, Any] = {"recipes": [], "graph": False}
+    meta: Dict[str, Any] = {"recipes": [], "graph": False, "missing": []}  # "missing" shows in the trace
     failure_text = json.dumps(failure, ensure_ascii=False) if failure else ""
     try:
         from servo.cognition.recipes import recipe_book
@@ -193,16 +112,27 @@ def knowledge_context(goal: str, failure: Optional[Dict[str, Any]] = None, activ
         if block:
             blocks.append(block)
             meta["recipes"] = ids
-    except Exception as e:
-        logger.debug("recipes unavailable: %s", e)
+    except Exception as e:  # noqa: BLE001 - context, not a decision: plan without it, and say so
+        meta["missing"].append(f"recipes: {e}")
+        logger.warning("recipes unavailable: %s", e)
     try:
         from servo.cognition.graph_memory import graph_memory
         g = graph_memory.format_context_for_prompt(goal=goal, active_app=active_app or None, failure=failure)
         if g:
             blocks.append(g)
             meta["graph"] = True
-    except Exception as e:
-        logger.debug("graph context unavailable: %s", e)
+    except Exception as e:  # noqa: BLE001
+        meta["missing"].append(f"knowledge graph: {e}")
+        logger.warning("graph context unavailable: %s", e)
+    try:
+        from servo.cognition.desktop_graph import desktop_graph
+        d = desktop_graph().context_for(" ".join([goal, failure_text[:300]]))
+        if d:
+            blocks.append(d)
+            meta["desktop_graph"] = True
+    except Exception as e:  # noqa: BLE001
+        meta["missing"].append(f"desktop graph: {e}")
+        logger.warning("desktop graph context unavailable: %s", e)
     return "\n\n".join(blocks), meta
 
 
@@ -222,18 +152,22 @@ def build_plan_prompt(
     ctx = windows_context.retrieve_context(goal)
     ctx_block = ctx.to_prompt_text()
 
+    memory_error = ""
     if memory_context is None:
         try:
             from servo.cognition.memory import chat_memory
             memory_context = chat_memory.to_prompt_context(query=goal)
-        except Exception:
-            memory_context = ""
+        except Exception as e:  # noqa: BLE001
+            memory_context, memory_error = "", f"chat memory: {e}"
+            logger.warning("chat memory unavailable: %s", e)
 
     focused = next((w for w in ctx.active_windows if w.get("is_focused")), None) or \
         (ctx.active_windows[0] if ctx.active_windows else {})
     active_app = str(focused.get("process") or "")
     knowledge, meta = knowledge_context(goal, failure, active_app, memory_context or "")
     meta["active_app"] = active_app
+    if memory_error:
+        meta["missing"].append(memory_error)
     if meta_out is not None:
         meta_out.update(meta)
 
@@ -272,57 +206,68 @@ class System2:
             self.provider = "anthropic"
         self.user_name = user_name
         self.tracer = tracer or NullTracer()
-        self._engine_handle: Any = None
+        self.tier = "local"
+        self.step_ups: List[str] = []
+        self._unparsable = 0
+        self.reset_tier()
 
     # ---------------------------------------------------------------- status
 
     def describe(self) -> Dict[str, Any]:
-        model = {
-            "anthropic": settings.anthropic_model,
-            "openai": settings.openai_model,
-            "gemini": settings.gemini_model,
-            "cactus": settings.cactus_engine_model,
-        }.get(self.provider, "")
-        return {"provider": self.provider, "model": model, "available": self.available()}
+        cloud_model = {"anthropic": settings.anthropic_model, "openai": settings.openai_model,
+                       "gemini": settings.gemini_model}.get(self.provider, "")
+        local = {"url": settings.local_planner_url, "model": settings.local_planner_model,
+                 "available": _reachable(settings.local_planner_url)}
+        cloud = {"provider": self.provider, "model": cloud_model, "available": self._cloud_configured()}
+        on_tier = local if self.tier == "local" else cloud
+        return {"mode": settings.planner_mode, "tier": self.tier, "local": local, "cloud": cloud,
+                "provider": "local" if self.tier == "local" else self.provider,
+                "model": on_tier["model"], "available": self.available()}
 
-    def available(self) -> bool:
-        """Cheap readiness check. For a local server this probes it (cached for 20 s)."""
-        if self.provider == "anthropic":
+    def _provider_available(self, provider: str) -> bool:
+        if provider == "anthropic":
             try:
                 import anthropic  # noqa: F401
             except ImportError:
                 return False
             return bool(settings.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
                         or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
-        if self.provider == "openai":
-            return _reachable(settings.openai_base_url, settings.openai_api_key)
-        if self.provider == "gemini":
+        if provider == "openai":
+            return bool(settings.openai_base_url) and _reachable(settings.openai_base_url, settings.openai_api_key)
+        if provider == "gemini":
             return bool(settings.gemini_api_key)
-        if self.provider == "cactus":
-            try:
-                from cactus import cactus_complete  # type: ignore  # noqa: F401
-                return True
-            except Exception:
-                return False
         return False
 
+    def available(self) -> bool:
+        """Is the planner for the current tier ready (local first in local_first mode, with the
+        cloud as its step-up)? For a local server this probes it (cached for 20 s)."""
+        mode = settings.planner_mode
+        local_ok = _reachable(settings.local_planner_url)
+        if mode == "local_only":
+            return local_ok
+        if mode == "cloud_only" or self.tier == "cloud":
+            return self._cloud_configured()
+        return local_ok or self._cloud_configured()
+
     def unavailable_reason(self) -> str:
+        local = f"nothing is answering at {settings.local_planner_url} (start llama-server with the Qwen model)"
         p = self.provider
-        if p in ("none", "passthrough", ""):
-            return "No reasoning model chosen."
-        if p == "anthropic":
-            try:
-                import anthropic  # noqa: F401
-            except ImportError:
-                return "The Anthropic SDK isn't installed (pip install anthropic)."
-            return "No Anthropic API key."
-        if p == "openai":
-            return f"Nothing is answering at {settings.openai_base_url}. Is Ollama running?"
-        if p == "gemini":
-            return "No Gemini API key."
-        if p == "cactus":
-            return "cactus-engine isn't installed."
-        return f"Unknown provider '{p}'."
+        if p in ("none", ""):
+            cloud = "no cloud planner chosen"
+        elif p == "anthropic":
+            cloud = "no Anthropic API key or SDK"
+        elif p == "openai":
+            cloud = f"nothing is answering at {settings.openai_base_url or '(no endpoint set)'}"
+        elif p == "gemini":
+            cloud = "no Gemini API key"
+        else:
+            cloud = f"provider '{p}' is not ready"
+        mode = settings.planner_mode
+        if mode == "local_only":
+            return f"Local planner: {local}."
+        if mode == "cloud_only":
+            return f"Cloud planner: {cloud}."
+        return f"Local planner: {local}; cloud planner: {cloud}."
 
     def probe(self) -> Dict[str, Any]:
         """Real connection test (network call). Returns {ok, detail, models}."""
@@ -362,8 +307,6 @@ class System2:
                     return {"ok": False, "detail": f"Model '{settings.gemini_model}' not found."}
                 r.raise_for_status()
                 return {"ok": True, "detail": f"Connected · {settings.gemini_model}"}
-            if p == "cactus":
-                return {"ok": self.available(), "detail": "cactus-engine ready" if self.available() else self.unavailable_reason()}
             return {"ok": False, "detail": self.unavailable_reason()}
         except Exception as e:
             return {"ok": False, "detail": f"{e.__class__.__name__}: {e}"}
@@ -377,34 +320,50 @@ class System2:
         completed: Optional[List[str]] = None,
         failure: Optional[Dict[str, Any]] = None,
         round_no: int = 1,
+        agent: str = DEFAULT_AGENT,
     ) -> System2Result:
         knowledge_meta: Dict[str, Any] = {}
         prompt = build_plan_prompt(goal, screen, completed, failure, self.user_name, round_no,
                                    meta_out=knowledge_meta)
+        system = plan_system(agent)
         if failure:
-            title = "System 2 · re-plan after failure"
+            title = f"System 2 ({agent}) · re-plan after failure"
         elif completed:
-            title = f"System 2 · look at the result, decide what's next (round {round_no})"
+            title = f"System 2 ({agent}) · look at the result, decide what's next (round {round_no})"
         else:
-            title = "System 2 · plan"
-        with self.tracer.span("model", title, tier="system2", provider=self.provider) as sp:
-            res = self._complete(PLAN_SYSTEM, prompt, json_mode=True)
+            title = f"System 2 ({agent}) · plan"
+        with self.tracer.span("model", title, tier="system2", provider=self.provider, agent=agent) as sp:
+            res = self._complete(system, prompt, json_mode=True)
             try:
                 data = _parse_plan(res.raw)
             except (ValueError, json.JSONDecodeError) as e:
-                sp.done("fail", f"Unparsable plan: {e}", prompt=prompt, response=res.raw, reasoning=res.reasoning)
-                raise System2Unavailable(f"System 2 returned an unparsable plan: {e}") from e
+                # One retry on the same tier, told what was wrong, before it counts as a failure.
+                self.tracer.emit("model", "Planner reply was not valid JSON · asking again", str(e),
+                                 tier="system2", status="warn", response=res.raw[:2000])
+                res = self._complete(system, prompt + "\n\nYour previous reply was not a valid JSON object ("
+                                     f"{e}). Reply with ONLY the JSON object.", json_mode=True)
+                try:
+                    data = _parse_plan(res.raw)
+                except (ValueError, json.JSONDecodeError) as e2:
+                    sp.done("fail", f"Unparsable plan: {e2}", prompt=prompt, response=res.raw, reasoning=res.reasoning)
+                    self._unparsable += 1
+                    if self.tier == "local" and self.step_up(f"The local planner returned unusable output twice ({e2})"):
+                        self._unparsable = 0
+                        return self.plan(goal, screen, completed, failure, round_no, agent)
+                    raise System2Unavailable(f"System 2 returned an unparsable plan: {e2}") from e2
+            self._unparsable = 0
             res.thought = str(data.get("thought") or "")
             res.reply = str(data.get("reply") or "")
             res.subtasks = data["subtasks"]
             res.done = bool(data.get("done"))
+            res.next_agent = str(data.get("next_agent") or "").strip().lower()
             sp.done(
                 "ok",
                 res.thought or f"{len(res.subtasks)} subtask(s)",
                 confidence=res.meta.get("confidence"),
                 provider=res.provider, model=res.model, latency_ms=res.latency_ms,
-                system=PLAN_SYSTEM, prompt=prompt, response=res.raw, reasoning=res.reasoning,
-                subtasks=res.subtasks, meta=res.meta, knowledge=knowledge_meta,
+                system=system, prompt=prompt, response=res.raw, reasoning=res.reasoning,
+                subtasks=res.subtasks, meta=res.meta, knowledge=knowledge_meta, agent=agent,
             )
             if res.reasoning:
                 self.tracer.emit("model", "Model reasoning", res.reasoning, tier="system2", reasoning=True)
@@ -427,113 +386,65 @@ class System2:
 
     # -------------------------------------------------------------- providers
 
+    # -------------------------------------------------------------- tiers
+
+    def _cloud_configured(self) -> bool:
+        return self.provider not in ("none", "") and self._provider_available(self.provider)
+
+    def step_up(self, reason: str) -> bool:
+        """Local planner failed: use the cloud planner for the rest of this task.
+
+        Only in local_first mode and only when a cloud planner is configured. Returns
+        whether the tier changed; the step-up is always traced."""
+        if self.tier == "cloud" or settings.planner_mode != "local_first" or not self._cloud_configured():
+            return False
+        self.tier = "cloud"
+        self.step_ups.append(reason)
+        self.tracer.emit("escalate", "Step up · local planner → cloud planner", reason, tier="system2",
+                         status="warn", provider=self.provider)
+        return True
+
+    def reset_tier(self) -> None:
+        """A new task starts on the configured first tier again."""
+        self.tier = "cloud" if settings.planner_mode in ("cloud_first", "cloud_only") else "local"
+        self.step_ups = []
+        self._unparsable = 0
+
     def _complete(self, system: str, user: str, json_mode: bool, max_tokens: int = 16000) -> System2Result:
         t0 = time.perf_counter()
-        if self.provider in ("none", "passthrough"):
-            raise System2Unavailable(
-                f"No System 2 provider configured (SERVO_PLANNER_PROVIDER={self.provider!r}). "
-                "Set it to anthropic, openai (Ollama/any OpenAI-compatible server), gemini or cactus."
-            )
+        try:
+            res = self._complete_on_tier(self.tier, system, user, json_mode, max_tokens)
+        except System2Unavailable as e:
+            if self.tier == "local" and self.step_up(f"Local planner failed: {e}"):
+                res = self._complete_on_tier("cloud", system, user, json_mode, max_tokens)
+            else:
+                raise
+        res.latency_ms = int((time.perf_counter() - t0) * 1000)
+        res.meta["tier"] = self.tier
+        return res
 
-        candidates: List[ProviderCandidate] = []
-
-        # 1. Primary provider candidates (all keys configured for primary provider)
-        if self.provider == "anthropic":
-            keys = parse_api_keys(settings.anthropic_api_key) or [""]
-            for i, k in enumerate(keys):
-                name = f"anthropic[key_{i+1}]" if len(keys) > 1 else "anthropic"
-                candidates.append(ProviderCandidate(
-                    provider="anthropic", api_key=k, model=settings.anthropic_model, name=name
-                ))
-        elif self.provider == "gemini":
-            keys = parse_api_keys(settings.gemini_api_key) or [""]
-            for i, k in enumerate(keys):
-                name = f"gemini[key_{i+1}]" if len(keys) > 1 else "gemini"
-                candidates.append(ProviderCandidate(
-                    provider="gemini", api_key=k, model=settings.gemini_model, name=name
-                ))
-        elif self.provider == "openai":
-            keys = parse_api_keys(settings.openai_api_key) or [""]
-            for i, k in enumerate(keys):
-                name = f"openai[key_{i+1}:{settings.openai_model}]" if len(keys) > 1 else f"openai[{settings.openai_model}]"
-                candidates.append(ProviderCandidate(
-                    provider="openai", api_key=k, model=settings.openai_model, base_url=settings.openai_base_url, name=name
-                ))
-        elif self.provider == "cactus":
-            candidates.append(ProviderCandidate(
-                provider="cactus", model=settings.cactus_engine_model, name="cactus"
-            ))
-
-        # 2. Backup cloud providers if alternative keys are configured
-        if self.provider != "anthropic" and settings.anthropic_api_key:
-            for i, k in enumerate(parse_api_keys(settings.anthropic_api_key)):
-                candidates.append(ProviderCandidate(
-                    provider="anthropic", api_key=k, model=settings.anthropic_model, name=f"anthropic_backup[key_{i+1}]"
-                ))
-        if self.provider != "gemini" and settings.gemini_api_key:
-            for i, k in enumerate(parse_api_keys(settings.gemini_api_key)):
-                candidates.append(ProviderCandidate(
-                    provider="gemini", api_key=k, model=settings.gemini_model, name=f"gemini_backup[key_{i+1}]"
-                ))
-        if self.provider != "openai" and settings.openai_api_key:
-            for i, k in enumerate(parse_api_keys(settings.openai_api_key)):
-                candidates.append(ProviderCandidate(
-                    provider="openai", api_key=k, model=settings.openai_model, base_url=settings.openai_base_url, name=f"openai_backup[key_{i+1}]"
-                ))
-
-        # 3. Default local small model on Ollama (tailored for 4GB VRAM devices)
-        local_model = getattr(settings, "default_local_model", "llama3.2:1b")
-        already_has_local = any(
-            c.provider == "openai" and c.model == local_model and "11434" in c.base_url
-            for c in candidates
-        )
-        if not already_has_local:
-            candidates.append(ProviderCandidate(
-                provider="openai",
-                api_key="",
-                model=local_model,
-                base_url="http://localhost:11434/v1",
-                name=f"local_default[{local_model}]",
-            ))
-
-        if not candidates:
-            raise System2Unavailable(
-                f"No System 2 provider configured (SERVO_PLANNER_PROVIDER={self.provider!r}). "
-                "Set it to anthropic, openai (Ollama/any OpenAI-compatible server), gemini or cactus."
-            )
-
-        errors: List[str] = []
-        for idx, cand in enumerate(candidates):
+    def _complete_on_tier(self, tier: str, system: str, user: str, json_mode: bool, max_tokens: int) -> System2Result:
+        if tier == "local":
             try:
-                if cand.provider == "anthropic":
-                    res = self._anthropic(system, user, max_tokens, api_key=cand.api_key, model=cand.model)
-                elif cand.provider == "openai":
-                    res = self._openai(system, user, json_mode, api_key=cand.api_key, model=cand.model, base_url=cand.base_url)
-                elif cand.provider == "gemini":
-                    res = self._gemini(system, user, json_mode, api_key=cand.api_key, model=cand.model)
-                elif cand.provider == "cactus":
-                    res = self._cactus(system, user)
-                else:
-                    continue
-                res.latency_ms = int((time.perf_counter() - t0) * 1000)
-                return res
-            except Exception as e:
-                err_str = f"{cand.name}: {e}"
-                errors.append(err_str)
-                logger.warning("System 2 candidate %s failed: %s", cand.name, e)
-                if idx < len(candidates) - 1:
-                    next_cand = candidates[idx + 1]
-                    self.tracer.emit(
-                        "model",
-                        f"Failover: {cand.name} failed ({e}); switching to {next_cand.name}...",
-                        tier="system2",
-                        candidate_failed=cand.name,
-                        candidate_next=next_cand.name,
-                    )
-
-        raise System2Unavailable(
-            "All System 2 providers/keys in failover pool failed:\n" + "\n".join(f"- {err}" for err in errors)
-        )
+                return self._openai(system, user, json_mode, api_key="", model=settings.local_planner_model,
+                                    base_url=settings.local_planner_url, timeout=settings.local_planner_timeout_seconds,
+                                    provider_name="local")
+            except System2Unavailable:
+                raise
+            except Exception as e:  # noqa: BLE001
+                raise System2Unavailable(f"Local planner at {settings.local_planner_url} failed: {e}") from e
+        p = self.provider
+        if p in ("none", ""):
+            raise System2Unavailable("No cloud planner configured (SERVO_PLANNER_PROVIDER).")
+        if p == "anthropic":
+            return self._anthropic(system, user, max_tokens)
+        if p == "openai":
+            if not settings.openai_base_url:
+                raise System2Unavailable("The cloud planner has no endpoint (SERVO_OPENAI_BASE_URL).")
+            return self._openai(system, user, json_mode)
+        if p == "gemini":
+            return self._gemini(system, user, json_mode)
+        raise System2Unavailable(f"Unknown planner provider '{p}'.")
 
     def _anthropic(self, system: str, user: str, max_tokens: int, api_key: str = "", model: str = "") -> System2Result:
         try:
@@ -545,15 +456,12 @@ class System2:
         mdl = model or settings.anthropic_model or "claude-opus-5-5"
         try:
             # Streaming keeps long thinking turns clear of HTTP timeouts.
-            with client.beta.messages.stream(
+            with client.messages.stream(
                 model=mdl,
                 max_tokens=max_tokens,
                 system=system,
                 thinking={"type": "adaptive", "display": "summarized"},
                 output_config={"effort": settings.system2_effort},
-                # Server-side refusal fallback re-runs a declined request on a fallback model.
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
                 messages=[{"role": "user", "content": user}],
             ) as stream:
                 msg = stream.get_final_message()
@@ -574,10 +482,13 @@ class System2:
             meta={"stop_reason": msg.stop_reason, "usage": msg.usage.model_dump() if msg.usage else {}},
         )
 
-    def _openai(self, system: str, user: str, json_mode: bool, api_key: str = "", model: str = "", base_url: str = "") -> System2Result:
-        key = api_key if api_key != "" else settings.openai_api_key
-        mdl = model or settings.openai_model or getattr(settings, "default_local_model", "llama3.2:1b")
-        b_url = base_url or settings.openai_base_url or "http://localhost:11434/v1"
+    def _openai(self, system: str, user: str, json_mode: bool, api_key: Optional[str] = None, model: str = "",
+                base_url: str = "", timeout: float = 90.0, provider_name: str = "openai") -> System2Result:
+        key = settings.openai_api_key if api_key is None else api_key
+        mdl = model or settings.openai_model
+        b_url = base_url or settings.openai_base_url
+        if not b_url:
+            raise System2Unavailable("No endpoint configured for this planner.")
         headers = {"Content-Type": "application/json"}
         if key:
             headers["Authorization"] = f"Bearer {key}"
@@ -590,11 +501,8 @@ class System2:
             payload["response_format"] = {"type": "json_object"}
         url = f"{b_url.rstrip('/')}/chat/completions"
         try:
-            with httpx.Client(timeout=90.0) as client:
+            with httpx.Client(timeout=timeout) as client:
                 r = client.post(url, headers=headers, json=payload)
-                if r.status_code == 400 and json_mode:  # server without JSON mode
-                    payload.pop("response_format", None)
-                    r = client.post(url, headers=headers, json=payload)
             r.raise_for_status()
             msg = r.json()["choices"][0]["message"]
         except httpx.HTTPError as e:
@@ -603,7 +511,7 @@ class System2:
             raise System2Unavailable(f"Unexpected response from {b_url}: {e}") from e
         content, think = _split_think(msg.get("content") or "")
         reasoning = msg.get("reasoning_content") or msg.get("reasoning") or think
-        return System2Result(raw=content, reasoning=str(reasoning or ""), provider="openai", model=mdl)
+        return System2Result(raw=content, reasoning=str(reasoning or ""), provider=provider_name, model=mdl)
 
     def _gemini(self, system: str, user: str, json_mode: bool, api_key: str = "", model: str = "") -> System2Result:
         key = api_key or settings.gemini_api_key
@@ -629,35 +537,3 @@ class System2:
         text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
         thoughts = "\n".join(p.get("text", "") for p in parts if p.get("thought"))
         return System2Result(raw=text, reasoning=thoughts, provider="gemini", model=mdl)
-
-    def _cactus(self, system: str, user: str) -> System2Result:
-        try:
-            from cactus import cactus_complete, cactus_init, get_bundle_dir  # type: ignore
-        except Exception as e:
-            raise System2Unavailable(
-                "cactus-engine is not installed (pip install cactus-engine). Note: it cannot be "
-                "installed alongside cactus-compute (Needle/Mirage); both import as 'cactus'."
-            ) from e
-        if self._engine_handle is None:
-            self._engine_handle = cactus_init(str(get_bundle_dir(settings.cactus_engine_model)), None, False)
-        result = cactus_complete(
-            self._engine_handle,
-            json.dumps([{"role": "system", "content": system}, {"role": "user", "content": user}]),
-            json.dumps({"max_tokens": 1024, "temperature": 0.2, "enable_thinking_if_supported": True}),
-            None,
-            None,
-        )
-        if not result.get("success", True):
-            raise System2Unavailable(f"cactus-engine error: {result.get('error')}")
-        content, think = _split_think(result.get("response") or "")
-        return System2Result(
-            raw=content,
-            reasoning=str(result.get("thinking") or think or ""),
-            provider="cactus",
-            model=settings.cactus_engine_model,
-            meta={
-                "confidence": result.get("confidence"),
-                "cloud_handoff": result.get("cloud_handoff"),
-                "decode_tps": result.get("decode_tps"),
-            },
-        )

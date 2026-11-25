@@ -20,7 +20,7 @@
   --needle: #14b8a6;
   --screen: #3b82f6;
   --mirage: #a855f7;
-  --kev: #f59e0b;
+  --laya: #f59e0b;
   --system2: #ec4899;
   --ok: #10b981;
   --fail: #ef4444;
@@ -40,7 +40,7 @@
     --line-subtle: rgba(0, 0, 0, 0.06);
     --ink: #0f172a; --ink-2: #475569; --ink-3: #64748b; --focus: #2563eb;
     --focus-glow: rgba(37, 99, 235, 0.25);
-    --needle: #0d9488; --screen: #2563eb; --mirage: #9333ea; --kev: #d97706; --system2: #db2777;
+    --needle: #0d9488; --screen: #2563eb; --mirage: #9333ea; --laya: #d97706; --system2: #db2777;
     --ok: #059669; --fail: #dc2626; --warn: #d97706; --user: #e2e8f0;
     --shadow: 0 12px 36px rgba(15, 23, 42, 0.12);
     --shadow-sm: 0 2px 8px rgba(15, 23, 42, 0.06);
@@ -171,7 +171,7 @@ body.native .wincontrols { display: flex; }
 .link.lit { background: linear-gradient(90deg, var(--from), var(--to)); }
 .link .gate {
   position: absolute; left: 50%; top: 50%; width: 6px; height: 6px; transform: translate(-50%, -50%) rotate(45deg);
-  background: var(--kev); display: none; box-shadow: 0 0 4px var(--kev);
+  background: var(--laya); display: none; box-shadow: 0 0 4px var(--laya);
 }
 .link.gated .gate { display: block; }
 .r-needle { --c: var(--needle); } .r-screen { --c: var(--screen); } .r-mirage { --c: var(--mirage); } .r-system2 { --c: var(--system2); }
@@ -184,7 +184,7 @@ body.native .wincontrols { display: flex; }
 
 /* Confirmation cards */
 .confirm {
-  margin: 10px 0; border: 1px solid var(--kev); border-radius: var(--radius); padding: 12px; background: var(--surface);
+  margin: 10px 0; border: 1px solid var(--laya); border-radius: var(--radius); padding: 12px; background: var(--surface);
   box-shadow: var(--shadow);
 }
 .confirm h3 { margin: 0 0 4px; font-size: 13.5px; }
@@ -192,7 +192,7 @@ body.native .wincontrols { display: flex; }
 .confirm code { font-family: var(--mono); font-size: 11.5px; background: var(--surface-2); padding: 2px 6px; border-radius: 4px; }
 .confirm .row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 .countdown { height: 3px; background: var(--line); border-radius: 2px; margin-top: 10px; overflow: hidden; }
-.countdown span { display: block; height: 100%; background: var(--kev); transform-origin: left; }
+.countdown span { display: block; height: 100%; background: var(--laya); transform-origin: left; }
 
 .confirm.closed {
   box-shadow: none; border-color: var(--line); padding: 6px 10px; display: flex; gap: 8px; align-items: baseline;
@@ -456,7 +456,7 @@ textarea::placeholder { color: var(--ink-3); }
       <path d="M24.5 14 A10.5 10.5 0 0 1 14 24.5" fill="none" stroke="var(--screen)" stroke-width="2.5" stroke-linecap="round"/>
       <path d="M14 24.5 A10.5 10.5 0 0 1 3.5 14" fill="none" stroke="var(--mirage)" stroke-width="2.5" stroke-linecap="round"/>
       <path d="M3.5 14 A10.5 10.5 0 0 1 14 3.5" fill="none" stroke="var(--system2)" stroke-width="2.5" stroke-linecap="round"/>
-      <circle cx="14" cy="14" r="3" fill="var(--kev)"/>
+      <circle cx="14" cy="14" r="3" fill="var(--laya)"/>
     </svg>
   </div>
   <div class="who">
@@ -556,10 +556,7 @@ textarea::placeholder { color: var(--ink-3); }
   <div class="filter-pills" id="graphFilterPills">
     <button class="pill active" data-filter="all">All (<span id="countAll">0</span>)</button>
     <button class="pill" data-filter="UISurface">Surfaces</button>
-    <button class="pill" data-filter="OSPrimitive">Primitives</button>
-    <button class="pill" data-filter="Bridge">Bridges</button>
     <button class="pill" data-filter="Quirk">Quirks</button>
-    <button class="pill" data-filter="Playbook">Playbooks</button>
     <button class="pill" data-filter="Module">Modules</button>
   </div>
   <div class="graph-visual-box" id="graphVisualBox">
@@ -665,7 +662,7 @@ textarea::placeholder { color: var(--ink-3); }
   let busy = false, currentRun = null, ws = null, retry = 0, setupShownOnce = false, lastCaps = null;
   let cachedGraph = null, activeGraphFilter = "all", selectedNodeId = null;
 
-  const TIER_NAME = { needle: "Needle", uia: "UIA", browser: "Browser", mirage: "Mirage", kev: "Kev", system2: "System 2", system: "Files & shell", router: "Router", copilot: "Servo" };
+  const TIER_NAME = { needle: "Needle", uia: "UIA", browser: "Browser", mirage: "Mirage", laya: "Laya", system2: "System 2", system: "Files & shell", router: "Router", copilot: "Servo" };
   const RUNG_OF = { needle: "needle", uia: "screen", browser: "screen", mirage: "mirage", system2: "system2" };
   const RUNG_ORDER = ["needle", "screen", "mirage", "system2"];
   const RUNG_LABEL = { needle: "Needle", screen: "Screen", mirage: "Mirage", system2: "System 2" };
@@ -796,7 +793,7 @@ textarea::placeholder { color: var(--ink-3); }
         link.className = "link"; link.dataset.from = RUNG_ORDER[i - 1]; link.dataset.to = r;
         link.style.setProperty("--from", `var(${RUNG_VAR[RUNG_ORDER[i - 1]]})`);
         link.style.setProperty("--to", `var(${RUNG_VAR[r]})`);
-        link.innerHTML = '<span class="gate" title="Kev checked this step"></span>';
+        link.innerHTML = '<span class="gate" title="Laya checked this step"></span>';
         ladder.appendChild(link);
       }
       const rung = document.createElement("span");
@@ -821,7 +818,7 @@ textarea::placeholder { color: var(--ink-3); }
 
   function lightRung(run, ev) {
     const r = RUNG_OF[ev.tier];
-    if (ev.tier === "kev") {
+    if (ev.tier === "laya") {
       const last = [...run.used].sort((a, b) => RUNG_ORDER.indexOf(b) - RUNG_ORDER.indexOf(a))[0] || "needle";
       const idx = RUNG_ORDER.indexOf(last);
       const link = run.ladder.querySelectorAll(".link")[Math.max(0, idx - 1)];
@@ -1156,7 +1153,7 @@ textarea::placeholder { color: var(--ink-3); }
       item.className = "graph-item";
       const typeColor = {
         UISurface: "var(--screen)",
-        OSPrimitive: "var(--kev)",
+        OSPrimitive: "var(--laya)",
         Bridge: "var(--needle)",
         Quirk: "var(--system2)",
         Playbook: "var(--mirage)",
@@ -1181,7 +1178,7 @@ textarea::placeholder { color: var(--ink-3); }
     svg.innerHTML = "";
     const w = svg.clientWidth || 360, h = 190;
 
-    const priorityTypes = new Set(["UISurface", "Bridge", "Quirk", "OSPrimitive", "Playbook"]);
+    const priorityTypes = new Set(["UISurface", "Quirk", "Recipe"]);
     const keyNodes = cachedGraph.nodes.filter((n) => priorityTypes.has(n.type)).slice(0, 22);
     if (!keyNodes.length) return;
 
@@ -1218,7 +1215,7 @@ textarea::placeholder { color: var(--ink-3); }
       circle.setAttribute("r", n.type === "Quirk" ? 9 : (n.type === "Bridge" ? 8 : 7));
       const fill = {
         UISurface: "var(--screen)",
-        OSPrimitive: "var(--kev)",
+        OSPrimitive: "var(--laya)",
         Bridge: "var(--needle)",
         Quirk: "var(--system2)",
         Playbook: "var(--mirage)",
@@ -1365,8 +1362,8 @@ textarea::placeholder { color: var(--ink-3); }
     if (!lastCaps) return;
     const l = $("#capList");
     if (!l) return;
-    const rows = [["needle", "Needle 3", "--needle"], ["mirage", "Mirage", "--mirage"], ["kev", "Kev", "--kev"],
-                  ["browser", "Playwright", "--screen"], ["system2", "Reasoning", "--system2"]];
+    const rows = [["needle", "Needle 3", "--needle"], ["mirage", "Mirage", "--mirage"], ["laya", "Laya", "--laya"],
+                  ["browser", "Browser", "--screen"], ["system2", "Reasoning", "--system2"]];
     l.innerHTML = rows.map(([k, name, col]) => {
       const c = lastCaps[k] || {};
       return `

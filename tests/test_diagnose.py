@@ -23,8 +23,9 @@ def graph(tmp_path_factory):
 @pytest.mark.parametrize("error,function", [
     ("Could not bring HWND 66886 to the foreground; refusing to send keystrokes to another window.",
      "ensure_target_in_foreground"),
-    ("System 1 could not interpret this command; rewrite it in the command grammar.", "_run_batch"),
-    ("No UI element found matching target 'Notepad'. Available elements sample: Text editor", "resolve_element"),
+    ("Needle (pointer) found no tool for this step", "propose"),
+    ("the step is not one of the step forms", "propose"),
+    ("No UI element found matching target 'Notepad'. Available elements sample: Text editor", "_resolve_core"),
     ("Typed text is not in the target control. It now reads: “hello”", "evaluate_post_transition"),
 ])
 def test_error_traces_to_the_function_that_raised_it(graph, error, function):
@@ -40,7 +41,7 @@ def _record(error, success=False):
                       {"command": "type", "call": "type_text(text='x', target='Notepad')", "tier": "uia",
                        "success": False, "error": error}],
             "rounds": [{"subtasks": ["open notepad", 'type "x" into Notepad']}],
-            "events": [{"kind": "decision", "tier": "kev", "status": "warn", "title": "Kev pre-check · medium risk",
+            "events": [{"kind": "decision", "tier": "laya", "status": "warn", "title": "Laya pre-check · medium risk",
                         "detail": "Writes a file"}]}
 
 
@@ -48,7 +49,7 @@ def test_diagnosis_names_step_cause_and_code(graph):
     d = dg.diagnose(record=_record("No UI element found matching target 'Notepad'."), graph=graph)
     assert d.status == "failed" and d.failing_step["call"].startswith("type_text")
     assert "accessibility tree" in d.cause
-    assert d.code[0].function == "resolve_element"
+    assert d.code[0].function == "_resolve_core"
     text = d.to_text()
     assert "Failing step" in text and "alias_mapping.py:" in text and "The planner tried" in text
     assert d.gate and "medium risk" in d.gate[0]
@@ -88,7 +89,7 @@ def test_router_answers_why_without_planning(monkeypatch, tmp_path):
             return cm()
         events = []
 
-    r = CascadeRouter(tracer=T(), kev=JevGate(use_fallback=True), memory=None, browser=object())
+    r = CascadeRouter(tracer=T(), laya=JevGate(), memory=None)
     monkeypatch.setattr(r.system2, "available", lambda: False)
     out = r.run("why did that fail?")
-    assert out.route == "diagnose" and "resolve_element" in out.reply
+    assert out.route == "diagnose" and "_resolve_core" in out.reply

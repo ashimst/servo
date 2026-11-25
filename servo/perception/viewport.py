@@ -1,6 +1,5 @@
 """Viewport transforms, DPI v2 coordinate mapping, and HWND client bounds calculation.
 
-See ADR-06 in SERVO_ARCHITECTURE_V1.md.
 """
 
 from __future__ import annotations
@@ -84,13 +83,6 @@ class ViewportTransform:
         norm_x = int(((screen_x - b.client_left) / b.client_width) * 1000)
         norm_y = int(((screen_y - b.client_top) / b.client_height) * 1000)
         return max(0, min(1000, norm_x)), max(0, min(1000, norm_y))
-
-    def norm_to_screen(self, norm_x: int, norm_y: int) -> Tuple[int, int]:
-        """Convert normalized 0-1000 client-relative coordinates to physical screen pixels."""
-        b = self.bounds
-        screen_x = int(b.client_left + (norm_x / 1000.0) * b.client_width)
-        screen_y = int(b.client_top + (norm_y / 1000.0) * b.client_height)
-        return screen_x, screen_y
 
     def bbox_screen_to_norm(self, bbox: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
         """Convert [left, top, right, bottom] screen bbox to normalized 0-1000 bbox."""

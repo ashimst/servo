@@ -105,14 +105,17 @@ class Diagnosis(BaseModel):
 # ------------------------------------------------------------ known patterns
 
 PATTERNS: List[Tuple[str, str, str]] = [
-    (r"could not interpret this command|rewrite it in the command grammar",
-     "System 2 wrote a subtask the command grammar couldn't parse, so System 1 had nothing to run.",
-     "Check the subtask wording against COMMAND_GRAMMAR (servo/cognition/needle.py); if the wording is "
-     "reasonable, extend parse_grammar or the grammar's plausibility checks (_plausible)."),
+    (r"not one of the step forms|could not interpret this step",
+     "The planner wrote a step that isn't one of the step forms, so no Needle agent could run it.",
+     "Compare the step with STEP_FORMS (servo/cognition/specialists.py) and the planner agent's prompt "
+     "(servo/cognition/planners.py)."),
+    (r"doesn't match the step|but Needle called|but Needle's",
+     "Needle's tool call didn't match the step's own words, so check_call refused it.",
+     "See check_call (servo/cognition/needle.py) and the step form's example in specialists.py."),
     (r"no ui element found|ambiguous target|no input field matching",
      "The label System 2 asked for wasn't in the window's accessibility tree (or matched several elements).",
-     "Compare the requested label with the 'Controls' list in the screen description; the planner should "
-     "click a listed label. If the element exists but isn't exposed, Mirage (vision) is the fallback."),
+     "Compare the control with the numbered 'Controls' list in the screen description. If it isn't exposed "
+     "to UIA, the loop tries Windows OCR and then the vision locator; see their trace lines."),
     (r"could not bring hwnd .* foreground|refusing to send keystrokes",
      "Windows refused to bring the target window to the front (foreground lock), so Servo didn't type.",
      "Usually transient: retry. If it repeats, another window is holding focus (a dialog, a fullscreen app)."),
@@ -233,7 +236,7 @@ def diagnose(run_id: str = "", record: Optional[Dict[str, Any]] = None, graph: A
     evidence = " ".join(filter(None, [error, rec.get("reply") or "", *(e.get("detail") or "" for e in fail_events[-3:])]))
     cause, nxt = _pattern(evidence)
     gate = [f"{e.get('title')}: {e.get('detail')}"[:200] for e in events
-            if e.get("tier") == "kev" and e.get("kind") == "decision" and e.get("status") in ("warn", "fail")]
+            if e.get("tier") == "laya" and e.get("kind") == "decision" and e.get("status") in ("warn", "fail")]
     d = Diagnosis(
         run_id=rec.get("run_id", ""), goal=rec.get("goal", ""), status=status, failing_step=failing,
         error=error or "", tier=failing.get("tier", ""), cause=cause, next_step=nxt,

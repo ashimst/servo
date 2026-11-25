@@ -1,21 +1,12 @@
-"""Graphify Knowledge Graph & Persistent Memory Layer for Servo.
+"""Servo's knowledge graph: its own code, Windows UI surfaces, app quirks and recipes.
 
-Provides a structural, compounding knowledge layer for System 2 (Macro-Planner):
-1. AST Parser: Parses Servo's Python codebase (`servo/`) to map modules, classes,
-   functions, and execution paths.
-2. Markdown & Frontmatter Parser: Ingests the Windows interaction ontology
-   (`knowledge/windows/`), playbooks (`knowledge/playbooks/`), and learned quirks
-   (`knowledge/learned_quirks/`).
-3. Graph Index: Compiles entities and typed relationships into `~/.servo/graph.json`.
-4. System 2 Graph Retrieval: Injects high-signal structural context (surfaces,
-   bridges, recovery playbooks, app quirks) into System 2 planning prompts.
-5. Incremental Learning: Appends newly discovered application quirks and recovery
-   heuristics to `knowledge/learned_quirks/` and updates `graph.json`.
-
-ARCHITECTURAL GUARDRAIL:
-Graphify is strictly decoupled from System 1 (UIA, Mirage, Jev, Needle 3).
-The reflex loop remains zero-overhead and sub-second; only System 2 or offline
-processes query or update the graph.
+1. Code: an AST pass over `servo/` maps modules, classes and functions (self-diagnosis
+   uses it to point a failure at the code that produced it).
+2. Knowledge: learned quirks (`knowledge/learned_quirks/`) and recipes
+   (`knowledge/recipes/`), plus the UI surfaces below.
+3. Saved to `~/.servo/graph.json` and drawn in the copilot's Graph tab.
+4. Planner context: quirks of the active app, its UI surface, and recovery advice for the
+   failure that just happened (`format_context_for_prompt`).
 """
 
 from __future__ import annotations
@@ -23,7 +14,6 @@ from __future__ import annotations
 import ast
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,7 +21,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pydantic import BaseModel, Field
 
-from servo.config import settings
 
 logger = logging.getLogger("servo.cognition.graph_memory")
 
@@ -263,78 +252,19 @@ def parse_knowledge_documents(knowledge_root: Path, graph: KnowledgeGraph) -> No
     if not knowledge_root.is_dir():
         return
 
-    # 1. UI Surfaces
-    surfaces_file = knowledge_root / "windows" / "ui_surfaces.md"
-    if surfaces_file.is_file():
-        surfaces = [
-            ("surface_win32", "Win32 Classic Controls", "USER32/GDI deep HWND tree; native UIA proxy support."),
-            ("surface_wpf", "Windows Presentation Foundation (WPF)", "DirectX/XAML tree; VirtualizingStackPanel requires scrolling."),
-            ("surface_electron", "Electron & Chromium Shell", "Chrome_WidgetWin_1; lazy accessibility tree activation; canvas fallback."),
-            ("surface_browser", "Browser Web DOM", "Direct Playwright DOM tree accessibility snapshot."),
-            ("surface_canvas", "Custom Canvas / Direct3D", "Non-accessible pixel surface; strictly requires Mirage OCR + Needle."),
-        ]
-        for sid, name, desc in surfaces:
-            graph.add_node(GraphNode(id=sid, type="UISurface", name=name, description=desc, file_path=str(surfaces_file)))
-        # Semantic fallback edges
-        graph.add_edge(GraphEdge(source="surface_electron", target="surface_canvas", type="falls_back_to"))
-        graph.add_edge(GraphEdge(source="surface_wpf", target="surface_canvas", type="falls_back_to"))
+    # 1. UI surfaces: what kind of accessibility tree an app has.
+    for sid, name, desc in (
+        ("surface_win32", "Win32 Classic Controls", "Native controls with a full UIA tree."),
+        ("surface_wpf", "Windows Presentation Foundation (WPF)",
+         "Long lists are virtualized: items below the fold are not in the tree until scrolled into view."),
+        ("surface_electron", "Electron & Chromium Shell",
+         "The page's accessibility tree is built lazily and can be empty at first; text on screen is read with OCR."),
+        ("surface_browser", "Browser Web Page",
+         "A page in the user's own browser: the accessibility tree Chromium builds from the DOM, then OCR and vision."),
+    ):
+        graph.add_node(GraphNode(id=sid, type="UISurface", name=name, description=desc))
 
-    # 2. OS Primitives
-    primitives_file = knowledge_root / "windows" / "os_primitives.md"
-    if primitives_file.is_file():
-        primitives = [
-            ("primitive_hwnd_focus", "HWND Focus & Z-Order", "AttachThreadInput and SW_RESTORE rules for foreground activation."),
-            ("primitive_uac", "User Account Control (UAC)", "Secure Desktop isolation; non-interactive boundary; alerts user."),
-            ("primitive_file_dialogs", "Common File Dialogs", "Direct path typing into Edit1/ComboBox to avoid UI click latency."),
-            ("primitive_system_tray", "System Tray & Notification Area", "Shell_TrayWnd and NotifyIconOverflowWindow interactions."),
-            ("primitive_clipboard", "Windows Global Clipboard", "Exclusive lock contention with retry backoff."),
-        ]
-        for pid, name, desc in primitives:
-            graph.add_node(GraphNode(id=pid, type="OSPrimitive", name=name, description=desc, file_path=str(primitives_file)))
-
-    # 3. Servo-to-Windows Bridges
-    bridges_file = knowledge_root / "windows" / "servo_bridges.md"
-    if bridges_file.is_file():
-        bridges = [
-            ("bridge_uia_sensor", "UIA Sensor", "servo.perception.uia_sensor for COM-based accessible tree navigation.", "mod:servo.perception.uia_sensor"),
-            ("bridge_mirage_sensor", "Mirage Sensor", "servo.perception.mirage_sensor for visual OCR and neural perception.", "mod:servo.perception.mirage_sensor"),
-            ("bridge_browser", "Browser Tier", "servo.cognition.browser for Playwright DOM tree automation.", "mod:servo.cognition.browser"),
-            ("bridge_trajectory", "Trajectory Generator", "servo.actuation.trajectory for continuous Bezier mouse/keyboard input.", "mod:servo.actuation.trajectory"),
-            ("bridge_watchdog", "Settling & Watchdog", "servo.perception.watchdog and settling for window stability.", "mod:servo.perception.watchdog"),
-            ("bridge_system_tools", "System Tools", "servo.actuation.system_tools for direct headless file and shell execution.", "mod:servo.actuation.system_tools"),
-            ("bridge_jev_gate", "Kev Gate", "servo.control.jev_gate for pre/post-action safety checks.", "mod:servo.control.jev_gate"),
-        ]
-        for bid, name, desc, mod_ref in bridges:
-            graph.add_node(GraphNode(id=bid, type="Bridge", name=name, description=desc, file_path=str(bridges_file)))
-            graph.add_edge(GraphEdge(source=bid, target=mod_ref, type="implements"))
-
-        # Link Primitives and Surfaces to Bridges
-        graph.add_edge(GraphEdge(source="surface_win32", target="bridge_uia_sensor", type="bridges_to"))
-        graph.add_edge(GraphEdge(source="surface_wpf", target="bridge_uia_sensor", type="bridges_to"))
-        graph.add_edge(GraphEdge(source="surface_browser", target="bridge_browser", type="bridges_to"))
-        graph.add_edge(GraphEdge(source="surface_canvas", target="bridge_mirage_sensor", type="bridges_to"))
-        graph.add_edge(GraphEdge(source="primitive_hwnd_focus", target="bridge_watchdog", type="bridges_to"))
-        graph.add_edge(GraphEdge(source="primitive_uac", target="bridge_jev_gate", type="bridges_to"))
-
-    # 4. Playbooks
-    playbook_dir = knowledge_root / "playbooks"
-    if playbook_dir.is_dir():
-        for pb_file in playbook_dir.glob("*.md"):
-            pb_id = f"playbook_{pb_file.stem}"
-            content = pb_file.read_text(encoding="utf-8")
-            title = pb_file.stem.replace("_", " ").title()
-            first_line = [l.strip("# ").strip() for l in content.splitlines() if l.startswith("#")]
-            if first_line:
-                title = first_line[0]
-            graph.add_node(GraphNode(
-                id=pb_id,
-                type="Playbook",
-                name=title,
-                description=f"Behavioral guide: {title}",
-                file_path=str(pb_file),
-            ))
-
-    # 5. Learned Quirks
+    # 2. Learned quirks
     quirks_dir = knowledge_root / "learned_quirks"
     if quirks_dir.is_dir():
         for q_file in quirks_dir.glob("*.md"):
@@ -537,10 +467,6 @@ class GraphMemory:
         if surf_node in self.graph.nodes:
             node = self.graph.nodes[surf_node]
             line = f"Active app's UI surface: {node.name}: {node.description}"
-            kind = str((failure or {}).get("kind") or "")
-            fallbacks = [n for edge, n in self.graph.get_neighbors(surf_node) if edge.type == "falls_back_to"]
-            if kind == "perception" and fallbacks:
-                line += f" If labels are missing, System 1 falls back to {fallbacks[0].name}."
             sections.append(line)
 
         # 3. Recovery advice for the failure that just happened
@@ -551,75 +477,6 @@ class GraphMemory:
         if not sections:
             return ""
         return "\n".join(["[Knowledge Graph Context]", *sections])
-
-    # -------------------------------------------------- Compounding Learning
-
-    def record_learned_quirk(
-        self,
-        quirk_id: str,
-        title: str,
-        app: str,
-        surface: str,
-        symptom: str,
-        root_cause: str,
-        mitigation: str,
-        tags: Optional[List[str]] = None,
-        markdown_body: str = "",
-    ) -> Path:
-        """Write a new quirk markdown document to knowledge/learned_quirks/ and link it into graph.json."""
-        tags = tags or [app.lower(), surface.lower()]
-        quirks_dir = self.knowledge_dir / "learned_quirks"
-        quirks_dir.mkdir(parents=True, exist_ok=True)
-        file_path = quirks_dir / f"{quirk_id}.md"
-
-        frontmatter = [
-            "---",
-            f"id: {quirk_id}",
-            f"title: {title}",
-            f"app: {app}",
-            f"surface: {surface}",
-            f"symptom: {symptom}",
-            f"root_cause: {root_cause}",
-            f"mitigation: {mitigation}",
-            f"tags: [{', '.join(tags)}]",
-            f"related_nodes: [surface_{surface.lower()}]",
-            "---",
-            "",
-            f"## Description",
-            markdown_body or symptom,
-            "",
-            f"## Mitigation Playbook",
-            mitigation,
-            "",
-        ]
-        file_path.write_text("\n".join(frontmatter), encoding="utf-8")
-
-        # Ingest directly into active graph
-        node = GraphNode(
-            id=quirk_id,
-            type="Quirk",
-            name=title,
-            description=mitigation,
-            tags=tags,
-            file_path=str(file_path),
-            attributes={
-                "app": app,
-                "surface": surface,
-                "symptom": symptom,
-                "root_cause": root_cause,
-                "mitigation": mitigation,
-                "body": markdown_body,
-            },
-        )
-        self.graph.add_node(node)
-        self.graph.add_edge(GraphEdge(source=quirk_id, target=f"app:{app}", type="applies_to_app"))
-        surf_node = f"surface_{surface.lower()}"
-        if surf_node in self.graph.nodes:
-            self.graph.add_edge(GraphEdge(source=quirk_id, target=surf_node, type="applies_to_surface"))
-
-        self.save()
-        logger.info("Recorded new learned quirk [%s] and updated graph.json", quirk_id)
-        return file_path
 
     # --------------------------------------------------- Consistency Auditor
 
@@ -651,59 +508,6 @@ class GraphMemory:
                 "status": "pass",
                 "message": f"All {len(self.graph.edges)} edges resolve to valid graph nodes.",
                 "details": [],
-            })
-
-        # Check 2: Surface Fallback Completeness
-        total_checks += 1
-        surface_nodes = [n for n in self.graph.nodes.values() if n.type == "UISurface"]
-        missing_fallbacks = []
-        for s in surface_nodes:
-            neighbors = self.graph.get_neighbors(s.id)
-            has_bridge = any(e.type in ("bridges_to", "falls_back_to") for e, _ in neighbors)
-            if not has_bridge:
-                missing_fallbacks.append(f"Surface {s.id} ({s.name}) has no bridge or fallback link.")
-        if missing_fallbacks:
-            checks.append({
-                "id": "surface_fallbacks",
-                "name": "UI Surface Fallback Completeness",
-                "status": "warn",
-                "message": f"{len(missing_fallbacks)} surface(s) lack explicit sensor bridges.",
-                "details": missing_fallbacks,
-            })
-            issues_count += 1
-        else:
-            checks.append({
-                "id": "surface_fallbacks",
-                "name": "UI Surface Fallback Completeness",
-                "status": "pass",
-                "message": f"All {len(surface_nodes)} Windows UI surfaces have grounded sensor bridges and fallbacks.",
-                "details": [s.name for s in surface_nodes],
-            })
-
-        # Check 3: Bridge Implementation Grounding
-        total_checks += 1
-        bridge_nodes = [n for n in self.graph.nodes.values() if n.type == "Bridge"]
-        unimplemented_bridges = []
-        for b in bridge_nodes:
-            impl = [n for edge, n in self.graph.get_neighbors(b.id) if edge.type == "implements"]
-            if not impl:
-                unimplemented_bridges.append(f"Bridge {b.id} ({b.name}) has no implementing module node.")
-        if unimplemented_bridges:
-            checks.append({
-                "id": "bridge_grounding",
-                "name": "Servo-to-Windows Bridge Grounding",
-                "status": "warn",
-                "message": f"{len(unimplemented_bridges)} bridge(s) lack module mapping.",
-                "details": unimplemented_bridges,
-            })
-            issues_count += 1
-        else:
-            checks.append({
-                "id": "bridge_grounding",
-                "name": "Servo-to-Windows Bridge Grounding",
-                "status": "pass",
-                "message": f"All {len(bridge_nodes)} Servo subsystem bridges map to concrete Python modules.",
-                "details": [b.name for b in bridge_nodes],
             })
 
         # Check 4: Learned Quirks Schema & Grounding
@@ -760,19 +564,9 @@ class GraphMemory:
                 "id": "system1_decoupling",
                 "name": "System 1 Reflex Loop Decoupling Guardrail",
                 "status": "pass",
-                "message": "System 1 (UIA, Mirage, Needle, loop) is 100% decoupled from Graphify (0ms reflex overhead).",
+                "message": "None of the step-execution modules (UIA, Mirage, Needle, loop) import graph memory.",
                 "details": [f.name for f in reflex_files],
             })
-
-        # Check 6: Safety Rules Hardcoded Floor
-        total_checks += 1
-        checks.append({
-            "id": "safety_floor",
-            "name": "Hardcoded Safety & Risk Floor Enforcement",
-            "status": "pass",
-            "message": "Hard safety boundaries (Kev Gate, UAC alerts, harness sandbox) are verified hardcoded in code.",
-            "details": ["servo.control.jev_gate.JevGate", "servo.actuation.sandboxing", "servo.cognition.router"],
-        })
 
         score = max(0, int(((total_checks - issues_count) / total_checks) * 100))
         status = "healthy" if score >= 90 else ("warning" if score >= 70 else "error")
@@ -802,11 +596,12 @@ def _surface_for_app(app: str) -> str:
 
 
 _RECOVERY = {
-    "perception": "the label wasn't on screen. Pick a label that the screen description actually lists "
-                  "(shorter or partial labels work), or scroll/open the menu that contains it first.",
+    "perception": "the control wasn't found on screen. Use a control number from the CURRENT screen "
+                  "description, or scroll / open the menu that contains it first.",
     "verify": "the action ran but the expected change wasn't seen. Look at the screen: it may have worked, "
               "or a dialog may be in the way. Don't repeat the same command blindly.",
-    "reasoning": "System 1 couldn't interpret the command. Rewrite it strictly in the command grammar.",
+    "reasoning": "the step was not one of the step forms, or its tool call didn't match it. Rewrite it in "
+                 "exactly one of the step forms.",
     "policy": "the user declined or the action was refused. Don't retry it; explain or ask in reply.",
     "error": "the step errored. Read the error text, change the approach, and stop after two failed approaches.",
 }

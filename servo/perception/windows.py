@@ -150,3 +150,16 @@ def list_windows() -> List[Dict[str, object]]:
 
     _user32.EnumWindows(_callback, 0)
     return results
+
+
+def find_by_title(title: str) -> int:
+    """The window whose title is ``title`` (exact, then a unique case-insensitive substring).
+    Raises ValueError naming the candidates when there is no match or several."""
+    want = " ".join(title.split()).lower()
+    wins = list_windows()
+    exact = [w for w in wins if " ".join(str(w["title"]).split()).lower() == want]
+    hits = exact or [w for w in wins if want in str(w["title"]).lower()]
+    if len(hits) == 1:
+        return int(hits[0]["hwnd"])  # type: ignore[arg-type]
+    names = "; ".join(str(w["title"]) for w in (hits or wins)[:12])
+    raise ValueError(f"{'Several windows match' if hits else 'No window matches'} “{title}”: {names}")

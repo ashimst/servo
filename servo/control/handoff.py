@@ -1,6 +1,5 @@
 """System 1 and System 2 Handoff Architecture for Servo.
 
-See Section 5.4 in SERVO_ARCHITECTURE_V1.md and SERVO_ARCHITECTURE_V3.md.
 Coordinates the high-frequency reflex arc (System 1) with the macro setpoint
 planner (System 2), managing alias resolution, app lifecycle, safety gating,
 settling verification, and real-time execution telemetry.
@@ -12,35 +11,26 @@ import logging
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel
 
 from servo.actuation.alias_mapping import (
     AliasMapper,
-    CanonicalAction,
     CanonicalActionType,
 )
 from servo.control.confirmation import ConfirmationCallback
 from servo.cognition.trace import NullTracer, Tracer
-from servo.control.loop import ExecutionResult, ServoControlLoop
+from servo.control.loop import ServoControlLoop
 from servo.perception import windows
-from servo.perception.scene_index import SceneIndex
-from servo.perception.uia_sensor import UIASensor
-from servo.planner.tool_calling import (
+from servo.cognition.plan import (
     MacroPlan,
-    PlanStep,
-    SYSTEM_PROMPT_TEMPLATE,
-    build_tool_planning_prompt,
-    parse_llm_tool_plan,
 )
 
 logger = logging.getLogger("servo.control.handoff")
 
 
-def _to_str_or_none(val: Any) -> Optional[str]:
-    if val is None or hasattr(val, "_mock_name") or hasattr(val, "return_value"):
-        return None
-    return str(val) if not isinstance(val, str) else val
+def _text(val: Any) -> Optional[str]:
+    return None if val is None else str(val)
 
 
 def _fresh_notepad_tab(hwnd: int) -> bool:
@@ -94,10 +84,6 @@ class PlanExecutionSummary(BaseModel):
 
 
 # Event callback types for streaming execution UI
-OnPlanStartFn = Callable[[MacroPlan], None]
-OnStepStartFn = Callable[[PlanStep], None]
-OnStepProgressFn = Callable[[PlanStep, StepExecutionReport], None]
-OnPlanCompleteFn = Callable[[PlanExecutionSummary], None]
 
 
 class SystemHandoffCoordinator:
@@ -110,10 +96,6 @@ class SystemHandoffCoordinator:
         confirmation_callback: Optional[ConfirmationCallback] = None,
         should_abort: Optional[Union[Callable[[], bool], threading.Event]] = None,
         mode: Optional[Literal["assistant", "harness"]] = None,
-        on_plan_start: Optional[OnPlanStartFn] = None,
-        on_step_start: Optional[OnStepStartFn] = None,
-        on_step_progress: Optional[OnStepProgressFn] = None,
-        on_plan_complete: Optional[OnPlanCompleteFn] = None,
         tracer: Optional[Tracer] = None,
         exclude_hwnds: Optional[Callable[[], set]] = None,
     ) -> None:
@@ -132,38 +114,6 @@ class SystemHandoffCoordinator:
         else:
             self.should_abort = should_abort
         self.mode = mode
-        self.on_plan_start = on_plan_start
-        self.on_step_start = on_step_start
-        self.on_step_progress = on_step_progress
-        self.on_plan_complete = on_plan_complete
-
-    def _emit_plan_start(self, plan: MacroPlan) -> None:
-        if self.on_plan_start:
-            try:
-                self.on_plan_start(plan)
-            except Exception as e:
-                logger.warning("Error in on_plan_start callback: %s", e)
-
-    def _emit_step_start(self, step: PlanStep) -> None:
-        if self.on_step_start:
-            try:
-                self.on_step_start(step)
-            except Exception as e:
-                logger.warning("Error in on_step_start callback: %s", e)
-
-    def _emit_step_progress(self, step: PlanStep, report: StepExecutionReport) -> None:
-        if self.on_step_progress:
-            try:
-                self.on_step_progress(step, report)
-            except Exception as e:
-                logger.warning("Error in on_step_progress callback: %s", e)
-
-    def _emit_plan_complete(self, summary: PlanExecutionSummary) -> None:
-        if self.on_plan_complete:
-            try:
-                self.on_plan_complete(summary)
-            except Exception as e:
-                logger.warning("Error in on_plan_complete callback: %s", e)
 
     def execute_plan(
         self,
@@ -176,7 +126,6 @@ class SystemHandoffCoordinator:
         overall_success = True
         plan_aborted = False
 
-        self._emit_plan_start(plan)
 
         current_hwnd = self.target_hwnd
         current_title = (
@@ -203,10 +152,8 @@ class SystemHandoffCoordinator:
                     error="Execution cancelled by user or caller timeout.",
                 )
                 reports.append(rep)
-                self._emit_step_progress(step, rep)
                 break
 
-            self._emit_step_start(step)
 
             # Ensure we have a CanonicalAction for this step
             action = step.canonical_action
@@ -226,7 +173,6 @@ class SystemHandoffCoordinator:
                     )
                     reports.append(rep)
                     overall_success = False
-                    self._emit_step_progress(step, rep)
                     break
 
             # 1. Handle Application Launching / Switching
@@ -272,7 +218,6 @@ class SystemHandoffCoordinator:
                     overall_success = False
 
                 reports.append(rep)
-                self._emit_step_progress(step, rep)
                 if not rep.success:
                     break
                 continue
@@ -297,7 +242,6 @@ class SystemHandoffCoordinator:
                             verification="failed",
                         )
                     reports.append(rep)
-                    self._emit_step_progress(step, rep)
                     if not rep.success:
                         overall_success = False
                         break
@@ -361,7 +305,6 @@ class SystemHandoffCoordinator:
                         note=f"No open window matched '{app_target}', so nothing was closed.",
                     )
                 reports.append(rep)
-                self._emit_step_progress(step, rep)
                 continue
 
             # 3. Handle System 1 Control Loop (Clicks, Typing, Hotkeys, Invoke, Scroll, Wait)
@@ -396,7 +339,6 @@ class SystemHandoffCoordinator:
                         error="Execution cancelled by user or caller timeout." if aborted else None,
                     )
                     reports.append(rep)
-                    self._emit_step_progress(step, rep)
                     if aborted:
                         plan_aborted = True
                         overall_success = False
@@ -414,7 +356,6 @@ class SystemHandoffCoordinator:
                     )
                     reports.append(rep)
                     overall_success = False
-                    self._emit_step_progress(step, rep)
                     break
 
             # Bring target window to foreground
@@ -500,6 +441,19 @@ class SystemHandoffCoordinator:
                     expected_outcome=f"Scrolled {direction}",
                 )
 
+            elif action.action_type in (CanonicalActionType.SET_TOGGLE, CanonicalActionType.SET_EXPANDED,
+                                        CanonicalActionType.SELECT_OPTION, CanonicalActionType.SET_VALUE):
+                what = action.state or action.text
+                res = loop.execute_subgoal(
+                    step_index=step.step_index,
+                    sub_goal=step.rationale or f"{action.action_type.value} '{action.target}' → {what}",
+                    target_label_hint=action.target or "",
+                    action_type=action.action_type.value,
+                    text_to_type=action.text,
+                    state=action.state,
+                    expected_outcome=f"{action.target} → {what}",
+                )
+
             elif action.action_type == CanonicalActionType.WAIT:
                 wait_sec = action.duration_seconds or 0.5
                 res = loop.execute_subgoal(
@@ -526,7 +480,7 @@ class SystemHandoffCoordinator:
             step_latency = log_latency if isinstance(log_latency, int) else int((time.perf_counter() - step_t0) * 1000)
 
             raw_err = getattr(step_log, "error", None) if step_log else None
-            err_str = _to_str_or_none(raw_err)
+            err_str = _text(raw_err)
             is_aborted = (
                 bool(err_str and "cancelled" in err_str.lower())
                 or bool(self.should_abort and self.should_abort())
@@ -546,15 +500,14 @@ class SystemHandoffCoordinator:
                 latency_ms=step_latency,
                 error=err_str if not res.success else None,
                 attempts_used=attempts_int,
-                perception_source=_to_str_or_none(getattr(step_log, "perception_source", None)),
-                jev_risk=_to_str_or_none(getattr(step_log, "jev_pre_risk", None)),
-                confirmation=_to_str_or_none(getattr(step_log, "confirmation", None)),
-                verification=(_to_str_or_none(getattr(step_log, "verification", None)) or
+                perception_source=_text(getattr(step_log, "perception_source", None)),
+                jev_risk=_text(getattr(step_log, "jev_pre_risk", None)),
+                confirmation=_text(getattr(step_log, "confirmation", None)),
+                verification=(_text(getattr(step_log, "verification", None)) or
                               ("confirmed" if res.success else "failed")),
-                note=_to_str_or_none(getattr(step_log, "note", None)),
+                note=_text(getattr(step_log, "note", None)),
             )
             reports.append(rep)
-            self._emit_step_progress(step, rep)
 
             if not res.success:
                 overall_success = False
@@ -573,5 +526,4 @@ class SystemHandoffCoordinator:
             aborted=plan_aborted,
         )
 
-        self._emit_plan_complete(summary)
         return summary

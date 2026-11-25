@@ -50,11 +50,6 @@ def test_coordinate_normalization():
     assert norm_x == 500
     assert norm_y == 500
 
-    # Roundtrip conversion
-    sx, sy = vt.norm_to_screen(500, 500)
-    assert sx == 500
-    assert sy == 500
-
     # Bbox conversion
     norm_bbox = vt.bbox_screen_to_norm((100, 200, 300, 400))
     assert norm_bbox == (100, 200, 300, 400)

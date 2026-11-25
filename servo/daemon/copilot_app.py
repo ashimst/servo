@@ -27,7 +27,6 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from servo import __version__
-from servo.cognition import browser as browser_mod
 from servo.cognition import cactus_runtime
 from servo.cognition.router import CascadeRouter, RunOutcome, new_run_id
 from servo.cognition.system2 import System2, list_openai_models
@@ -110,6 +109,10 @@ class CopilotSession:
         self._lock = threading.Lock()
         self._listeners: List[Callable[[Dict[str, Any]], None]] = []
         self._confirms: Dict[str, Dict[str, Any]] = {}
+        # MCP callers: what each control number in their last screen() meant, and runs
+        # they are waiting on (run_id -> {"event", "outcome"}).
+        self.mcp_numbered: Dict[int, Dict[str, Any]] = {}
+        self._waiters: Dict[str, Dict[str, Any]] = {}
         self.step_mode = False
         self.tracker = ForegroundTracker(self.is_own_window)
         self._unsub = bus.subscribe(self._on_trace)
@@ -171,7 +174,7 @@ class CopilotSession:
 
     def capabilities(self) -> Dict[str, Any]:
         cactus = cactus_runtime.status()
-        kev = JevGate()
+        laya = JevGate()
         s2 = System2(user_name=self.brain.user_name).describe()
 
         def cactus_detail(key: str, label: str) -> str:
@@ -183,15 +186,13 @@ class CopilotSession:
                 return f"installed cactus package has no {label} (need cactus-compute >= 3.3)"
             return f"cactus-compute {cactus.get('version') or ''}".strip()
 
-        mirage_avail = bool(cactus.get("mirage")) or bool(cactus.get("windows_ocr"))
-        mirage_detail = "cactus-compute (Mirage)" if cactus.get("mirage") else ("Windows Media OCR (Native WinRT)" if cactus.get("windows_ocr") else cactus_detail("mirage", "Mirage"))
-
         return {
             "needle": {"available": bool(cactus.get("needle")), "detail": cactus_detail("needle", "Needle"),
                        "threshold": settings.needle_confidence_threshold},
-            "mirage": {"available": mirage_avail, "detail": mirage_detail},
-            "kev": {"available": kev.model_enabled, "detail": settings.kev_url or "heuristic gate (set SERVO_KEV_URL)"},
-            "browser": {"available": browser_mod.playwright_installed(), "detail": f"Playwright · {settings.browser_channel}"},
+            "mirage": {"available": bool(cactus.get("mirage")), "detail": cactus_detail("mirage", "Mirage")},
+            "laya": {"available": laya.model_enabled, "detail": settings.laya_url or "not configured (set SERVO_LAYA_URL)"},
+            "browser": {"available": True, "detail": f"your browser · {settings.preferred_browser or 'Windows default'}"},
+            "vision": {"available": bool(settings.locator_url), "detail": f"Qwen3.5-4B vision · {settings.locator_url}"},
             "system2": {"available": s2["available"], "detail": f"{s2['provider']} · {s2['model']}".strip(" ·")},
         }
 
@@ -261,7 +262,7 @@ class CopilotSession:
     def _notice(self, reply: str) -> None:
         self.broadcast({"type": "notice", "text": "", "reply": reply})
 
-    def send(self, text: str) -> str:
+    def send(self, text: str, kind: str = "goal", waiter: Optional[Dict[str, Any]] = None) -> str:
         text = text.strip()
         if not text:
             raise ValueError("Type a request first.")
@@ -275,10 +276,64 @@ class CopilotSession:
         # The router records both turns (redacted, with route); recording here too saved
         # every turn twice and fed duplicates to System 2.
         self.broadcast({"type": "run_started", "run_id": run_id, "text": text})
-        threading.Thread(target=self._run, args=(run_id, text), name=f"servo-run-{run_id}", daemon=True).start()
+        if waiter is not None:
+            self._waiters[run_id] = waiter   # before the thread starts, so a fast finish is not missed
+        threading.Thread(target=self._run, args=(run_id, text, kind), name=f"servo-run-{run_id}",
+                         daemon=True).start()
         return run_id
 
-    def _run(self, run_id: str, text: str) -> None:
+    def _new_router(self, tracer: Any) -> Any:
+        return self.router_factory(
+            tracer=tracer,
+            user_name=self.brain.user_name,
+            brain=self.brain,
+            should_abort=self.abort,
+            confirmation_callback=self._confirm,
+            ask=self.ask,
+            step_mode=self.step_mode,
+            app_launcher=self.launcher,
+            target_hwnd=self.target_hwnd if self.target_hwnd and windows.is_window(self.target_hwnd) else self.tracker.last_hwnd,
+            exclude_hwnds=self.own_hwnds,
+            history=list(self.history),
+            context=self.context,
+        )
+
+    # ------------------------------------------------------------- MCP callers
+
+    def run_for_mcp(self, kind: str, text: str, hwnd: Optional[int], timeout: float) -> Dict[str, Any]:
+        """Run an MCP caller's goal ("goal") or step ("step") like a typed request: it waits
+        for the copilot to be free, shows live with its trace, and risky actions ask the user."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                free = not self.busy
+            if free:
+                if hwnd:
+                    self.target_hwnd = hwnd
+                slot: Dict[str, Any] = {"event": threading.Event(), "outcome": None}
+                try:
+                    run_id = self.send(text, kind=kind, waiter=slot)
+                except RuntimeError:   # lost a race with a run that just started
+                    continue
+                break
+            if time.monotonic() > deadline:
+                return {"success": False, "reply": "The copilot is busy with another request; try again."}
+            time.sleep(0.3)
+        if not slot["event"].wait(max(1.0, deadline - time.monotonic())):
+            return {"success": False, "run_id": run_id, "reply": "Still running in the copilot; check it there."}
+        self._waiters.pop(run_id, None)
+        return slot["outcome"] or {"success": False, "run_id": run_id, "reply": "The run crashed; see its trace."}
+
+    def screen_for_mcp(self, hwnd: Optional[int]) -> str:
+        from servo.cognition.trace import NullTracer
+        from servo.daemon.discovery import com_thread
+        if hwnd:
+            self.target_hwnd = hwnd
+        with com_thread():
+            text, self.mcp_numbered = self._new_router(NullTracer()).screen()
+        return text
+
+    def _run(self, run_id: str, text: str, kind: str = "goal") -> None:
         com = False
         if sys.platform == "win32":
             try:
@@ -291,22 +346,9 @@ class CopilotSession:
         outcome: Optional[RunOutcome] = None
         try:
             self.tracker.observe()
-            router = self.router_factory(
-                tracer=tracer,
-                user_name=self.brain.user_name,
-                brain=self.brain,
-                should_abort=self.abort,
-                confirmation_callback=self._confirm,
-                ask=self.ask,
-                step_mode=self.step_mode,
-                app_launcher=self.launcher,
-                target_hwnd=self.target_hwnd if self.target_hwnd and windows.is_window(self.target_hwnd) else self.tracker.last_hwnd,
-                exclude_hwnds=self.own_hwnds,
-                history=list(self.history),
-                context=self.context,
-            )
+            router = self._new_router(tracer)
             self._active_router = router
-            outcome = router.run(text)
+            outcome = router.run_step(text, self.mcp_numbered) if kind == "step" else router.run(text)
             self.target_hwnd = getattr(router, "hwnd", None) or self.target_hwnd
             self.context = getattr(router, "context", self.context)
             self.brain.active_hwnd = self.target_hwnd
@@ -325,6 +367,10 @@ class CopilotSession:
                 c["event"].set()
             self.broadcast({"type": "run_finished", "run_id": run_id,
                             "outcome": outcome.model_dump() if outcome else None, "state": self.state()})
+            waiter = self._waiters.get(run_id)
+            if waiter is not None:
+                waiter["outcome"] = outcome.model_dump() if outcome else None
+                waiter["event"].set()
             if com:
                 try:
                     import pythoncom  # type: ignore
@@ -427,11 +473,11 @@ class ConfigBody(BaseModel):
     model: Optional[str] = None
     api_key: Optional[str] = None   # None = keep the saved key; "" = remove it
     base_url: Optional[str] = None
-    kev_url: Optional[str] = None
+    laya_url: Optional[str] = None
 
 
 PROVIDER_LABELS = {"anthropic": "Claude", "openai": "Ollama / OpenAI-compatible", "gemini": "Gemini",
-                   "cactus": "Cactus (on-device)", "none": "Off"}
+                   "none": "Off"}
 
 
 def provider_label(p: str) -> str:
@@ -456,8 +502,8 @@ def config_updates(body: ConfigBody) -> Dict[str, Any]:
     elif p == "gemini":
         up["gemini_model"] = model or settings.gemini_model
         up["gemini_api_key"] = body.api_key
-    if body.kev_url is not None:
-        up["kev_url"] = body.kev_url.strip()
+    if body.laya_url is not None:
+        up["laya_url"] = body.laya_url.strip()
     return up
 
 
@@ -473,7 +519,7 @@ def config_view() -> Dict[str, Any]:
                    "key": user_settings.key_hint(settings.openai_api_key)},
         "gemini": {"model": settings.gemini_model, "key": user_settings.key_hint(settings.gemini_api_key)},
         "ollama": {"running": ollama_models is not None, "models": ollama_models or []},
-        "kev_url": settings.kev_url,
+        "laya_url": settings.laya_url,
     }
 
 
@@ -485,6 +531,12 @@ def _has_module(name: str) -> bool:
 class AnswerBody(BaseModel):
     id: str
     choice: str
+
+
+class McpBody(BaseModel):
+    text: str = ""
+    window: Optional[str] = None
+    timeout: float = 600.0
 
 
 class StepModeBody(BaseModel):
@@ -714,6 +766,31 @@ def create_app(session: CopilotSession) -> FastAPI:
             router.step_mode = body.on   # also applies to the run in progress
         return {"step_mode": session.step_mode}
 
+    # ---- MCP callers (servo --mcp forwards here while the copilot runs) ----
+
+    def _mcp_hwnd(window: Optional[str]) -> Optional[int]:
+        if not window:
+            return None
+        try:
+            return windows.find_by_title(window)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.post("/api/mcp/do")
+    def mcp_do(body: McpBody, x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        return session.run_for_mcp("goal", body.text, _mcp_hwnd(body.window), body.timeout)
+
+    @app.post("/api/mcp/step")
+    def mcp_step(body: McpBody, x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        return session.run_for_mcp("step", body.text, _mcp_hwnd(body.window), body.timeout)
+
+    @app.post("/api/mcp/screen")
+    def mcp_screen(body: McpBody, x_servo_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        check(x_servo_token)
+        return {"screen": session.screen_for_mcp(_mcp_hwnd(body.window))}
+
     @app.websocket("/ws")
     async def ws(socket: WebSocket) -> None:
         token = socket.query_params.get("token")
@@ -861,9 +938,8 @@ def _free_port(preferred: int) -> int:
 
 
 def run_copilot(open_window: bool = True, port: Optional[int] = None) -> None:
-    from servo.daemon.worker import worker
+    from servo.daemon import discovery
 
-    worker.start()
     session = CopilotSession()
     session.tracker.start()
     session.scheduler.start()
@@ -872,6 +948,7 @@ def run_copilot(open_window: bool = True, port: Optional[int] = None) -> None:
     server = _start_server(app, port)
     url = f"http://127.0.0.1:{port}/"
     print(f"Servo Copilot UI: {url}", file=sys.stderr)
+    discovery.publish(port, session.token)   # servo --mcp forwards to this copilot
 
     try:
         if not open_window:
@@ -939,11 +1016,7 @@ def run_copilot(open_window: bool = True, port: Optional[int] = None) -> None:
         session.stop()
         session.tracker.stop()
         server.should_exit = True
-        try:
-            browser_mod.browser_tier.close()
-        except Exception:
-            pass
-        worker.stop()
+        discovery.withdraw()
 
 
 def _ensure_edge_mic_permission(profile_dir: Path, url: str) -> None:

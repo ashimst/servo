@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-import os
 import sys
 from pathlib import Path
 from typing import Literal
@@ -16,7 +15,6 @@ from servo.paths import servo_home
 def init_windows_dpi_awareness() -> bool:
     """Initialize Windows Per-Monitor DPI v2 awareness for pixel-perfect coordinate mapping.
     
-    See ADR-06 in SERVO_ARCHITECTURE_V1.md.
     """
     if sys.platform != "win32":
         return False
@@ -46,44 +44,6 @@ def init_windows_dpi_awareness() -> bool:
         return False
 
 
-def is_running_as_admin() -> bool:
-    """Probe if current process has elevated Administrator privileges (UIPI / UAC check)."""
-    if sys.platform != "win32":
-        return False
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        return False
-
-
-def get_hardware_profile() -> dict[str, int | str | bool]:
-    """Inspect local CPU core count and RAM for System 1 threading configuration."""
-    profile: dict[str, int | str | bool] = {
-        "cpu_count": os.cpu_count() or 1,
-        "is_admin": is_running_as_admin(),
-        "platform": sys.platform,
-    }
-    if sys.platform == "win32":
-        class MEMORYSTATUSEX(ctypes.Structure):
-            _fields_ = [
-                ("dwLength", ctypes.c_ulong),
-                ("dwMemoryLoad", ctypes.c_ulong),
-                ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-            ]
-        stat = MEMORYSTATUSEX()
-        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
-            profile["total_ram_mb"] = stat.ullTotalPhys // (1024 * 1024)
-            profile["avail_ram_mb"] = stat.ullAvailPhys // (1024 * 1024)
-    return profile
-
-
 class ServoConfig(BaseSettings):
     """Central configuration for Servo execution modes and policies."""
     model_config = SettingsConfigDict(env_prefix="SERVO_", extra="ignore")
@@ -97,47 +57,44 @@ class ServoConfig(BaseSettings):
     # Kinematics: fast_mode skips trajectory interpolation for CI throughput
     fast_mode: bool = False
 
-    # Jev / Kev Decision Model endpoint (TypeSafe System One contract).
-    # Empty by default: the old default (localhost:8000) was Servo's own daemon port,
-    # so disabling the heuristic fallback made the gate POST to Servo itself.
-    jev_url: str = ""
-    jev_timeout_seconds: float = 2.0
-    # True forces heuristics even when a Kev URL is set (hermetic/offline runs).
-    use_heuristic_jev_fallback: bool = False
-    # Kev server (python -m kev.serve ... --port 8009). Base URL; /v1/systemone is appended.
-    kev_url: str = ""
-    kev_api_key: str = ""
-    kev_model: str = "kev-latest"
+    # Laya runs on the CPU (the GPU holds the planner); allow it time per decision.
+    jev_timeout_seconds: float = 20.0
+    # Laya decision server: decision_model/server.py serve (Laya vega engine + heads fitted on
+    # Servo's labelled rows; see decision_model/build_rows.py).
+    # Base URL; /v1/systemone is appended. There is no decision path without it.
+    laya_url: str = "http://127.0.0.1:8009"
+    laya_api_key: str = ""
+    laya_model: str = "english"
     # P(high) at or above this counts as high risk even if another level is likelier.
-    kev_high_risk_floor: float = 0.25
+    laya_high_risk_floor: float = 0.25
 
     # ---- Cognitive cascade (see docs/COGNITIVE_CASCADE.md) ----
     # Cactus Needle 3: minimum calibrated confidence to act on a proposed tool call.
     needle_confidence_threshold: float = 0.7
     # Path to needle3.cact; empty = cactus downloads Cactus-Compute/needle3.
     needle_weights: str = ""
+    # Servo's tuned Needle for the request and command agents (needle_model/README.md);
+    # empty = the base Needle. Planner steps always use needle_weights.
+    needle_intent_weights: str = ""
+    # A request or command call acts only at or above this confidence (needle_model/eval.py).
+    needle_intent_threshold: float = 0.5
     mirage_weights: str = ""
-    # Minimum fuzzy-match score for a Mirage detection to count as the target.
-    mirage_match_threshold: float = 0.72
+    # Visual locator: the local planner's Qwen3.5-4B with its vision projector (llama-server
+    # --mmproj), so it is the same server as local_planner_url.
+    locator_url: str = "http://127.0.0.1:8080/v1"
+    locator_timeout_seconds: float = 60.0
+    # Minimum fuzzy-match score for text on screen (OCR, Mirage) to count as the target.
+    text_match_threshold: float = 0.72
     # How many times System 2 may re-plan after a failure within one goal.
-    max_replans: int = 2
+    max_replans: int = 4   # real multi-step tasks need room to recover from a wrong label or two
     # Act-observe-decide rounds with System 2 before asking you whether to continue.
     max_rounds: int = 8
-    # Web tasks: 'user' opens pages in YOUR browser (preferred_browser, else the Windows
-    # default) and drives it like any desktop app; 'playwright' uses Servo's own
-    # separate automation browser (more reliable DOM access, but not your tabs/logins).
-    browser_mode: Literal["user", "playwright"] = "user"
-    # e.g. "dia", "chrome", "edge", "arc". Empty = the Windows default browser.
+    # Web tasks open pages in YOUR browser (preferred_browser, else the Windows default)
+    # and drive it like any desktop app. e.g. "dia", "chrome", "edge", "arc".
     preferred_browser: str = ""
-    # Playwright browser tier: 'msedge', 'chrome', or 'chromium' (bundled).
-    browser_channel: str = "msedge"
-    browser_profile_dir: Path = Field(default_factory=lambda: servo_home() / "browser-profile")
-    browser_headless: bool = False
     search_url: str = "https://www.bing.com/search?q={q}"
     # System 2 (LLM) reasoning depth for Anthropic models: low | medium | high | xhigh | max
     system2_effort: str = "medium"
-    # cactus-engine bundle for a fully local System 2 (SERVO_PLANNER_PROVIDER=cactus)
-    cactus_engine_model: str = "google/gemma-4-E2B-it"
     # Copilot UI server
     copilot_port: int = 8765
 
@@ -153,24 +110,24 @@ class ServoConfig(BaseSettings):
     # Telemetry storage
     trace_dir: Path = Field(default_factory=lambda: servo_home() / "traces")
 
-    # System 2 Planner config
-    planner_provider: Literal["openai", "anthropic", "gemini", "cactus", "passthrough", "none"] = "openai"
+    # System 2 planner tiers. The local planner is a Qwen model behind llama.cpp's
+    # OpenAI-compatible server; the cloud planner (planner_provider + its key) is the step-up.
+    #   local_first: local; steps up to cloud for the rest of a task when local fails
+    #   local_only / cloud_first / cloud_only: as named (cloud_first steps down to nothing)
+    planner_mode: Literal["local_first", "local_only", "cloud_first", "cloud_only"] = "local_first"
+    local_planner_url: str = "http://127.0.0.1:8080/v1"
+    local_planner_model: str = "qwen"
+    local_planner_timeout_seconds: float = 300.0
+    # Cloud planner
+    planner_provider: Literal["openai", "anthropic", "gemini", "none"] = "openai"
     openai_api_key: str = ""
-    openai_base_url: str = "http://localhost:11434/v1"
-    # Default model chosen specifically to fit 4GB VRAM local GPU budgets
-    openai_model: str = "llama3.2:1b"
-    default_local_model: str = "llama3.2:1b"
+    openai_base_url: str = ""
+    openai_model: str = ""
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-opus-5-5"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
 
-    # Local REST API bearer token. If empty, a random token is generated on first
-    # start and stored in ~/.servo/api_token (see servo.daemon.auth).
-    api_token: str = ""
-    # Extra Host names the REST server accepts besides loopback (DNS-rebinding guard),
-    # e.g. '["192.168.1.20"]' when deliberately binding to a LAN address.
-    allowed_hosts: list[str] = Field(default_factory=list)
 
     # Assistant-mode confirmation for medium/high-risk actions:
     #   'dialog' - native Yes/No dialog on the automated desktop (default No, times out to No)
@@ -201,7 +158,6 @@ settings = ServoConfig()
 try:  # values chosen in the copilot's setup screen (env vars still win)
     from servo.user_settings import apply as _apply_user_settings
     _apply_user_settings(settings)
-except Exception:
-    pass
-if not settings.kev_url and settings.jev_url:
-    settings.kev_url = settings.jev_url  # SERVO_JEV_URL kept as an alias
+except Exception as _e:  # noqa: BLE001 - the copilot still starts, but says its saved settings were not used
+    import logging as _logging
+    _logging.getLogger("servo.config").warning("Saved settings (~/.servo/settings.json) not applied: %s", _e)

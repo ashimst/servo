@@ -1,4 +1,4 @@
-"""Perception package: Viewport transforms, UIA sensor, Mirage visual fallback, and Scene Index."""
+"""Perception: viewport transforms, UIA, Windows OCR, the vision locator, Mirage and the scene index."""
 
 from servo.perception.viewport import ViewportTransform, WindowBounds
 from servo.perception.scene_index import SceneIndex, SceneElement, SceneDelta

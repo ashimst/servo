@@ -19,7 +19,7 @@ import re
 import sys
 import time
 from typing import Optional, Tuple
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import urlparse
 
 from servo.config import settings
 
@@ -33,42 +33,6 @@ KNOWN_BROWSERS = {
 }
 BROWSER_PROCESSES = frozenset(KNOWN_BROWSERS.values())
 _BROWSER_NAME_RE = "|".join(sorted((re.escape(k) for k in KNOWN_BROWSERS), key=len, reverse=True))
-
-# Sites people name without a domain, plus how to search them by URL (far more reliable
-# than finding and clicking a site's search box).
-SITES = {
-    "youtube": ("https://www.youtube.com", "https://www.youtube.com/results?search_query={q}"),
-    "spotify": ("https://open.spotify.com", "https://open.spotify.com/search/{q}"),
-    "gmail": ("https://mail.google.com", "https://mail.google.com/mail/u/0/#search/{q}"),
-    "google": ("https://www.google.com", "https://www.google.com/search?q={q}"),
-    "bing": ("https://www.bing.com", "https://www.bing.com/search?q={q}"),
-    "wikipedia": ("https://en.wikipedia.org", "https://en.wikipedia.org/w/index.php?search={q}"),
-    "github": ("https://github.com", "https://github.com/search?q={q}"),
-    "amazon": ("https://www.amazon.com", "https://www.amazon.com/s?k={q}"),
-    "maps": ("https://www.google.com/maps", "https://www.google.com/maps/search/{q}"),
-    "google maps": ("https://www.google.com/maps", "https://www.google.com/maps/search/{q}"),
-    "facebook": ("https://www.facebook.com", "https://www.facebook.com/search/top?q={q}"),
-    "gemini": ("https://gemini.google.com", ""),
-    "chatgpt": ("https://chatgpt.com", ""),
-    "linkedin": ("https://www.linkedin.com", "https://www.linkedin.com/search/results/all/?keywords={q}"),
-    "reddit": ("https://www.reddit.com", "https://www.reddit.com/search/?q={q}"),
-    "netflix": ("https://www.netflix.com", "https://www.netflix.com/search?q={q}"),
-    "outlook": ("https://outlook.live.com", ""),
-    "whatsapp": ("https://web.whatsapp.com", ""),
-}
-
-
-def site_url(name: str) -> Optional[str]:
-    hit = SITES.get(name.strip().lower())
-    return hit[0] if hit else None
-
-
-def site_search_url(site: str, query: str) -> Optional[str]:
-    hit = SITES.get(site.strip().lower())
-    if not hit or not hit[1]:
-        return None
-    return hit[1].format(q=quote_plus(query.strip()))
-
 
 def browser_process(name: str) -> Optional[str]:
     return KNOWN_BROWSERS.get(name.strip().lower())

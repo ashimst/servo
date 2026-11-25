@@ -32,10 +32,6 @@ mcp = [
 cactus = [
     "cactus-compute>=3.3.0",
 ]
-# Playwright browser tier (uses installed Edge/Chrome; `playwright install chromium` for the bundled build)
-browser = [
-    "playwright>=1.49",
-]
 # Frameless always-on-top native window for the copilot (falls back to Edge --app)
 ui = [
     "pywebview>=5.0",
@@ -46,11 +42,11 @@ anthropic = [
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
-    "playwright>=1.49",
+    "playwright>=1.49",   # drives the copilot UI in tests/test_browser_and_ui.py
 ]
 
 [project.scripts]
-servo = "servo.daemon.server:main"
+servo = "servo.cli:main"
 
 [tool.pytest.ini_options]
 markers = [

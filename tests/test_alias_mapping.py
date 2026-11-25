@@ -242,91 +242,6 @@ def test_canonicalize_action_missing_required_args():
         AliasMapper.canonicalize_action("nonexistent_tool")
 
 
-def test_map_to_needle_tool_dispatch():
-    scene = _make_scene([("Button1", "Button")])
-    tools = MagicMock(spec=NeedleToolSurface)
-    tools.click.return_value = "clicked"
-    tools.invoke.return_value = "invoked"
-    tools.type_text.return_value = "typed"
-    tools.hotkey.return_value = "hotkeyed"
-    tools.wait.return_value = "waited"
-
-    # Click
-    act_click = AliasMapper.canonicalize_action("click", target="Button1")
-    fn, sig = AliasMapper.map_to_needle_tool(act_click, tools, scene, element_id=0)
-    assert sig == "click(0, button='left')"
-    assert fn() == "clicked"
-    tools.click.assert_called_with(scene, 0, button="left")
-
-    # Double click
-    act_dbl = AliasMapper.canonicalize_action("double_click", target="Button1")
-    fn, sig = AliasMapper.map_to_needle_tool(act_dbl, tools, scene, element_id=0)
-    assert sig == "click(0, button='double')"
-    assert fn() == "clicked"
-    tools.click.assert_called_with(scene, 0, button="double")
-
-    # Right click
-    act_rt = AliasMapper.canonicalize_action("right_click", target="Button1")
-    fn, sig = AliasMapper.map_to_needle_tool(act_rt, tools, scene, element_id=0)
-    assert sig == "click(0, button='right')"
-    assert fn() == "clicked"
-    tools.click.assert_called_with(scene, 0, button="right")
-
-    # Invoke
-    act_inv = AliasMapper.canonicalize_action("invoke", target="Button1")
-    fn, sig = AliasMapper.map_to_needle_tool(act_inv, tools, scene, element_id=0)
-    assert sig == "invoke(0)"
-    assert fn() == "invoked"
-    tools.invoke.assert_called_with(scene, 0)
-
-    # Type
-    act_type = AliasMapper.canonicalize_action("type", target="Button1", text="abc", press_enter=True, clear_first=True)
-    fn, sig = AliasMapper.map_to_needle_tool(act_type, tools, scene, element_id=0)
-    assert sig == "type_text(0, text='abc')"
-    assert fn() == "typed"
-    tools.type_text.assert_called_with(scene, 0, text="abc", press_enter=True, clear_first=True)
-
-    # Hotkey
-    act_hk = AliasMapper.canonicalize_action("hotkey", keys=["ctrl", "s"])
-    fn, sig = AliasMapper.map_to_needle_tool(act_hk, tools, scene)
-    assert sig == "hotkey(['ctrl', 's'])"
-    assert fn() == "hotkeyed"
-    tools.hotkey.assert_called_with(["ctrl", "s"])
-
-    # Wait
-    act_wait = AliasMapper.canonicalize_action("wait", duration_seconds=1.5)
-    fn, sig = AliasMapper.map_to_needle_tool(act_wait, tools, scene)
-    assert sig == "wait(1.5)"
-    assert fn() == "waited"
-    tools.wait.assert_called_with(1.5)
-
-
-def test_map_to_needle_tool_missing_element_id_raises():
-    scene = _make_scene([("Button1", "Button")])
-    tools = MagicMock(spec=NeedleToolSurface)
-
-    act_click = AliasMapper.canonicalize_action("click", target="Button1")
-    with pytest.raises(ValueError, match="Action 'click' requires an element_id"):
-        AliasMapper.map_to_needle_tool(act_click, tools, scene, element_id=None)
-
-    act_inv = AliasMapper.canonicalize_action("invoke", target="Button1")
-    with pytest.raises(ValueError, match="Action 'invoke' requires an element_id"):
-        AliasMapper.map_to_needle_tool(act_inv, tools, scene, element_id=None)
-
-    act_type = AliasMapper.canonicalize_action("type", target="Button1", text="abc")
-    with pytest.raises(ValueError, match="Action 'type' requires an element_id"):
-        AliasMapper.map_to_needle_tool(act_type, tools, scene, element_id=None)
-
-
-def test_map_to_needle_tool_unsupported_action_raises():
-    scene = _make_scene([("Button1", "Button")])
-    tools = MagicMock(spec=NeedleToolSurface)
-
-    act_launch = AliasMapper.canonicalize_action("launch", app_name="calc")
-    with pytest.raises(ValueError, match="cannot be dispatched directly to NeedleToolSurface"):
-        AliasMapper.map_to_needle_tool(act_launch, tools, scene)
-
-
 def test_needle_tool_surface_invoke():
     scene = _make_scene([("Submit", "Button")])
     surface = NeedleToolSurface(hwnd=1001)
@@ -373,6 +288,33 @@ def test_hyphen_delimited_hotkeys_and_blacklist():
     action_mixed = AliasMapper.canonicalize_action("hotkey", keys="ctrl+shift-esc")
     assert action_mixed.keys == ["ctrl", "shift", "esc"]
     assert is_hotkey_blacklisted(action_mixed.keys) is True
+
+    # Punctuation hotkeys: ctrl+,, ctrl++, ctrl+-, ctrl+[
+    action_comma = AliasMapper.canonicalize_action("hotkey", keys="ctrl+,")
+    assert action_comma.keys == ["ctrl", ","]
+    assert is_hotkey_blacklisted(action_comma.keys) is False
+
+    action_plus = AliasMapper.canonicalize_action("hotkey", keys="ctrl++")
+    assert action_plus.keys == ["ctrl", "+"]
+
+    action_minus = AliasMapper.canonicalize_action("hotkey", keys="ctrl+-")
+    assert action_minus.keys == ["ctrl", "-"]
+
+    action_bracket = AliasMapper.canonicalize_action("hotkey", keys="ctrl+[")
+    assert action_bracket.keys == ["ctrl", "["]
+
+
+def test_clear_action_and_empty_set_value():
+    """Verify 'clear' action alias and set_value with empty value."""
+    act_clear = AliasMapper.canonicalize_action("clear", target="search_box")
+    assert act_clear.action_type == CanonicalActionType.SET_VALUE
+    assert act_clear.target == "search_box"
+    assert act_clear.text == ""
+
+    act_set_val_empty = AliasMapper.canonicalize_action("set_value", target="search_box", value="")
+    assert act_set_val_empty.action_type == CanonicalActionType.SET_VALUE
+    assert act_set_val_empty.target == "search_box"
+    assert act_set_val_empty.text == ""
 
 
 def test_multispace_and_tab_action_normalization():

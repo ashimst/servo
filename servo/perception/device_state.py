@@ -14,9 +14,9 @@ import os
 import platform
 import socket
 import sys
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 logger = logging.getLogger("servo.perception.device_state")
 

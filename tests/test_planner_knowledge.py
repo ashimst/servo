@@ -1,4 +1,4 @@
-"""Planner inputs: recipes, redaction, media grammar, screen description, prompt rules."""
+"""Planner inputs: recipes, redaction, media keys, screen description, prompt rules."""
 
 import pytest
 
@@ -68,7 +68,7 @@ def test_leaves_ordinary_text(text):
     assert redact_secrets(text) == (text, [])
 
 
-def test_router_redacts_before_anything_sees_it(monkeypatch):
+def test_router_redacts_before_anything_sees_it(monkeypatch, laya):
     from servo.cognition.router import CascadeRouter
     seen = []
 
@@ -90,39 +90,21 @@ def test_router_redacts_before_anything_sees_it(monkeypatch):
             return cm()
 
     from servo.control.jev_gate import JevGate
-    r = CascadeRouter(tracer=T(), kev=JevGate(use_fallback=True), memory=Mem(), browser=object())
+    r = CascadeRouter(tracer=T(), laya=JevGate(), memory=Mem())
     monkeypatch.setattr(r.system2, "available", lambda: False)
     r.run("login with password: Hunter2_xyz")
     assert all("Hunter2_xyz" not in t for t in seen)
     assert all("Hunter2_xyz" not in f"{t} {d}" for _, t, d in events)
     assert any("Secret removed" in t for _, t, _ in events)
+    assert laya.calls and all("Hunter2_xyz" not in str(state) for state, _ in laya.calls)   # Laya saw the redacted goal
 
 
-# ---------------------------------------------------------- media grammar
-
-@pytest.mark.parametrize("text,key,n", [
-    ("increase the volume a bit", "volumeup", 5),
-    ("turn the volume down by 20%", "volumedown", 10),
-    ("mute", "volumemute", 1),
-    ("pause the music", "playpause", 1),
-    ("press volumeup 3 times", "volumeup", 3),
-    ("next track", "nexttrack", 1),
-])
-def test_media_grammar(text, key, n):
-    from servo.cognition.needle import parse_grammar
-    plan = parse_grammar(text)
-    assert len(plan.steps) == n and all(s.arguments["keys"] == [key] for s in plan.steps)
-
+# ---------------------------------------------------------- media keys
 
 def test_media_key_codes():
     from servo.actuation.needle_tools import media_key_vk
     assert media_key_vk(["volumeup"]) == 0xAF and media_key_vk(["volume up"]) == 0xAF
     assert media_key_vk(["ctrl", "s"]) is None and media_key_vk(["enter"]) is None
-
-
-def test_go_to_known_site():
-    from servo.cognition.needle import parse_grammar
-    assert parse_grammar("go to youtube").steps[0].arguments["url"] == "https://www.youtube.com"
 
 
 # ------------------------------------------------------- screen and prompt
@@ -144,11 +126,15 @@ def test_describe_scene_dedupes_and_shows_address():
 
 
 def test_plan_prompt_has_the_rules_that_fix_real_failures():
-    from servo.cognition.system2 import PLAN_SYSTEM
-    flat = " ".join(PLAN_SYSTEM.split())
-    for rule in ["never wrap it in `powershell -command`", "SendKeys", "NOT confirmed", "[redacted]",
-                 "Statements and preferences", "Follow-ups", "search <site> for <query>", "[Recipes]"]:
-        assert rule in flat, rule
+    from servo.cognition.planners import AGENTS, plan_system
+    for name in AGENTS:
+        flat = " ".join(plan_system(name).split())
+        for rule in ["NOT confirmed", "[redacted]", "Statements and questions", "Follow-ups", "[Recipes]",
+                     "never send the same step again unchanged", "Never close the Servo Copilot window"]:
+            assert rule in flat, (name, rule)
+    code = " ".join(plan_system("code").split())
+    assert "never wrapped in powershell -command" in code
+    assert "powershell -command" not in " ".join(plan_system("settings").split())
 
 
 def test_plan_prompt_includes_recipes_and_records_them():
@@ -158,7 +144,21 @@ def test_plan_prompt_includes_recipes_and_records_them():
     assert "[Recipes" in prompt and "youtube" in meta["recipes"]
 
 
-def test_typed_text_escapes_are_decoded():
-    from servo.cognition.needle import parse_grammar
-    step = parse_grammar('type "skies are clear\u2014\nthe world is washed"').steps[0]
-    assert step.arguments["text"] == "skies are clear—\nthe world is washed"
+def test_recipe_steps_are_valid_step_forms():
+    """Recipes go into the planner's prompt: every `step` in them must be one Servo accepts,
+    or the recipe teaches the planner steps that are rejected at run time."""
+    import glob
+    import re
+    from pathlib import Path
+    from servo.cognition.specialists import step_form
+    root = Path(__file__).resolve().parent.parent / "knowledge" / "recipes"
+    prose = {"powershell -command"}   # quoted in a sentence, not a step
+    bad = []
+    for f in glob.glob(str(root / "*.md")):
+        if f.endswith("README.md"):
+            continue
+        for step in re.findall(r"`([^`]+)`", Path(f).read_text(encoding="utf-8")):
+            filled = step.replace("[n]", "[3]").replace("<", "").replace(">", "")
+            if step not in prose and step_form(filled) is None:
+                bad.append(f"{Path(f).name}: {step}")
+    assert not bad, bad

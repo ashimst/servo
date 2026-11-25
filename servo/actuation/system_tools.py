@@ -4,12 +4,11 @@ The GUI path (click, type) is slow and fragile for work that is really about fil
 commands. These tools do that work directly, and their output goes back to System 2 so
 it can act on what a command printed or a file contains.
 
-Safety model (the GUI tools' gate applies on top, as max(Kev, floor)):
+Safety model (the GUI tools' gate applies on top, as max(Laya, floor)):
 
-* Reached only through the deterministic command grammar (``parse_system_intent``),
-  never proposed by the on-device Needle model, so a misparse cannot run a command.
-* Every shell command is at least medium risk, so assistant mode always asks you and
-  shows the exact command. Destructive or download-and-run commands are high.
+* Proposed by the Needle model like every other action, so the guard is the gate: every
+  shell command is at least medium risk, so assistant mode always asks you and shows the
+  exact command, and Laya judges it too. Destructive or download-and-run commands are high.
 * Writes are medium; overwriting a file, writing a script/executable, or writing into
   the Startup folder is high.
 * Reads are low, except credential stores (high). Servo's own folder (``~/.servo``:
@@ -306,39 +305,3 @@ def execute(tool: str, args: Dict[str, Any], abort: Optional[threading.Event] = 
     if tool == "run_command":
         return run_command(str(args.get("command", "")), str(args.get("shell") or "powershell"), abort=abort)
     raise SystemToolError(f"Unknown system tool '{tool}'.")
-
-
-# ---------------------------------------------------------------- grammar
-
-SYSTEM_GRAMMAR = """\
-read file <path>               e.g. read file desktop\\notes.txt
-list folder <path>             e.g. list folder downloads
-write "<text>" to file <path>  creates or replaces the file (also: append "<text>" to file <path>)
-run command "<command>"        PowerShell, output comes back to you (also: run cmd command "<command>")"""
-
-_Q = r'"(.*)"'  # greedy: the command/text runs to the LAST quote on the line
-# Not "open file …": "open file explorer" launches Explorer.
-_RE_READ = re.compile(r"^(?:read|show)\s+(?:the\s+)?(?:text\s+)?file\s+(.+)$", re.I)
-_RE_LIST = re.compile(r"^(?:list|show)\s+(?:the\s+)?(?:folder|directory|files\s+in)\s+(.+)$", re.I)
-_RE_WRITE = re.compile(rf"^(write|append)\s+{_Q}\s+(?:to|into)\s+(?:the\s+)?file\s+(.+)$", re.I | re.S)
-_RE_RUN = re.compile(rf"^run\s+(?:(powershell|cmd)\s+)?command\s+{_Q}$", re.I | re.S)
-
-
-def parse_system_intent(text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """Map one command in the system grammar to (tool, arguments), or None."""
-    t = text.strip()
-    m = _RE_RUN.match(t)
-    if m:
-        return "run_command", {"command": m.group(2), "shell": (m.group(1) or "powershell").lower()}
-    m = _RE_WRITE.match(t)
-    if m:
-        return "write_file", {"text": m.group(2), "path": m.group(3).strip().rstrip("."),
-                              "append": m.group(1).lower() == "append"}
-    t = t.rstrip(".")
-    m = _RE_READ.match(t)
-    if m:
-        return "read_file", {"path": m.group(1).strip()}
-    m = _RE_LIST.match(t)
-    if m:
-        return "list_folder", {"path": m.group(1).strip()}
-    return None

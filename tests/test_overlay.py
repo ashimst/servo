@@ -92,6 +92,6 @@ def test_router_ignores_servo_windows_without_a_list(monkeypatch):
     from servo.control.handoff import SystemHandoffCoordinator
     monkeypatch.setattr(overlay, "own_windows", lambda: {PANEL})
     from servo.cognition.trace import NullTracer
-    r = CascadeRouter(tracer=NullTracer(), browser=object())
+    r = CascadeRouter(tracer=NullTracer())
     assert PANEL in r.exclude_hwnds()
     assert PANEL in SystemHandoffCoordinator(target_hwnd=None).exclude_hwnds()

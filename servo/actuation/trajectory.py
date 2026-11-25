@@ -1,6 +1,5 @@
 """Cubic Ease-Out Kinematics and Corner-Slam Failsafe.
 
-See ADR-07 and Section 5.2 in SERVO_ARCHITECTURE_V1.md.
 Handles both interactive desktop sessions and non-interactive / CI sessions gracefully.
 """
 

@@ -30,7 +30,6 @@ from servo.config import settings
 logger = logging.getLogger("servo.cactus")
 
 _lock = threading.Lock()
-_needle: Any = None
 _needle_error: Optional[str] = None
 _mirage: Any = None
 _mirage_error: Optional[str] = None
@@ -43,12 +42,7 @@ def _import_cactus() -> Any:
 
 def status() -> Dict[str, Any]:
     """Report which Cactus capabilities are importable (does not load weights)."""
-    info: Dict[str, Any] = {"installed": False, "needle": False, "mirage": False, "engine": False, "version": None, "windows_ocr": False}
-    try:
-        import winsdk.windows.media.ocr  # noqa: F401
-        info["windows_ocr"] = True
-    except Exception:
-        pass
+    info: Dict[str, Any] = {"installed": False, "needle": False, "mirage": False, "engine": False, "version": None}
     try:
         cactus = _import_cactus()
     except Exception as e:
@@ -67,29 +61,37 @@ def status() -> Dict[str, Any]:
 
 
 NEEDLE_SYSTEM = (
-    "You translate one desktop-control command into tool calls for a Windows assistant. "
-    "Use element labels exactly as the user wrote them. Never invent coordinates."
+    "You translate one desktop-control step into tool calls for a Windows assistant. "
+    "Copy control numbers and quoted text exactly. Never invent coordinates."
 )
+_needles: Dict[str, Any] = {}
 
 
-def get_needle(tools: List[Dict[str, Any]]) -> Any:
-    """Return a cached Needle agent bound to ``tools`` (raw JSON-schema tool dicts)."""
-    global _needle, _needle_error
+def get_needle(tools: List[Dict[str, Any]], key: str = "default", system: str = "",
+               weights: Optional[str] = None) -> Any:
+    """A cached Needle agent per specialist ``key``, bound to ``tools`` and ``system``.
+
+    Cactus fixes the tools when an agent is created, so each specialist is its own agent
+    (a few tens of MB each). ``weights`` overrides ``settings.needle_weights`` for this
+    agent (the request and command agents use Servo's tuned Needle, needle_model/)."""
+    global _needle_error
     with _lock:
-        if _needle is not None or _needle_error is not None:
-            return _needle
+        if key in _needles:
+            return _needles[key]
+        if _needle_error is not None:
+            return None
         try:
             cactus = _import_cactus()
             cls = getattr(cactus, "Needle", None) or getattr(cactus, "Cactus")
-            kwargs: Dict[str, Any] = {"tools": tools, "system": NEEDLE_SYSTEM, "stateless": True}
-            if settings.needle_weights:
-                kwargs["weights"] = settings.needle_weights
-            _needle = cls(**kwargs)
+            kwargs: Dict[str, Any] = {"tools": tools, "system": system or NEEDLE_SYSTEM, "stateless": True}
+            if weights or settings.needle_weights:
+                kwargs["weights"] = weights or settings.needle_weights
+            _needles[key] = cls(**kwargs)
         except Exception as e:
             _needle_error = f"{e.__class__.__name__}: {e}"
             logger.info("Cactus Needle unavailable: %s", _needle_error)
-            _needle = None
-        return _needle
+            return None
+        return _needles[key]
 
 
 def needle_complete(agent: Any, text: str) -> Optional[Dict[str, Any]]:
@@ -125,7 +127,16 @@ def get_mirage() -> Any:
         return _mirage
 
 
+def mirage_error() -> Optional[str]:
+    return _mirage_error
+
+
+def needle_error() -> Optional[str]:
+    return _needle_error
+
+
 def reset_for_tests() -> None:
-    global _needle, _needle_error, _mirage, _mirage_error
+    global _needle_error, _mirage, _mirage_error
     with _lock:
-        _needle = _needle_error = _mirage = _mirage_error = None
+        _needles.clear()
+        _needle_error = _mirage = _mirage_error = None

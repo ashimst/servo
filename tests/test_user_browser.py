@@ -1,28 +1,9 @@
-"""Web tasks in the user's own browser: grammar, preference, URL safety, routing."""
+"""Web tasks in the user's own browser: preference, URL safety, routing."""
 
 import pytest
 
 from servo.cognition import user_browser as ub
 from servo.config import settings
-
-
-@pytest.mark.parametrize("text,url,browser", [
-    ("open gmail in chrome", "https://mail.google.com", "chrome"),
-    ("open youtube.com in dia", "https://youtube.com", "dia"),
-    ("search youtube for kanye west", "https://www.youtube.com/results?search_query=kanye+west", ""),
-    ("search for lo-fi beats on spotify", "https://open.spotify.com/search/lo-fi+beats", ""),
-    ("find usb hub on amazon in edge", "https://www.amazon.com/s?k=usb+hub", "edge"),
-])
-def test_site_grammar(text, url, browser):
-    from servo.cognition.needle import parse_grammar
-    step = parse_grammar(text).steps[0]
-    assert step.tool_name == "open_url" and step.arguments["url"] == url
-    assert step.arguments.get("browser", "") == browser
-
-
-def test_unknown_site_in_browser_is_not_guessed():
-    from servo.cognition.needle import parse_site_intent
-    assert parse_site_intent("open email in dia") is None   # goes to System 2, not a guess
 
 
 @pytest.mark.parametrize("text,name", [
@@ -79,29 +60,30 @@ class _Tracer:
 
 
 def _router(monkeypatch, verdict="confirmed"):
+    # Laya (the `laya` fixture) answers low risk / in scope for every step.
     from servo.cognition import router as r
     from servo.control.jev_gate import JevGate
-    monkeypatch.setattr(settings, "browser_mode", "user")
     nav = []
     monkeypatch.setattr(ub, "navigate", lambda hwnd, url: nav.append((hwnd, url)) or (verdict, "Page", ""))
     monkeypatch.setattr(r.windows, "get_foreground_window", lambda: 0)
     launched = []
-    rt = r.CascadeRouter(tracer=_Tracer(), kev=JevGate(use_fallback=True), browser=object(), memory=None,
+    rt = r.CascadeRouter(tracer=_Tracer(), laya=JevGate(), memory=None,
                          app_launcher=lambda name: launched.append(name) or (42, name))
     return rt, nav, launched
 
 
-def test_open_url_goes_to_named_browser(monkeypatch):
-    from servo.cognition.needle import parse_grammar
+def test_open_url_goes_to_the_preferred_browser(monkeypatch, laya):
+    from servo.cognition.needle import to_steps
     rt, nav, launched = _router(monkeypatch)
-    rt.goal = "open gmail in dia"
-    out = rt._execute(parse_grammar("open gmail in dia").steps[0])
+    monkeypatch.setattr(settings, "preferred_browser", "dia")
+    rt.goal = "open gmail"
+    out = rt._execute(to_steps("open_web", {"address": "mail.google.com"})[0])
     assert out.success and out.verification == "confirmed"
     assert launched == ["dia"] and nav == [(42, "https://mail.google.com")]
     assert rt.context == "desktop" and rt.recent_browser == "dia"
 
 
-def test_local_address_refused_without_launching(monkeypatch):
+def test_local_address_refused_without_launching(monkeypatch, laya):
     from servo.cognition.needle import _step
     rt, nav, launched = _router(monkeypatch)
     rt.goal = "play music"
@@ -109,7 +91,7 @@ def test_local_address_refused_without_launching(monkeypatch):
     assert not out.success and out.kind == "policy" and not launched and not nav
 
 
-def test_failed_navigation_is_a_failure(monkeypatch):
+def test_failed_navigation_is_a_failure(monkeypatch, laya):
     from servo.cognition.needle import _step
     rt, _, _ = _router(monkeypatch, verdict="failed")
     rt.goal = "open youtube"
@@ -124,3 +106,11 @@ def test_preference_is_saved_not_executed(monkeypatch):
     out = rt.run("dia is my default browser")
     assert out.route == "preference" and saved == {"preferred_browser": "dia"}
     assert not nav and not launched
+
+
+def test_navigation_without_laya_does_not_launch(monkeypatch, laya):
+    from servo.cognition.needle import to_steps
+    rt, nav, launched = _router(monkeypatch)
+    laya.unavailable = "connection refused"
+    out = rt._execute(to_steps("open_web", {"address": "youtube.com"})[0])
+    assert not out.success and out.kind == "policy" and not launched and not nav

@@ -1,4 +1,4 @@
-"""Direct file/shell tools: grammar, risk floors, guards, execution, and router wiring."""
+"""Direct file/shell tools: Needle mapping, risk floors, guards, execution, and router wiring."""
 
 import sys
 import threading
@@ -23,30 +23,37 @@ def home(tmp_path, monkeypatch):
     return tmp_path
 
 
-# ---------------------------------------------------------------- grammar
+# ------------------------------------------------- reached through Needle's tools
 
-@pytest.mark.parametrize("text,tool,args", [
-    ("read file desktop\\notes.txt", "read_file", {"path": "desktop\\notes.txt"}),
-    ("list folder downloads", "list_folder", {"path": "downloads"}),
-    ('write "a, b and then c" to file out.txt', "write_file", {"text": "a, b and then c", "path": "out.txt", "append": False}),
-    ('append "x" to file log.txt', "write_file", {"text": "x", "path": "log.txt", "append": True}),
-    ('run command "Get-Date"', "run_command", {"command": "Get-Date", "shell": "powershell"}),
-    ('run cmd command "echo "hi""', "run_command", {"command": 'echo "hi"', "shell": "cmd"}),
+@pytest.mark.parametrize("name,args,tool,expected", [
+    ("read_file", {"path": r"desktop\notes.txt"}, "read_file", {"path": r"desktop\notes.txt"}),
+    ("list_folder", {"path": "downloads"}, "list_folder", {"path": "downloads"}),
+    ("write_file", {"text": "a, b and then c", "path": "out.txt"}, "write_file",
+     {"text": "a, b and then c", "path": "out.txt", "append": False}),
+    ("append_file", {"text": "x", "path": "log.txt"}, "write_file",
+     {"text": "x", "path": "log.txt", "append": True}),
+    ("run_command", {"command": "Get-Date"}, "run_command", {"command": "Get-Date", "shell": "powershell"}),
 ])
-def test_grammar(text, tool, args):
-    assert st.parse_system_intent(text) == (tool, args)
+def test_needle_calls_become_system_tools(name, args, tool, expected):
+    from servo.cognition.needle import to_steps
+    step = to_steps(name, args)[0]
+    assert step.tool_name == tool and tool in st.SYSTEM_TOOLS
+    assert step.arguments == expected and step.canonical_action is None
 
 
 def test_open_file_explorer_still_launches_explorer():
-    from servo.cognition.needle import parse_grammar
-    assert st.parse_system_intent("open file explorer") is None
-    plan = parse_grammar("read file notes.txt")
-    assert plan.steps[0].tool_name == "read_file" and plan.steps[0].canonical_action is None
+    from servo.cognition.needle import to_steps
+    assert not hasattr(st, "parse_system_intent")
+    assert to_steps("open_app", {"name": "file explorer"})[0].tool_name == "launch_app"
 
 
-def test_needle_never_sees_system_tools():
+def test_needle_reaches_system_tools_only_through_file_and_command_tools():
     from servo.cognition.needle import NEEDLE_TOOLS
-    assert not {t["name"] for t in NEEDLE_TOOLS} & set(st.SYSTEM_TOOLS)
+    from servo.cognition.specialists import SPECIALIST_OF
+    names = {t["name"] for t in NEEDLE_TOOLS}
+    assert names & set(st.SYSTEM_TOOLS) == {"read_file", "list_folder", "write_file", "run_command"}
+    assert "append_file" in names                                   # becomes write_file(append=True)
+    assert {SPECIALIST_OF[n] for n in names & set(st.SYSTEM_TOOLS) | {"append_file"}} == {"files", "system"}
 
 
 # ------------------------------------------------------------------- risk
@@ -152,42 +159,49 @@ class _Tracer:
 def _router(confirm):
     from servo.cognition.router import CascadeRouter
     from servo.control.jev_gate import JevGate
-    return CascadeRouter(tracer=_Tracer(), kev=JevGate(use_fallback=True), confirmation_callback=confirm,
-                         browser=object(), memory=None)
+    return CascadeRouter(tracer=_Tracer(), laya=JevGate(), confirmation_callback=confirm,
+                         memory=None)
 
 
-def _step(text):
-    from servo.cognition.needle import parse_grammar
-    return parse_grammar(text).steps[0]
+def _step(name, **args):
+    from servo.cognition.needle import to_steps
+    return to_steps(name, args)[0]
 
 
-def test_router_runs_read_without_asking(home):
+def test_router_runs_read_without_asking(home, laya):
     (home / "n.txt").write_text("contents here")
     asked = []
-    out = _router(lambda req: asked.append(req) or True)._execute(_step("read file n.txt"))
+    out = _router(lambda req: asked.append(req) or True)._execute(_step("read_file", path="n.txt"))
     assert out.success and out.output == "contents here" and not asked
 
 
-def test_router_asks_before_command_and_respects_no(home):
+def test_router_asks_before_command_and_respects_no(home, laya):
     asked = []
-    out = _router(lambda req: asked.append(req) or False)._execute(_step('run cmd command "echo hi"'))
+    out = _router(lambda req: asked.append(req) or False)._execute(_step("run_command", command="echo hi"))
     assert not out.success and out.kind == "policy"
     assert asked and asked[0].risk_level == "medium" and "echo hi" in asked[0].tool_call
 
 
-def test_router_write_over_existing_is_high(home):
+def test_router_write_over_existing_is_high(home, laya):
     (home / "e.txt").write_text("old")
     asked = []
-    _router(lambda req: asked.append(req) or False)._execute(_step('write "new" to file e.txt'))
+    _router(lambda req: asked.append(req) or False)._execute(_step("write_file", text="new", path="e.txt"))
     assert asked[0].risk_level == "high"
     assert (home / "e.txt").read_text() == "old"
 
 
-def test_output_reaches_system2_via_completed(home, monkeypatch):
+def test_output_reaches_system2_via_completed(home, monkeypatch, laya):
     (home / "n.txt").write_text("line one")
     r = _router(lambda req: True)
     completed, records = [], []
-    status, _ = r._run_batch([_step("read file n.txt")], completed, records, 1)
+    status, _ = r._run_batch([_step("read_file", path="n.txt")], completed, records, 1)
     assert status == "ok"
     assert "output:" in completed[0] and "line one" in completed[0]
     assert records[0].output == "line one"
+
+
+def test_router_refuses_system_tools_when_laya_is_down(home, laya):
+    (home / "n.txt").write_text("contents here")
+    laya.unavailable = "connection refused"
+    out = _router(lambda req: True)._execute(_step("read_file", path="n.txt"))
+    assert not out.success and out.kind == "policy" and "No safety check possible" in out.error

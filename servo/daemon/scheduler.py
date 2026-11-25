@@ -143,6 +143,76 @@ def parse_schedule(text: str, now: Optional[datetime] = None) -> Optional[Schedu
     return None
 
 
+class WhenError(ValueError):
+    """A time phrase Servo can't turn into a schedule (it says which and why)."""
+
+
+_WORD_NUM = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "ten": 10, "fifteen": 15,
+             "twenty": 20, "thirty": 30, "forty five": 45, "half an": 0.5, "a half": 0.5}
+_PART_OF_DAY = {"morning": "am", "evening": "pm", "afternoon": "pm", "night": "pm", "tonight": "pm"}
+
+
+def _amount(s: str) -> float:
+    s = s.strip().lower()
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        return float(s)
+    if s in _WORD_NUM:
+        return float(_WORD_NUM[s])
+    raise WhenError(f"“{s}” is not an amount I can count")
+
+
+def parse_when(phrase: str, now: Optional[datetime] = None) -> Tuple[Kind, float, int, str]:
+    """A time phrase Needle copied from the request -> (kind, next_run, interval_s, time_of_day).
+
+    'in 10 minutes', 'in half an hour', 'at 5pm', 'tomorrow at 9am', 'tonight at 10',
+    'every day at 9:00', 'each morning at 8', 'every 30 minutes', 'every hour'.
+    Raises WhenError for a phrase it can't place exactly (no guessing 'in a few minutes')."""
+    now = now or datetime.now()
+    w = " ".join(phrase.lower().replace(",", " ").split())
+    w = re.sub(r"\bnoon\b", "12:00", w)
+    w = re.sub(r"\bmidnight\b", "0:00", w)
+
+    m = re.fullmatch(rf"in (\d+(?:\.\d+)?|an?|one|two|three|four|five|ten|fifteen|twenty|thirty|half an) {_UNIT}", w)
+    if m:
+        secs = int(_amount(m.group(1)) * _unit_seconds(m.group(2)))
+        if secs <= 0:
+            raise WhenError(f"“{phrase}” is not in the future")
+        return "once", (now + timedelta(seconds=secs)).timestamp(), 0, ""
+
+    m = re.fullmatch(rf"every (?:(\d+) )?{_UNIT}", w)
+    if m:
+        secs = max(int(m.group(1) or 1) * _unit_seconds(m.group(2)), MIN_INTERVAL_S)
+        return "interval", (now + timedelta(seconds=secs)).timestamp(), secs, ""
+
+    m = re.fullmatch(rf"(?:every|each) (day|morning|evening|afternoon|night)(?: at)? {_TIME}|daily at {_TIME}", w)
+    if m:
+        if m.group(1):
+            part, h, mi, ap = m.group(1), m.group(2), m.group(3), m.group(4)
+        else:
+            part, h, mi, ap = "day", m.group(5), m.group(6), m.group(7)
+        ap = ap or _PART_OF_DAY.get(part)
+        hm = _clock(h, mi or ("00" if ap else None), ap)
+        if not hm:
+            raise WhenError(f"“{phrase}” has no exact time of day (say e.g. 9am or 21:00)")
+        return "daily", _next_at(*hm, now).timestamp(), 0, f"{hm[0]:02d}:{hm[1]:02d}"
+
+    m = re.fullmatch(rf"(today|tomorrow|tonight|this (?:morning|evening|afternoon))? ?(?:at )?{_TIME}", w)
+    if m and (m.group(1) or w.startswith("at ") or m.group(4) or m.group(3)):
+        day = m.group(1) or ""
+        ap = m.group(4) or _PART_OF_DAY.get(day.split()[-1] if day else "", None)
+        hm = _clock(m.group(2), m.group(3) or ("00" if ap else None), ap)
+        if not hm:
+            raise WhenError(f"“{phrase}” has no exact time (say e.g. 5pm or 17:00)")
+        offset = 1 if day == "tomorrow" else (0 if day else None)
+        when = _next_at(*hm, now, offset)
+        if when <= now:
+            raise WhenError(f"{when:%H:%M} today has already passed")
+        return "once", when.timestamp(), 0, ""
+
+    raise WhenError(f"I can't place “{phrase}” in time; say e.g. “in 10 minutes”, “at 5pm”, "
+                    "“tomorrow at 9am”, “every day at 8:00” or “every 30 minutes”")
+
+
 _LIST = re.compile(r"^(?:list|show|what(?:'s| is| are))\s+(?:my\s+|the\s+)?(?:scheduled\s+tasks?|schedule|queue|queued\s+tasks?)\??$", re.I)
 _CANCEL = re.compile(r"^(?:cancel|remove|delete|unschedule)\s+(?:scheduled\s+task\s+|task\s+|job\s+)?\[?([0-9a-f]{4,8})\]?$", re.I)
 _CANCEL_ALL = re.compile(r"^(?:cancel|clear|remove)\s+(?:all\s+)?(?:scheduled\s+tasks|the\s+schedule|the\s+queue|queue|schedule)$", re.I)

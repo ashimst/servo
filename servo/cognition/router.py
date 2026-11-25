@@ -1,48 +1,47 @@
-"""The cognitive cascade router.
+"""The cognitive cascade router (see docs/COGNITIVE_CASCADE.md).
 
-One explicit function decides which tier handles each piece of work:
-
-    goal ─► Tier 1 (grammar → Cactus Needle) ─► confident AND Kev says "single"? ─► System 1 executes
-                │                                           │ no (reasoning miss)
-                │                                           ▼
-                │                                  System 2 writes plain-language subtasks
-                │                                           │ each subtask goes back DOWN to Tier 1
-                ▼                                           ▼
-    execution per step:  UIA (desktop) / Playwright DOM (web)
-                         ── perception miss ──► Mirage (sideways, same step)
-                         ── Kev pre-check (risk/scope) → your confirmation if medium/high
-                         ── actuation (once) → Kev post-check
-    failure ─► classify:  policy/abort → stop and report
-                          perception / verification / reasoning → System 2 re-plans with
-                          what was tried, why it failed and what the screen shows now
-                          (bounded by settings.max_replans)
+    goal ─► Laya: desktop task? complexity? area?
+              │ not a desktop task ─► System 2 answers as chat
+              │ single + Needle confident on the request itself ─► execute
+              ▼
+            planner agent for the area writes steps in the step forms
+              ─► each step: the Needle agent for that tool ─► check_call ─► execute
+    execute (servo/control/loop.py): UIA ─► Windows OCR ─► vision locator ─► fail;
+              Laya pre-check (your confirmation if medium/high) ─► act once ─► verify
+    failure ─► policy/abort: stop and report
+               perception / verification / reasoning: the planner re-plans with what was
+               tried, why it failed and the current screen (settings.max_replans per tier,
+               then the local planner steps up to the cloud)
 
 Every decision is emitted to the trace bus, so the copilot shows the full reasoning.
 """
 
 from __future__ import annotations
 
-import collections
+import re
 import sys
 import threading
 import time
 import uuid
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from pydantic import BaseModel, Field
 
 from servo.actuation import system_tools
-from servo.cognition import browser as browser_mod
 from servo.cognition.needle import BROWSER_TOOLS, Tier1Intent, describe_step
 from servo.cognition.system2 import System2, System2Unavailable
+from servo.cognition.planners import AGENTS as PLANNER_AGENTS, DEFAULT_AGENT, agent as planner_agent
 from servo.cognition.trace import Tracer
 from servo.config import settings
 from servo.control.confirmation import ConfirmationCallback, ConfirmationRequest
-from servo.control.handoff import PlanExecutionSummary, StepExecutionReport, SystemHandoffCoordinator
-from servo.control.jev_gate import JevGate
+from servo.control.handoff import StepExecutionReport, SystemHandoffCoordinator
+from servo.control.jev_gate import JevGate, LayaUnavailable
 from servo.perception import app_identity, windows
-from servo.perception.scene_index import SceneDelta
-from servo.planner.tool_calling import MacroPlan, PlanStep
+from servo.cognition.plan import MacroPlan, PlanStep
+from servo.actuation.alias_mapping import AliasMapper
+
+# Request actions without a target control (servo/cognition/intents.py request_steps).
+_DIRECT_TOOLS = ("audio", "media_key", "window_state", "browser_hotkey", "open_file")
 
 AskFn = Callable[[str, Dict[str, Any], List[str], Optional[float]], str]
 
@@ -54,7 +53,6 @@ def _window_class(hwnd: int) -> str:
     return buf.value
 
 
-BROWSER_CAPABLE = {"click_element", "click", "double_click", "right_click", "type_text", "send_hotkey"}
 
 
 class StepRecord(BaseModel):
@@ -68,6 +66,10 @@ class StepRecord(BaseModel):
     output: str = ""  # what a system tool returned (file text, command output)
     verification: str = "confirmed"  # confirmed | unconfirmed | failed
     note: Optional[str] = None
+    # Where it happened, for the desktop knowledge graph.
+    target: str = ""
+    app: str = ""
+    page: str = ""
 
 
 class StepOutcome(BaseModel):
@@ -101,28 +103,52 @@ def _indent(text: str, prefix: str = "    ") -> str:
     return "\n".join(prefix + line for line in text.splitlines())
 
 
-def describe_scene(scene: Any, process: str = "", limit: int = 150) -> str:
+def describe_scene(scene: Any, process: str = "", limit: int = 150,
+                   numbered: Optional[Dict[int, Dict[str, Any]]] = None) -> str:
     """Screen description for System 2: window, address bar / focused text, then controls.
 
+    Every control gets a number ("[12] Button: Save"); the planner refers to controls by
+    that number and ``numbered`` records what each number stands for, so the step is
+    grounded to that exact control instead of a label the planner retyped.
     Duplicate labels are collapsed (YouTube lists each channel link twice) and long
     labels are trimmed, so the entries cover more of the page.
     """
     lines = [f"Active window: {scene.window_title}" + (f"  ({process})" if process else "")]
-    edits = [e for e in scene.elements.values() if e.role in ("Edit", "ComboBox") and (e.value or "").strip()]
+    edits = [e for e in scene.elements.values() if e.role == "Edit" and (e.value or "").strip()]
     if edits:
         lines.append(f"Address bar / input: {(edits[0].value or '')[:200]}")
     seen = set()
     controls: List[str] = []
+    texts: List[str] = []
     for e in scene.elements.values():
         label = " ".join((e.label or "").split())[:140]
-        key = (e.role, label)
+        key = (e.role, label, getattr(e, "context", None))
         if not label or key in seen:
             continue
         seen.add(key)
-        controls.append(f"{e.role}: {label}")
+        if not getattr(e, "interactive", True):
+            if len(texts) < 40:
+                texts.append(label)
+            continue
+        # State in brackets ("[on]", "[collapsed]", "[selected]") and the current value, so
+        # the planner can tell whether a switch is already on or which option is chosen.
+        tags = e.state_tags() if hasattr(e, "state_tags") else []
+        value = (e.value or "").strip()
+        shown = f"{e.role}: {label}" + (f" ({e.context})" if getattr(e, "context", None) else "")
+        if value and value != label and e.role in ("ComboBox", "Slider", "Spinner", "Edit", "Custom"):
+            shown += f" = {value[:80]}"
+        if tags:
+            shown += f" [{', '.join(tags)}]"
+        n = len(controls) + 1
+        controls.append(f"[{n}] {shown}")
+        if numbered is not None:
+            numbered[n] = {"role": e.role, "label": label, "context": getattr(e, "context", None),
+                           "bbox": tuple(e.bbox_screen)}
         if len(controls) >= limit:
             break
     lines.append("Controls:\n" + "\n".join(controls))
+    if texts:
+        lines.append("Text on screen:\n" + "\n".join(texts))
     return "\n".join(lines)
 
 
@@ -163,10 +189,9 @@ class CascadeRouter:
         tracer: Tracer,
         user_name: str = "User",
         brain: Any = None,
-        kev: Optional[JevGate] = None,
+        laya: Optional[JevGate] = None,
         tier1: Optional[Tier1Intent] = None,
         system2: Optional[System2] = None,
-        browser: Optional[browser_mod.BrowserTier] = None,
         should_abort: Optional[threading.Event] = None,
         confirmation_callback: Optional[ConfirmationCallback] = None,
         app_launcher: Optional[Callable[[str], Tuple[Optional[int], str]]] = None,
@@ -181,12 +206,11 @@ class CascadeRouter:
         self.tracer = tracer
         self.user_name = user_name
         self.brain = brain
-        self.kev = kev or JevGate()
+        self.laya = laya or JevGate()
         self.tier1 = tier1 or Tier1Intent(user_name=user_name, tracer=tracer)
         self.tier1.tracer = tracer
         self.system2 = system2 or System2(user_name=user_name, tracer=tracer)
         self.system2.tracer = tracer
-        self.browser = browser if browser is not None else browser_mod.browser_tier
         self.abort_event = should_abort or threading.Event()
         self.confirmation_callback = confirmation_callback
         # ask(kind, payload, options) -> chosen option; drives the copilot's buttons.
@@ -200,20 +224,39 @@ class CascadeRouter:
         if exclude_hwnds is None:
             from servo.actuation.overlay import own_windows as exclude_hwnds
         self.exclude_hwnds = exclude_hwnds
+        self._commands_declined = False
+        # What each control number in the last screen description stands for.
+        self._numbered: Dict[int, Dict[str, Any]] = {}
+        self.agent = DEFAULT_AGENT   # planner agent for this task (Laya picks it; planners.py)
+        self._handoffs = 0
+        self._outside_planner = False   # run_step: an MCP caller plans; every specialist is allowed
         self.history = history or []
         if memory is not None:
             self.memory = memory
         else:
-            try:
-                from servo.cognition.memory import chat_memory
-                self.memory = chat_memory
-            except Exception:
-                self.memory = None
-        self.context = context  # "desktop" | "browser"
+            from servo.cognition.memory import chat_memory
+            self.memory = chat_memory
+        self.context = context  # "desktop" (web pages are windows driven like any app)
         self.recent_browser = ""  # browser app this request launched (user browser mode)
         self.goal = ""
-        self._reports: List[StepExecutionReport] = []
         self._skip_requested = False
+
+    def _try_intent_request(self, complexity: str) -> Tuple[Optional[List[PlanStep]], float, str]:
+        """Try the tuned intent Needle when configured; return (None, 0.0, reason) to hand off to System 2."""
+        if complexity != "single" or not settings.needle_intent_weights:
+            return None, 0.0, ""
+        from servo.cognition import intents
+
+        reading = intents.read(self.goal, "request", tracer=self.tracer)
+        if not reading:
+            return None, 0.0, reading.why or "Needle left this for the planner"
+        steps: List[PlanStep] = []
+        try:
+            for call in reading.calls:
+                steps.extend(intents.request_steps(call["name"], call.get("arguments") or {}, start=len(steps) + 1))
+        except intents.IntentError as e:
+            return None, 0.0, str(e)
+        return steps, float(reading.confidence or 0.0), ""
 
     # ================================================================== run
 
@@ -227,16 +270,20 @@ class CascadeRouter:
             # Redacted before memory, traces or any model sees it; Servo never types secrets.
             tr.emit("decision", "Secret removed from your request",
                     f"{', '.join(sorted(set(secrets_found)))} replaced with [redacted]. Servo never types "
-                    "passwords, codes or card numbers; enter those yourself.", tier="kev", status="warn")
+                    "passwords, codes or card numbers; enter those yourself.", tier="laya", status="warn")
         records: List[StepRecord] = []
-        counters = {"replans": 0, "rounds": 0}
+        counters = {"replans": 0, "rounds": 0, "still": 0}
+        self._commands_declined = False
+        self.system2.reset_tier()
+        self.agent, self._handoffs = DEFAULT_AGENT, 0
 
         def finish(success: bool, reply: str, route: str, aborted: bool = False) -> RunOutcome:
             if self.memory is not None:
                 try:
                     self.memory.add_turn("assistant", reply, run_id=tr.run_id, route=route)
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    tr.emit("error", "Chat memory not saved", f"{e.__class__.__name__}: {e}", tier="copilot",
+                            status="warn")
             out = RunOutcome(
                 run_id=tr.run_id, goal=self.goal, success=success, reply=reply, route=route, steps=records,
                 replans=counters["replans"], aborted=aborted, latency_ms=int((time.perf_counter() - t0) * 1000),
@@ -244,37 +291,33 @@ class CascadeRouter:
             tr.emit("result", reply, tier="copilot", status="ok" if success else ("warn" if aborted else "fail"),
                     duration_ms=out.latency_ms, route=route, replans=counters["replans"],
                     rounds=counters["rounds"], steps=len(records))
-            self._record_telemetry(out)
             try:
                 from servo.telemetry.run_record import build_record, save_run
                 save_run(build_record(out, tr.events, {"secrets_redacted": bool(secrets_found),
                                                         "browser": self.recent_browser or None}))
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                tr.emit("error", "Run record not saved (diagnosis won't find this run)",
+                        f"{e.__class__.__name__}: {e}", tier="copilot", status="warn")
+            self._remember_run(out)
             return out
 
         if self.memory is not None:
             try:
                 self.memory.add_turn("user", self.goal, run_id=tr.run_id)
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                tr.emit("error", "Chat memory not saved", f"{e.__class__.__name__}: {e}", tier="copilot",
+                        status="warn")
 
-        # 0. Conversation and desktop introspection never need a model.
-        if self.brain is not None:
-            quick = self.brain.conversational_reply(self.goal)
-            if quick:
-                tr.emit("route", "Conversation", "Answered locally without touching the desktop.", tier="router")
-                return finish(True, quick, "chat")
-
-        # 0b. A stated preference ("dia is my default browser") is remembered, not executed.
+        # 0. A stated preference ("dia is my default browser") is remembered, not executed.
         from servo.cognition.user_browser import parse_browser_preference
         pref = parse_browser_preference(self.goal)
         if pref:
+            from servo import user_settings
             try:
-                from servo import user_settings
                 user_settings.save(settings, {"preferred_browser": pref}, mark_done=False)
-            except Exception:
-                settings.preferred_browser = pref
+            except Exception as e:  # noqa: BLE001
+                tr.emit("error", "Preference not saved", f"{e.__class__.__name__}: {e}", tier="router", status="fail")
+                return finish(False, f"I couldn't save that preference: {e}", "preference")
             tr.emit("route", "Preference saved", f"preferred_browser = {pref}", tier="router", status="ok")
             return finish(True, f"Got it. I'll open web pages in {pref.capitalize()} from now on.", "preference")
 
@@ -288,58 +331,63 @@ class CascadeRouter:
                         code=[c.model_dump() for c in d.code], failing_step=d.failing_step)
             return finish(d.found, d.to_text(), "diagnose")
 
-        # 1. Tier 1: a compound request whose every clause parses needs no LLM.
-        compound = self.tier1.propose_compound(self.goal)
-        proposal = compound or self.tier1.propose(self.goal)
-
-        # 2. Kev routing decision.
-        with tr.span("decision", "Kev · route the request", tier="kev") as sp:
-            assess = self.kev.assess_goal(
-                self.goal, tier1_parsed=proposal is not None and proposal.source == "grammar"
-            )
+        # 1. Laya decides what kind of request this is; it has no rule-based stand-in.
+        with tr.span("decision", "Laya · route the request", tier="laya") as sp:
+            try:
+                assess = self.laya.assess_goal(self.goal)
+            except LayaUnavailable as e:
+                sp.done("fail", str(e))
+                return finish(False, f"I can't decide how to handle that: {e}", "laya-unavailable")
             sp.done("ok", assess.reason, confidence=assess.confidence, desktop_task=assess.desktop_task,
-                    complexity=assess.complexity, probabilities=assess.complexity_probabilities, source=assess.source)
+                    complexity=assess.complexity, probabilities=assess.complexity_probabilities, source=assess.source,
+                    domain=assess.domain, domain_probabilities=assess.domain_probabilities)
+        self.agent = planner_agent(assess.domain).name
 
+        if not assess.desktop_task:
+            tr.emit("route", "Conversation → System 2", "Laya: not a desktop task; answering as chat.", tier="router")
+            if not self.system2.available():
+                return finish(False, self._no_system2_message(), "system2-unavailable")
+            try:
+                return finish(True, self._chat(), "chat")
+            except System2Unavailable as e:
+                tr.emit("error", "System 2 chat failed", str(e), tier="system2", status="fail")
+                return finish(False, f"I couldn't answer that: {e}", "chat")
+
+        # 2. A single direct action goes straight to Needle; anything else is planned.
         thr = settings.needle_confidence_threshold
-        confident = proposal is not None and proposal.confidence >= thr
+        intent_steps, intent_conf, intent_why = self._try_intent_request(assess.complexity)
+        proposal = None
+        if intent_steps is None:
+            proposal = self.tier1.propose(self.goal) if assess.complexity == "single" else None
         agentic = False
 
-        if compound is not None:
-            tr.emit("route", f"System 1 runs all {len(compound.steps)} steps",
-                    "Every clause is a direct command, so the sequence runs on-device with no LLM.",
+        if intent_steps is not None:
+            tr.emit("route", "Needle handles this directly",
+                    f"Laya rates the request 'single' and tuned Needle is confident ({intent_conf:.2f} ≥ {settings.needle_intent_threshold:.2f}).",
                     tier="router", status="ok")
-            items: List[Union[str, PlanStep]] = list(compound.steps)
+            items: List[Union[str, PlanStep]] = list(intent_steps)
             route = "system1"
-        elif confident and assess.complexity != "multi":
-            tr.emit("route", "System 1 handles this directly",
-                    f"Tier 1 ({proposal.source}) is confident ({proposal.confidence:.2f} ≥ {thr:.2f}) and Kev rates the "
-                    f"request '{assess.complexity}'. No LLM needed.", tier="router", status="ok")
+        elif proposal is not None and proposal.confidence >= thr:
+            tr.emit("route", "Needle handles this directly",
+                    f"Laya rates the request 'single' and Needle is confident ({proposal.confidence:.2f} ≥ {thr:.2f}).",
+                    tier="router", status="ok")
             items = list(proposal.steps)
             route = "system1"
-        elif proposal is None and not assess.desktop_task:
-            tr.emit("route", "Conversation → System 2", "Not a desktop task; answering as chat.", tier="router")
-            return finish(True, self._chat(), "chat")
         else:
-            why = []
-            if proposal is None:
-                why.append("Tier 1 could not map the request to tool calls")
-            elif not confident:
-                why.append(f"Tier 1 confidence {proposal.confidence:.2f} is below {thr:.2f}")
-            if assess.complexity != "single":
-                why.append(f"Kev rates it '{assess.complexity}'")
-            tr.emit("escalate", "Reasoning miss → System 2", "; ".join(why) + ".", tier="system2", status="warn")
+            why = [f"Laya rates it '{assess.complexity}'"] if assess.complexity != "single" else \
+                [intent_why or self.tier1.last_error or "Needle could not map the request to tool calls"]
+            tr.emit("escalate", "→ System 2", "; ".join(why) + ".", tier="system2", status="warn")
             route = "system2"
             if not self.system2.available():
-                if proposal is not None and proposal.source == "grammar":
-                    tr.emit("route", "System 2 not ready — falling back to the direct parse",
-                            self.system2.unavailable_reason(), tier="router", status="warn")
-                    items = list(proposal.steps)
-                    route = "system1-fallback"
-                else:
-                    return finish(False, self._no_system2_message(), "system2-unavailable")
+                return finish(False, self._no_system2_message(), "system2-unavailable")
             else:
                 try:
-                    plan = self.system2.plan(self.goal, screen=self._screen_summary(), round_no=1)
+                    tr.emit("route", f"Planner agent · {self.agent}",
+                            f"Laya: this is a {planner_agent(self.agent).title} task.", tier="system2", status="ok",
+                            probabilities=assess.domain_probabilities)
+                    plan = self.system2.plan(self.goal, screen=self._screen_summary(), round_no=1, agent=self.agent)
+                    if plan.next_agent and self._hand_off(plan) and not plan.subtasks:
+                        plan = self.system2.plan(self.goal, screen=self._screen_summary(), round_no=1, agent=self.agent)
                 except System2Unavailable as e:
                     tr.emit("error", "System 2 failed", str(e), tier="system2", status="fail")
                     return finish(False, f"I couldn't plan that: {e}", route)
@@ -352,15 +400,35 @@ class CascadeRouter:
         # 3. Act → observe → decide, until System 2 says the goal is done.
         completed: List[str] = []
         last_batch: Tuple[str, ...] = ()
+        last_screen: Optional[str] = None
+        repeated: Optional[Dict[str, Any]] = None
         while True:
-            status, failure = self._run_batch(items, completed, records, counters["rounds"] or 1)
+            if repeated is not None:
+                status, failure, repeated = "failed", repeated, None
+            else:
+                status, failure = self._run_batch(items, completed, records, counters["rounds"] or 1)
             if status == "abort":
                 return finish(False, "Stopped. Nothing else will run.", route, aborted=True)
+            if status == "policy" and self._declined_command_can_replan(failure, counters):
+                # The user said no to a shell command, not to the goal: plan again through
+                # the app's own interface. (Before, every task stopped dead at the first
+                # declined "Start-Process ms-settings:…" or "Rename-Item".)
+                tr.emit("decision", "Command declined → plan through the interface instead",
+                        failure.get("command", ""), tier="system2", status="warn")
+                status = "failed"
+                failure = {**failure, "kind": "declined",
+                           "error": "The user declined this command. Do not run commands for this goal: "
+                                    "do it through the apps' own windows (open, click, type, set), or stop and "
+                                    "explain what you would need."}
             if status == "policy":
                 return finish(False, f"I didn't do “{failure['command']}”: {failure.get('error')}", route)
 
             if status == "failed":
                 kind = failure.get("kind") or "error"
+                if counters["replans"] >= settings.max_replans and self.system2.step_up(
+                        f"The local planner used all {settings.max_replans} re-plans; last failure: "
+                        f"{failure.get('error')}"):
+                    counters["replans"] = 0
                 if counters["replans"] >= settings.max_replans or not self.system2.available():
                     hint = "" if self.system2.available() else f" ({self.system2.unavailable_reason()})"
                     return finish(False, f"I got stuck on “{failure['command']}”: {failure.get('error')}{hint}", route)
@@ -391,30 +459,101 @@ class CascadeRouter:
 
             route = "system2"
             agentic = True
+            screen_now = self._screen_summary(screen_kind)
             try:
-                plan = self.system2.plan(self.goal, screen=self._screen_summary(screen_kind), completed=completed,
-                                         failure=failure, round_no=counters["rounds"] + 1)
+                plan = self.system2.plan(self.goal, screen=screen_now, completed=completed,
+                                         failure=failure, round_no=counters["rounds"] + 1, agent=self.agent)
             except System2Unavailable as e:
                 return finish(False, f"I couldn't decide the next step: {e}", route)
             counters["rounds"] += 1
+            if plan.next_agent and self._hand_off(plan) and not plan.subtasks and not plan.done:
+                items = []
+                last_batch, last_screen = (), None
+                continue
+            if failure and plan.subtasks and " ".join(plan.subtasks[0].split()).lower() ==                     " ".join(str(failure.get("command") or "").split()).lower():
+                # The planner sent the step that just failed, unchanged: it would fail the same way.
+                tr.emit("decision", "Planner repeated the failed step · not run", plan.subtasks[0],
+                        tier="system2", status="warn")
+                repeated = {**failure, "kind": "reasoning",
+                            "error": f"You sent “{plan.subtasks[0]}” again unchanged after it failed with: "
+                                     f"{failure.get('error')}. Use a different control, step form or route."}
+                continue
             if plan.done:
                 n = len(records)
                 return finish(True, plan.reply or f"Done — {n} step{'s' if n != 1 else ''} completed.", route)
             if not plan.subtasks:
                 return finish(False, plan.reply or "I'm not sure what to do next.", route)
             batch = tuple(plan.subtasks)
-            if batch == last_batch and failure is None:
-                return finish(False, "I was about to repeat the same steps without progress, so I stopped. "
-                                     + (plan.reply or ""), route)
-            last_batch = batch
+            # Repeating a step is fine while it makes progress ("scroll down" twice on a long
+            # page). Stop only when the same steps come back AND the screen didn't change.
+            counters["still"] = counters["still"] + 1 if screen_now == last_screen else 0
+            stuck = (batch == last_batch and failure is None and screen_now == last_screen) or counters["still"] >= 3
+            if stuck:
+                why = ("it proposed the same steps again and the screen did not change"
+                       if batch == last_batch else "the screen has not changed for 3 rounds")
+                if self.system2.step_up(f"The local planner is stuck: {why}"):
+                    counters["still"] = 0
+                    last_batch, last_screen = (), None
+                    items = []  # nothing to run: go straight to a fresh plan from the cloud tier
+                    continue
+                return finish(False, f"I stopped: {why}. " + (plan.reply or ""), route)
+            last_batch, last_screen = batch, screen_now
             items = list(plan.subtasks)
+
+    # ============================================================ for MCP callers
+
+    def screen(self) -> Tuple[str, Dict[int, Dict[str, Any]]]:
+        """The numbered screen description planners see, and what each number stands for
+        (pass it back to run_step: control numbers only mean something for this screen)."""
+        text = self._screen_summary()
+        return text, dict(self._numbered)
+
+    def run_step(self, step_text: str, numbered: Optional[Dict[int, Dict[str, Any]]] = None) -> RunOutcome:
+        """Run ONE step form written by an outside planner (an MCP caller): the Needle agent
+        for its tool, check_call, then the same execution, gate and verification as any
+        planner step. Every specialist is allowed; the Laya risk gate and the confirmation
+        callback still apply to each action."""
+        t0 = time.perf_counter()
+        tr = self.tracer
+        self.goal = step_text.strip()
+        tr.emit("goal", self.goal, tier="mcp")
+        self._numbered = dict(numbered or {})
+        self._outside_planner = True
+        records: List[StepRecord] = []
+        status, failure = self._run_batch([self.goal], [], records, round_no=1)
+        if status == "ok":
+            outs = [r.output for r in records if r.output]
+            reply = "Done." + ("\n" + "\n".join(outs) if outs else "")
+        else:
+            reply = f"{failure.get('kind') or status}: {failure.get('error') or status}"
+        out = RunOutcome(run_id=tr.run_id, goal=self.goal, success=status == "ok", reply=reply, route="mcp-step",
+                         steps=records, aborted=status == "abort",
+                         latency_ms=int((time.perf_counter() - t0) * 1000))
+        tr.emit("result", reply, tier="mcp", status="ok" if out.success else "fail", duration_ms=out.latency_ms,
+                route="mcp-step", steps=len(records))
+        try:
+            from servo.telemetry.run_record import build_record, save_run
+            save_run(build_record(out, tr.events, {"source": "mcp"}))
+        except Exception as e:  # noqa: BLE001
+            tr.emit("error", "Run record not saved", f"{e.__class__.__name__}: {e}", tier="mcp", status="warn")
+        return out
+
+    def _hand_off(self, plan: Any) -> bool:
+        """The planner asked to hand the task to another agent. Returns whether it switched."""
+        nxt = plan.next_agent
+        if nxt not in PLANNER_AGENTS or nxt == self.agent or self._handoffs >= 3:
+            return False
+        self._handoffs += 1
+        self.tracer.emit("route", f"Planner agent · {self.agent} → {nxt}",
+                         plan.thought or f"The task moved to {PLANNER_AGENTS[nxt].title}.", tier="system2", status="ok")
+        self.agent = nxt
+        return True
 
     def _run_batch(
         self, items: List[Union[str, PlanStep]], completed: List[str], records: List["StepRecord"], round_no: int,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run one batch of subtasks. Returns ("ok"|"failed"|"policy"|"abort", failure)."""
         tr = self.tracer
-        thr = settings.needle_confidence_threshold
         labels = [i if isinstance(i, str) else describe_step(i) for i in items]
         plan_ev = tr.emit("plan", f"Round {round_no} · {len(items)} step{'s' if len(items) != 1 else ''}",
                           "\n".join(labels), tier="system2" if any(isinstance(i, str) for i in items) else "needle",
@@ -439,12 +578,15 @@ class CascadeRouter:
 
             progress(i, "running")
             if isinstance(item, str):
-                prop = self.tier1.propose(item) or self.tier1.propose_compound(item)
-                if prop is None or prop.confidence < thr:
-                    progress(i, "fail", "not understood")
+                allowed = None if self._outside_planner else planner_agent(self.agent).specialists
+                prop = self.tier1.propose(item, planner_step=True, allowed=allowed)
+                if prop is None:
+                    why = self.tier1.last_error or "Needle could not interpret this step"
+                    progress(i, "fail", why)
                     return "failed", {"command": item, "kind": "reasoning",
-                                      "error": "System 1 could not interpret this command; rewrite it in the command grammar."}
-                steps = list(prop.steps)
+                                      "error": f"{why}. Write the step as one plain action on a numbered control, "
+                                               "e.g. “click [12]”, “type \"hello\" into [4]”, “set \"03\" in [7]”."}
+                steps = [self._ground(s) for s in prop.steps]
             else:
                 steps = [item]
 
@@ -463,7 +605,9 @@ class CascadeRouter:
                                           tier=out.tier, success=out.success,
                                           error=out.error, latency_ms=int((time.perf_counter() - t_step) * 1000),
                                           output=out.output,
-                                          verification=out.verification if out.success else "failed", note=out.note))
+                                          verification=out.verification if out.success else "failed", note=out.note,
+                                          target=str(step.arguments.get("target") or ""), app=self._app_name(),
+                                          page=self.title or ""))
                 if out.success:
                     if out.output:
                         outputs.append(out.output)
@@ -479,7 +623,7 @@ class CascadeRouter:
                     kind = "abort"
                 progress(i, "fail", out.error or "")
                 failure = {"command": command, "tool_call": describe_step(step), "kind": kind,
-                           "error": out.error, **out.detail}
+                           "error": out.error, "tool": step.tool_name, **out.detail}
                 return ("abort" if kind == "abort" else "policy" if kind == "policy" else "failed"), failure
 
             if skipped:
@@ -505,7 +649,9 @@ class CascadeRouter:
             return default
         try:
             return self.ask(kind, payload, options, timeout) or default
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            self.tracer.emit("error", f"Couldn't ask you ({kind})", f"{e.__class__.__name__}: {e}; using “{default}”",
+                             tier="copilot", status="warn")
             return default
 
     def _confirm(self, req: ConfirmationRequest) -> bool:
@@ -513,16 +659,18 @@ class CascadeRouter:
         if self.confirmation_callback is not None:
             try:
                 approved = bool(self.confirmation_callback(req))
-                if not approved and self._skip_requested:
-                    self.tracer.emit("decision", "You skipped this step", req.tool_call, tier="kev", status="warn")
-                return approved
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                self.tracer.emit("error", "Confirmation failed · not running the step", f"{e.__class__.__name__}: {e}",
+                                 tier="laya", status="fail")
+                return False
+            if not approved and self._skip_requested:
+                self.tracer.emit("decision", "You skipped this step", req.tool_call, tier="laya", status="warn")
+            return approved
         if self.ask is not None:
             choice = self._ask("confirm", req.model_dump(), ["proceed", "skip", "stop"], default="stop")
             if choice == "skip":
                 self._skip_requested = True
-                self.tracer.emit("decision", "You skipped this step", req.tool_call, tier="kev", status="warn")
+                self.tracer.emit("decision", "You skipped this step", req.tool_call, tier="laya", status="warn")
                 return False
             if choice == "stop":
                 self.abort_event.set()
@@ -532,23 +680,164 @@ class CascadeRouter:
 
     # ============================================================ execution
 
+    def _other_window_titled(self, title: str, exact: bool = False) -> Optional[int]:
+        """An open window (not Servo's, not the current one) with this title."""
+        t = " ".join(title.lower().split())
+        if len(t) < 3:
+            return None
+        own = self.exclude_hwnds() if self.exclude_hwnds else set()
+        best = None
+        for w in windows.list_windows():
+            h, wt = int(w["hwnd"]), " ".join(str(w.get("title") or "").lower().split())
+            if h in own or h == self.hwnd or "servo copilot" in wt or wt in ("program manager", ""):
+                continue
+            if wt == t:
+                return h
+            if not exact and best is None and t in wt:
+                best = h
+        return best
+
+    def _focus_window(self, title: str, step: PlanStep) -> StepOutcome:
+        """Bring an already-open window to the front and work in it from now on."""
+        call = describe_step(step)
+        h = self._other_window_titled(title)
+        if h is None and self.hwnd and title.lower() in windows.get_window_title(self.hwnd).lower():
+            h = self.hwnd
+        if h is None:
+            titles = [w.get("title") for w in windows.list_windows()[:12] if w.get("title")]
+            return StepOutcome(success=False, kind="perception", tier="uia",
+                               error=f"No open window titled '{title}'. Open windows: {', '.join(map(str, titles))}")
+        from servo.actuation.sandboxing import activate_window
+        ok = activate_window(h)
+        self.hwnd, self.title, self.context = h, windows.get_window_title(h), "desktop"
+        self.tracer.emit("action", call, f"Now working in “{self.title}”", tier="uia", status="ok" if ok else "warn")
+        return StepOutcome(success=True, tier="uia", verification="confirmed" if ok else "unconfirmed",
+                           note=None if ok else f"“{self.title}” was found but Windows kept it in the background")
+
+    def _refresh_target(self) -> None:
+        """If the window we were working in closed, continue in whatever is now in front.
+
+        Before, a closed Explorer window kept being sensed ("Invalid handle passed to
+        connect()") for the rest of the run, and the planner saw no screen at all.
+        """
+        if sys.platform != "win32" or not self.hwnd or windows.is_window(self.hwnd):
+            return
+        try:
+            fg = windows.get_foreground_window()
+            own = self.exclude_hwnds() if self.exclude_hwnds else set()
+            if fg and windows.is_window(fg) and fg not in own:
+                old = self.title
+                self.hwnd, self.title = fg, windows.get_window_title(fg)
+                self.tracer.emit("perception", f"Window closed · now in “{self.title}”",
+                                 f"“{old}” is gone; continuing in the window in front.", tier="uia", status="warn")
+            else:
+                self.hwnd = None
+        except Exception:
+            pass
+
     def _execute(self, step: PlanStep) -> StepOutcome:
+        self._refresh_target()
         tool = step.tool_name
+        if tool == "focus_window":
+            return self._focus_window(str(step.arguments.get("title") or ""), step)
+        if tool == "describe_screen":
+            return self._describe_screen(step)
+        if tool == "read_text":
+            return self._read_text(step)
         if tool in system_tools.SYSTEM_TOOLS:
             return self._system(step)
         if tool in BROWSER_TOOLS:
-            if settings.browser_mode == "user":
-                return self._user_browser_nav(step)
-            return self._browser_nav(step)
-        if tool in BROWSER_CAPABLE and self.context == "browser" and self._browser_open():
-            return self._browser_action(step)
+            return self._user_browser_nav(step)
+        if tool in _DIRECT_TOOLS:
+            return self._direct(step)
         return self._desktop(step)
 
-    def _browser_open(self) -> bool:
+    # ---------------------------------------------------------- direct (Needle requests)
+
+    def _direct(self, step: PlanStep) -> StepOutcome:
+        """Actions without a target control (servo/cognition/intents.py request_steps): the
+        speaker, media keys, a window's size, a browser tab shortcut, opening a file. Each is
+        gated like any step and reports what it read back."""
+        tool, a = step.tool_name, step.arguments
+        call = describe_step(step)
+        stop = self._gate(step.rationale or call, call, str(a.get("name") or a.get("path") or a.get("op") or tool),
+                          self.title or "", process_name="system")
+        if stop:
+            return stop
+        self.tracer.emit("action", call, step.rationale, tier="system")
         try:
-            return self.browser.is_open()
-        except Exception:
-            return False
+            ok, note = self._direct_run(tool, a)
+        except Exception as e:  # noqa: BLE001
+            self.tracer.emit("verify", f"{tool} failed", f"{e.__class__.__name__}: {e}", tier="system", status="fail")
+            return StepOutcome(success=False, kind="error", tier="system", error=f"{tool} failed: {e}")
+        self.tracer.emit("verify", note, "", tier="system", status="ok" if ok else "fail")
+        if not ok:
+            return StepOutcome(success=False, kind="verify", tier="system", error=note)
+        return StepOutcome(success=True, tier="system", verification="confirmed", output=note)
+
+    def _direct_run(self, tool: str, a: Dict[str, Any]) -> Tuple[bool, str]:
+        if tool == "audio":
+            from servo.actuation import audio
+            if a["op"] in ("mute", "unmute"):
+                want = a["op"] == "mute"
+                got = audio.set_muted(want)
+                return got == want, f"Sound is {'muted' if got else 'on'}."
+            before = audio.get_volume()
+            target = max(0, min(100, before + int(a["change"])))
+            after = audio.set_volume(target)
+            return after == target, f"Volume {before} → {after}."
+        if tool == "media_key":
+            from servo.actuation.needle_tools import MEDIA_KEYS
+            import ctypes
+            vk = MEDIA_KEYS[a["key"]]
+            for _ in range(int(a.get("presses") or 1)):
+                ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(vk, 0, 2, 0)
+            label = {"playpause": "play/pause (toggles whatever is playing)", "nexttrack": "next track",
+                     "prevtrack": "previous track"}.get(a["key"], a["key"])
+            return True, f"Pressed the {label} media key."
+        if tool == "window_state":
+            from servo.daemon.copilot import find_app_window
+            hwnd = find_app_window(str(a["name"]))
+            if not hwnd:
+                return False, f"No open window for {a['name']}."
+            import ctypes
+            user32 = ctypes.windll.user32
+            user32.ShowWindow(hwnd, 6 if a["state"] == "minimize" else 3)   # SW_MINIMIZE / SW_MAXIMIZE
+            time.sleep(0.3)
+            done = bool(user32.IsIconic(hwnd)) if a["state"] == "minimize" else bool(user32.IsZoomed(hwnd))
+            title = windows.get_window_title(hwnd)
+            return done, f"“{title}” is {a['state']}d." if done else f"“{title}” did not {a['state']}."
+        if tool == "browser_hotkey":
+            from servo.cognition import user_browser as ub
+            from servo.actuation.needle_tools import build_hotkey_sequence
+            name, _why = ub.choose_browser("", self.recent_browser)
+            launcher = self.app_launcher
+            if launcher is None:
+                from servo.daemon.copilot import launch_or_focus_app as launcher
+            hwnd, title = launcher(name)
+            if not hwnd:
+                return False, f"Couldn't bring up {name}: {title}"
+            before = windows.get_window_title(hwnd)
+            from pywinauto.keyboard import send_keys
+            send_keys(build_hotkey_sequence(list(a["keys"])))
+            time.sleep(0.5)
+            self.hwnd, self.title, self.recent_browser = hwnd, windows.get_window_title(hwnd), name
+            changed = self.title != before or not windows.is_window(hwnd)
+            return True, (f"Pressed {'+'.join(a['keys'])} in {name}; the window now shows “{self.title}”."
+                          if changed else f"Pressed {'+'.join(a['keys'])} in {name}; its title did not change.")
+        if tool == "open_file":
+            import os
+            before = windows.get_foreground_window()
+            os.startfile(str(a["path"]))  # type: ignore[attr-defined]
+            for _ in range(40):
+                time.sleep(0.2)
+                fg = windows.get_foreground_window()
+                if fg and fg != before:
+                    self.hwnd, self.title = fg, windows.get_window_title(fg)
+                    return True, f"Opened {a['path']} in “{self.title}”."
+            return False, f"Asked Windows to open {a['path']}, but no new window came up."
+        raise ValueError(f"unknown direct action {tool}")
 
     # ---------------------------------------------------------- desktop
 
@@ -569,7 +858,6 @@ class CascadeRouter:
             exclude_hwnds=self.exclude_hwnds,
         )
         summary = coord.execute_plan(MacroPlan(goal=self.goal, steps=[step]), app_launcher=self.app_launcher)
-        self._reports.extend(summary.step_reports)
         if summary.active_hwnd:
             self.hwnd, self.title = summary.active_hwnd, summary.active_title
         else:
@@ -606,32 +894,46 @@ class CascadeRouter:
 
     # ---------------------------------------------------------- browser
 
+    def _declined_command_can_replan(self, failure: Dict[str, Any], counters: Dict[str, int]) -> bool:
+        """Only a declined shell command, only once per run, and only with a planner."""
+        if failure.get("tool") != "run_command" or "rejected by user" not in str(failure.get("error") or "").lower():
+            return False
+        self._commands_declined = True
+        if counters.get("declined_commands", 0) >= 1 or not self.system2.available():
+            return False
+        counters["declined_commands"] = counters.get("declined_commands", 0) + 1
+        return True
+
     def _gate(self, sub_goal: str, tool_call: str, label: str, window_title: str,
               floor: Optional[Tuple[str, str]] = None, process_name: str = "browser") -> Optional[StepOutcome]:
-        """Kev pre-check + confirmation. Returns a failed outcome to stop, or None to proceed.
+        """Laya pre-check + confirmation. Returns a failed outcome to stop, or None to proceed.
 
-        ``floor`` is a deterministic (level, reason) minimum that Kev cannot lower.
+        ``floor`` is a deterministic (level, reason) minimum that Laya cannot lower.
         """
-        pre = self.kev.evaluate_pre_risk(sub_goal, tool_call, label)
+        try:
+            pre = self.laya.evaluate_pre_risk(sub_goal, tool_call, label)
+        except LayaUnavailable as e:
+            self.tracer.emit("decision", "Laya pre-check failed", str(e), tier="laya", status="fail")
+            return StepOutcome(success=False, kind="policy", tier="laya", error=f"No safety check possible: {e}")
         if floor and _RISK_ORDER[floor[0]] > _RISK_ORDER[pre.risk_level]:
             pre = pre.model_copy(update={"risk_level": floor[0], "reason": f"{floor[1]} (floor; was {pre.risk_level}: {pre.reason})"})
-        self.tracer.emit("decision", f"Kev pre-check · {pre.risk_level} risk", pre.reason, tier="kev",
+        self.tracer.emit("decision", f"Laya pre-check · {pre.risk_level} risk", pre.reason, tier="laya",
                          status="ok" if pre.risk_level == "low" and pre.scope_valid else "warn",
                          source=pre.source, scope_valid=pre.scope_valid, probabilities=pre.probabilities)
         if not pre.scope_valid:
-            return StepOutcome(success=False, kind="policy", tier="kev",
-                               error=f"Kev rejected the action as out of scope: {pre.reason}")
+            return StepOutcome(success=False, kind="policy", tier="laya",
+                               error=f"Laya rejected the action as out of scope: {pre.reason}")
         if settings.mode == "assistant" and pre.risk_level in ("medium", "high"):
             approved = self._confirm(ConfirmationRequest(
                 sub_goal=sub_goal, tool_call=tool_call, element_label=label, risk_level=pre.risk_level,
                 reason=pre.reason, hwnd=0, window_title=window_title, process_name=process_name,
             ))
             self.tracer.emit("decision", f"Your confirmation · {'approved' if approved else 'rejected'}", tool_call,
-                             tier="kev", status="ok" if approved else "fail")
+                             tier="laya", status="ok" if approved else "fail")
             if not approved:
                 if self.abort_event.is_set():
-                    return StepOutcome(success=False, kind="abort", tier="kev", error="Execution cancelled by user.")
-                return StepOutcome(success=False, kind="policy", tier="kev",
+                    return StepOutcome(success=False, kind="abort", tier="laya", error="Execution cancelled by user.")
+                return StepOutcome(success=False, kind="policy", tier="laya",
                                    error="Action rejected by user confirmation (declined or timed out).")
         if self.abort_event.is_set():
             return StepOutcome(success=False, kind="abort", tier="browser", error="Execution cancelled by user.")
@@ -642,6 +944,11 @@ class CascadeRouter:
     def _system(self, step: PlanStep) -> StepOutcome:
         """Files and shell, without the GUI. Gated like every other action, with a floor."""
         tool, args = step.tool_name, step.arguments
+        if tool == "run_command":
+            if self._commands_declined:
+                return StepOutcome(success=False, kind="reasoning", tier="system",
+                                   error="The user already declined a command for this goal. Use the apps' own "
+                                         "windows (open, click, type, set) instead of commands.")
         call = system_tools.describe(tool, args)
         why = system_tools.availability()
         if why:
@@ -661,14 +968,11 @@ class CascadeRouter:
         except system_tools.SystemToolError as e:
             kind = "abort" if self.abort_event.is_set() else "error"
             self.tracer.emit("verify", f"{tool} failed", str(e), tier="system", status="fail")
-            self._report(step, False, call, str(e))
             return StepOutcome(success=False, kind=kind, tier="system", error=str(e))
         except Exception as e:
-            self._report(step, False, call, str(e))
             return StepOutcome(success=False, kind="error", tier="system", error=f"{tool} failed: {e}")
         self.tracer.emit("verify", res.summary, res.output[:2000], tier="system", status="ok",
                          duration_ms=int((time.perf_counter() - t0) * 1000))
-        self._report(step, True, res.summary)
         return StepOutcome(success=True, tier="system", output=res.output)
 
     def _user_browser_nav(self, step: PlanStep) -> StepOutcome:
@@ -685,7 +989,7 @@ class CascadeRouter:
         call = describe_step(step)
         problem = ub.url_problem(url, self.goal)
         if problem:
-            self.tracer.emit("decision", "Address refused", problem, tier="kev", status="fail")
+            self.tracer.emit("decision", "Address refused", problem, tier="laya", status="fail")
             return StepOutcome(success=False, kind="policy", tier="browser", error=problem)
 
         name, why = ub.choose_browser(str(args.get("browser") or ""), self.recent_browser)
@@ -715,164 +1019,26 @@ class CascadeRouter:
         status = {"confirmed": "ok", "unconfirmed": "warn", "failed": "fail"}[verdict]
         self.tracer.emit("verify", f"Page · {page_title}", note or f"Address bar shows {url}", tier="browser",
                          status=status, verdict=verdict, duration_ms=int((time.perf_counter() - t0) * 1000))
-        self._report(step, verdict != "failed", call, note or None)
         if verdict == "failed":
             return StepOutcome(success=False, kind="verify", tier="browser", error=note)
         return StepOutcome(success=True, tier="browser", verification=verdict, note=note or None)
 
-    def _browser_nav(self, step: PlanStep) -> StepOutcome:
-        args = step.arguments
-        call = describe_step(step)
-        target = str(args.get("url") or args.get("query") or "")
-        stop = self._gate(step.rationale or call, call, target, "browser")
-        if stop:
-            return stop
-        self.tracer.emit("action", call, "Playwright drives a real browser window", tier="browser")
-        try:
-            t0 = time.perf_counter()
-            state = self.browser.open_url(target) if step.tool_name == "open_url" else self.browser.web_search(target)
-        except Exception as e:
-            return StepOutcome(success=False, kind="error", tier="browser", error=f"Browser failed: {e}")
-        self.context = "browser"
-        self.tracer.emit("perception", f"Page loaded · {state.title or state.url}", state.url, tier="browser",
-                         status="ok", duration_ms=int((time.perf_counter() - t0) * 1000),
-                         aria_snapshot=state.snapshot[:6000])
-        self._report(step, True, call)
-        return StepOutcome(success=True, tier="browser")
-
-    def _browser_action(self, step: PlanStep) -> StepOutcome:
-        args = step.arguments
-        tool = step.tool_name
-        call = describe_step(step)
-        if tool == "send_hotkey":
-            keys = list(args.get("keys") or [])
-            stop = self._gate(step.rationale or call, call, "+".join(keys), "browser")
-            if stop:
-                return stop
-            self.tracer.emit("action", call, "Playwright keyboard", tier="browser")
-            before, after = self.browser.press(keys)
-            delta = browser_mod.snapshot_delta(before, after)
-            changed = bool(delta["has_changed"])
-            self.tracer.emit("verify", "Page " + ("changed" if changed else "unchanged — effect not visible"),
-                             f"{after.title} <{after.url}>", tier="browser", status="ok" if changed else "warn",
-                             verdict="confirmed" if changed else "unconfirmed")
-            self._report(step, True, call)
-            return StepOutcome(success=True, tier="browser", verification="confirmed" if changed else "unconfirmed",
-                               note=None if changed else f"Pressed {'+'.join(keys)}; the page did not visibly change")
-
-        for_input = tool == "type_text"
-        target = str(args.get("target") or ("" if for_input else ""))
-        t0 = time.perf_counter()
-        loc = self.browser.locate(target, for_input=for_input)
-        self.tracer.emit(
-            "perception",
-            f"DOM · “{target or 'input'}” → " + (f"{loc.count} match" + ("es" if loc.count != 1 else "")),
-            loc.strategy or "no locator strategy matched", tier="browser",
-            status="ok" if loc.found else ("warn" if loc.count > 1 else "fail"),
-            confidence=loc.confidence, duration_ms=int((time.perf_counter() - t0) * 1000),
-            tried=loc.tried, candidates=loc.candidates,
-        )
-
-        if not loc.found and loc.count > 1:
-            return StepOutcome(success=False, kind="reasoning", tier="browser",
-                               error=f"Ambiguous target “{target}”: {loc.count} matches",
-                               detail={"candidates": loc.candidates})
-        if not loc.found:
-            if for_input:
-                return StepOutcome(success=False, kind="perception", tier="browser",
-                                   error=f"No input field matching “{target}” on the page")
-            return self._browser_mirage_click(step, target)
-
-        stop = self._gate(step.rationale or call, call, target, "browser")
-        if stop:
-            return stop
-        self.tracer.emit("action", call, f"Locator: {loc.strategy}", tier="browser")
-        try:
-            if for_input:
-                text = str(args.get("text") or "")
-                _, before, after, value = self.browser.fill(
-                    target, text, press_enter=bool(args.get("press_enter")), clear_first=args.get("clear_first", True) is not False,
-                )
-                if text and text in (value or ""):
-                    self.tracer.emit("verify", "Kev post-check · change confirmed", "Typed text is in the field.",
-                                     tier="kev", status="ok", confidence=0.95)
-                    self._report(step, True, call)
-                    return StepOutcome(success=True, tier="browser")
-            else:
-                button = str(args.get("button") or ("double" if tool == "double_click" else "right" if tool == "right_click" else "left"))
-                _, before, after = self.browser.click(target, button=button)
-        except Exception as e:
-            return StepOutcome(success=False, kind="error", tier="browser", error=f"Browser action failed: {e}")
-        return self._browser_verify(step, call, before, after)
-
-    def _browser_verify(self, step: PlanStep, call: str, before: Any, after: Any) -> StepOutcome:
-        delta = SceneDelta(**browser_mod.snapshot_delta(before, after))
-        post = self.kev.evaluate_post_transition(step.rationale or call, delta, expected_outcome=call,
-                                                 typed_text=str(step.arguments.get("text") or "") if step.tool_name == "type_text" else "")
-        title = {"confirmed": "confirmed", "unconfirmed": "ran, effect not visible", "failed": "expected change not seen"}
-        self.tracer.emit("verify", "Post-check · " + title[post.verdict],
-                         post.explanation, tier="kev",
-                         status={"confirmed": "ok", "unconfirmed": "warn", "failed": "fail"}[post.verdict],
-                         confidence=post.confidence, delta=delta.model_dump(), verdict=post.verdict)
-        self._report(step, post.transition_ok, call, None if post.transition_ok else post.explanation)
-        if post.transition_ok:
-            return StepOutcome(success=True, tier="browser", verification=post.verdict,
-                               note=post.explanation if post.verdict == "unconfirmed" else None)
-        return StepOutcome(success=False, kind="verify", tier="browser", error=post.explanation)
-
-    def _browser_mirage_click(self, step: PlanStep, target: str) -> StepOutcome:
-        from servo.perception.mirage_sensor import describe_image, match_target, parse_detections
-
-        call = describe_step(step)
-        self.tracer.emit("escalate", "Perception miss → Mirage", "Not in the DOM/accessibility tree (canvas, icon or "
-                         "image button?) — looking at the page pixels.", tier="mirage", status="warn")
-        t0 = time.perf_counter()
-        img = self.browser.screenshot_image()
-        raw = describe_image(img) if img is not None else None
-        if raw is None:
-            self.tracer.emit("perception", "Mirage unavailable", "Install cactus-compute (>= 3.3) for visual fallback.",
-                             tier="mirage", status="fail")
-            return StepOutcome(success=False, kind="perception", tier="mirage",
-                               error=f"“{target}” is not on the page and Mirage is unavailable")
-        dets = parse_detections(raw, img.width, img.height)
-        best, score, ranked = match_target(dets, target)
-        ok = best is not None and score >= settings.mirage_match_threshold
-        self.tracer.emit("perception", f"Mirage · {len(dets)} detections",
-                         (f"“{target}” → “{best.label}” at {best.center}" if ok else "no confident match"),
-                         tier="mirage", status="ok" if ok else "fail", confidence=score,
-                         duration_ms=int((time.perf_counter() - t0) * 1000), ranked=ranked)
-        if not ok:
-            return StepOutcome(success=False, kind="perception", tier="mirage",
-                               error=f"Mirage found no confident match for “{target}”",
-                               detail={"mirage_candidates": ranked})
-        stop = self._gate(step.rationale or call, call, best.label, "browser")
-        if stop:
-            return stop
-        self.tracer.emit("action", f"click({best.center[0]}, {best.center[1]})",
-                         "Mouse moves along a path to Mirage's target, then clicks", tier="mirage")
-        before, after = self.browser.click_point(*best.center)
-        return self._browser_verify(step, call, before, after)
-
     # ---------------------------------------------------------- context
 
     def _screen_summary(self, failure_kind: Optional[str] = None) -> str:
-        """What System 2 sees: page accessibility snapshot, or UIA labels (+ Mirage on perception misses)."""
+        """What System 2 sees: the window's numbered controls (+ the OCR text after a perception miss)."""
+        self._refresh_target()
         parts: List[str] = []
         try:
-            if self.context == "browser" and self._browser_open():
-                st = self.browser.state()
-                parts.append(f"Browser page: {st.title} <{st.url}>\nAccessibility snapshot:\n{st.snapshot[:8000]}")
-            elif self.hwnd and windows.is_window(self.hwnd):
+            if self.hwnd and windows.is_window(self.hwnd):
                 from servo.perception.uia_sensor import UIASensor
                 scene = UIASensor(self.hwnd).sense()
+                self._numbered = {}
                 parts.append(describe_scene(scene, app_identity.window_label(
-                    self.hwnd, windows.get_process_name(self.hwnd))))
+                    self.hwnd, windows.get_process_name(self.hwnd)), numbered=self._numbered))
+                self._observe_page(scene)
                 if failure_kind == "perception":
-                    from servo.perception.mirage_sensor import MirageSensor, summarize
-                    ms = MirageSensor(self.hwnd)
-                    mscene = ms.sense(window_title=scene.window_title)
-                    if not mscene.sense_error:
-                        parts.append("Mirage visual detections:\n" + summarize(ms.last_detections))
+                    parts.append(self._ocr_text())
             wins = [w.get("title") for w in windows.list_windows()[:12] if w.get("title")]
             if wins:
                 parts.append("Open windows: " + "; ".join(str(w) for w in wins))
@@ -883,43 +1049,126 @@ class CascadeRouter:
                          tier="system2", full=text)
         return text
 
-    def _chat(self) -> str:
-        if self.system2.available():
-            try:
-                return self.system2.chat(self.goal, self.history).reply or "…"
-            except System2Unavailable as e:
-                self.tracer.emit("error", "System 2 chat failed", str(e), tier="system2", status="fail")
-        if self.brain is not None:
-            return self.brain.offline_chat_reply(self.goal)
-        return "I can help with things on your screen — try “open notepad and write hello”."
-
-    def _no_system2_message(self) -> str:
-        return ("That needs multi-step reasoning, and no System 2 model is configured. Set SERVO_PLANNER_PROVIDER "
-                "(anthropic, openai for Ollama, gemini or cactus), or give me one direct command such as "
-                "“click Save” or “search the web for …”.")
-
-    def _report(self, step: PlanStep, success: bool, desc: str, error: Optional[str] = None,
-                source: Optional[str] = None) -> None:
-        source = source or ("system" if step.tool_name in system_tools.SYSTEM_TOOLS else "browser")
-        self._reports.append(StepExecutionReport(
-            step_index=len(self._reports) + 1, action_type=step.tool_name,
-            target=str(step.arguments.get("target") or step.arguments.get("url") or step.arguments.get("query")
-                       or step.arguments.get("path") or step.arguments.get("command") or ""),
-            description=desc, success=success, latency_ms=0, error=error, perception_source=source,
-        ))
-
-    def _record_telemetry(self, out: RunOutcome) -> None:
-        if not self._reports:
-            return
+    def _ocr_text(self) -> str:
+        """After a perception miss, the planner also gets the text on screen (Windows OCR):
+        it shows labels the accessibility tree does not expose."""
+        from servo.perception.mirage_sensor import MirageSensor
+        from servo.perception.ocr_sensor import OcrUnavailable, read_lines
+        img = MirageSensor(self.hwnd).capture_window_image()
+        if img is None:
+            return "Text on screen (OCR): could not capture the window"
         try:
-            from servo.daemon.tasks import record_plan_trace
-            record_plan_trace(PlanExecutionSummary(
-                goal=out.goal, success=out.success, total_steps=len(self._reports),
-                completed_steps=sum(1 for r in self._reports if r.success), total_latency_ms=out.latency_ms,
-                step_reports=self._reports, active_hwnd=self.hwnd, active_title=self.title, aborted=out.aborted,
-            ), mode="assistant")
+            lines, _ = read_lines(img)
+        except OcrUnavailable as e:
+            return f"Text on screen (OCR) failed: {e}"
+        return "Text on screen (OCR):\n" + "\n".join(d.label for d in lines[:80])
+
+    def _no_target(self) -> str:
+        """No window is targeted: say how to pick one, with the titles to pick from."""
+        own = self.exclude_hwnds() if self.exclude_hwnds else set()
+        titles = [str(w["title"]) for w in windows.list_windows() if w.get("title") and w["hwnd"] not in own][:10]
+        return ('No window is targeted yet. Start with switch to "<exact title>"; open windows: '
+                + "; ".join(f'"{t}"' for t in titles) + ".")
+
+    def _read_text(self, step: PlanStep) -> StepOutcome:
+        """All text visible in the window (Windows OCR), returned to the planner as output."""
+        if not self.hwnd or not windows.is_window(self.hwnd):
+            return StepOutcome(success=False, kind="reasoning", tier="ocr", error=self._no_target())
+        text = self._ocr_text()
+        failed = "failed" in text.split(":", 1)[0] or "could not capture" in text
+        self.tracer.emit("perception", "OCR · text on screen", text[:400], tier="ocr",
+                         status="fail" if failed else "ok")
+        if failed:
+            return StepOutcome(success=False, kind="perception", tier="ocr", error=text)
+        body = text.split("\n", 1)[-1]
+        return StepOutcome(success=True, tier="ocr", output=f"Text in “{self.title}”:\n{body}")
+
+    def _describe_screen(self, step: PlanStep) -> StepOutcome:
+        """Mirage's summary of the window, returned to the planner as output."""
+        from servo.perception.mirage_sensor import MirageSensor, summarize
+        if not self.hwnd or not windows.is_window(self.hwnd):
+            return StepOutcome(success=False, kind="reasoning", tier="mirage", error=self._no_target())
+        ms = MirageSensor(self.hwnd)
+        scene = ms.sense(window_title=self.title)
+        if scene.sense_error:
+            self.tracer.emit("perception", "Mirage failed", scene.sense_error, tier="mirage", status="fail")
+            return StepOutcome(success=False, kind="perception", tier="mirage", error=scene.sense_error)
+        text = summarize(ms.last_detections)
+        self.tracer.emit("perception", f"Mirage · {len(ms.last_detections)} detections", text[:400], tier="mirage")
+        return StepOutcome(success=True, tier="mirage", output=f"Mirage sees in “{self.title}”:\n{text}")
+
+    # ------------------------------------------------------- desktop knowledge graph
+
+    def _app_name(self) -> str:
+        try:
+            if self.hwnd and windows.is_window(self.hwnd):
+                return app_identity.window_label(self.hwnd, windows.get_process_name(self.hwnd)).split(" — ")[0]
         except Exception:
             pass
+        return ""
+
+    def _observe_page(self, scene: Any) -> None:
+        """Every UIA snapshot the planner sees also teaches the graph that page's controls."""
+        try:
+            from servo.cognition.desktop_graph import desktop_graph
+            b = None
+            if sys.platform == "win32" and self.hwnd:
+                import win32gui
+                b = win32gui.GetWindowRect(self.hwnd)
+            controls = [{"label": e.label, "role": e.role, "context": getattr(e, "context", None),
+                         "bbox": e.bbox_screen, "toggle": getattr(e, "toggle", None),
+                         "selected": getattr(e, "selected", None), "expanded": getattr(e, "expanded", None),
+                         "value": e.value if e.role in ("ComboBox", "Slider", "Spinner", "Custom") else None}
+                        for e in scene.elements.values() if getattr(e, "interactive", True)]
+            desktop_graph().observe_page(self._app_name() or "unknown", scene.window_title, controls,
+                                         window_box=tuple(b) if b else None)
+        except Exception as e:  # noqa: BLE001 - learning must never break a run, but say so
+            self.tracer.emit("error", "Desktop graph: could not record this page", str(e), tier="router", status="warn")
+
+    def _remember_run(self, out: "RunOutcome") -> None:
+        """Verified runs become procedures; Laya-failed steps become failures."""
+        try:
+            from servo.cognition.desktop_graph import desktop_graph
+            steps = []
+            for r in out.steps:
+                m = re.match(r"^([A-Za-z]+):\s*(.+?)(?:\s+\((.+)\))?$", r.target or "")
+                steps.append({"call": r.call, "tool": r.tool, "verification": r.verification, "error": r.error,
+                              "app": r.app, "page": r.page,
+                              "target_role": m.group(1) if m else "", "target_label": m.group(2) if m else r.target,
+                              "target_context": (m.group(3) or "") if m else ""})
+            desktop_graph().record_run(out.goal, steps, out.success)
+        except Exception as e:  # noqa: BLE001
+            self.tracer.emit("error", "Desktop graph: could not record this run", str(e), tier="router", status="warn")
+
+    _NUMBER_REF = re.compile(r"^\s*\[?#?\s*(\d{1,3})\s*\]?\s*$")
+
+    def _ground(self, step: PlanStep) -> PlanStep:
+        """A target given as a control number ("17", "[17]") becomes that exact control from
+        the screen description the planner saw: "Role: label (context)", which the resolver
+        matches against the live screen. An unknown number is left as is and fails there."""
+        target = step.arguments.get("target")
+        m = self._NUMBER_REF.match(str(target)) if target is not None else None
+        if not m or int(m.group(1)) not in self._numbered:
+            return step
+        ref = self._numbered[int(m.group(1))]
+        label = f"{ref['role']}: {ref['label']}" + (f" ({ref['context']})" if ref.get("context") else "")
+        args = {**step.arguments, "target": label}
+        canon = None
+        try:
+            canon = AliasMapper.canonicalize_action(raw_action=step.tool_name, **args)
+        except Exception:
+            canon = step.canonical_action
+        self.tracer.emit("perception", f"[{m.group(1)}] → {label}", "control number from the last screen description",
+                         tier="router")
+        return step.model_copy(update={"arguments": args, "canonical_action": canon})
+
+    def _chat(self) -> str:
+        """System 2's chat answer. Raises System2Unavailable; the caller reports the failure."""
+        return self.system2.chat(self.goal, self.history).reply or "…"
+
+    def _no_system2_message(self) -> str:
+        return (f"The planner (System 2) is not available: {self.system2.unavailable_reason()}. "
+                "Start the local planner server or configure the cloud planner.")
 
 
 def new_run_id() -> str:

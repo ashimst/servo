@@ -32,10 +32,6 @@ def test_scene_index_indexing_and_lookup():
     assert idx.get_by_id(0).label == "File"
     assert idx.get_by_id(999) is None
 
-    matches = idx.find_by_label("editor")
-    assert len(matches) == 1
-    assert matches[0].element_id == 1
-
 
 def test_scene_delta_computation():
     before = SceneIndex(

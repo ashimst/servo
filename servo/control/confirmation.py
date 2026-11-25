@@ -1,6 +1,5 @@
 """Human confirmation channel for medium/high-risk actions in assistant mode.
 
-See SERVO_HARDENING_NOTES.md §11.
 
 The default channel is a native Windows dialog shown on the desktop being automated:
 the person who can see the target window is the one who approves. Design rules:

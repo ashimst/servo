@@ -24,7 +24,7 @@ TraceKind = Literal[
     "tier",        # a tier was tried (with confidence)
     "perception",  # UIA / Mirage / DOM sensing result
     "model",       # a model call: prompt, response, reasoning, confidence
-    "decision",    # Kev decision (risk, scope, verification)
+    "decision",    # Laya decision (risk, scope, verification)
     "action",      # actuation dispatched
     "verify",      # post-action verification
     "escalate",    # escalation (perception miss / reasoning miss / verify fail)
@@ -34,7 +34,7 @@ TraceKind = Literal[
     "error",
 ]
 
-Tier = Literal["router", "needle", "uia", "browser", "mirage", "kev", "system2", "copilot"]
+Tier = Literal["router", "needle", "uia", "browser", "mirage", "laya", "system2", "copilot"]
 
 _seq = itertools.count(1)
 

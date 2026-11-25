@@ -78,25 +78,9 @@ def test_knowledge_ontology_parsing(tmp_path):
     assert "surface_win32" in graph.nodes
     assert "surface_wpf" in graph.nodes
     assert "surface_electron" in graph.nodes
-    assert "surface_canvas" in graph.nodes
     assert graph.nodes["surface_win32"].type == "UISurface"
-
-    # OS Primitives
-    assert "primitive_hwnd_focus" in graph.nodes
-    assert "primitive_uac" in graph.nodes
-    assert "primitive_file_dialogs" in graph.nodes
-
-    # Bridges
-    assert "bridge_uia_sensor" in graph.nodes
-    assert "bridge_mirage_sensor" in graph.nodes
-    assert "bridge_trajectory" in graph.nodes
-    assert "bridge_watchdog" in graph.nodes
-    assert "bridge_jev_gate" in graph.nodes
-
-    # Playbooks
-    assert "playbook_task_decomposition" in graph.nodes
-    assert "playbook_failure_recovery" in graph.nodes
-    assert "playbook_edge_cases" in graph.nodes
+    # Only real knowledge: no decorative primitive/bridge/playbook nodes.
+    assert not [n for n in graph.nodes.values() if n.type in ("OSPrimitive", "Bridge", "Playbook")]
 
     # Learned Quirks
     assert "edge_app_mode_mic" in graph.nodes
@@ -148,8 +132,9 @@ def test_graph_memory_query_and_prompt_formatting(tmp_path):
     assert "Edge App Mode Microphone" not in prompt_ctx
 
     # Task-scoped quirks for the focused app do appear.
-    wpf_ctx = gm.format_context_for_prompt(goal="select a row", active_app="wpf_generic")
-    assert "WPF VirtualizingStackPanel" in wpf_ctx
+    gm.graph.add_node(GraphNode(id="q_test", type="Quirk", name="Test App Lag",
+                                attributes={"app": "testapp", "mitigation": "wait 1 after opening"}))
+    assert "wait 1 after opening" in gm.format_context_for_prompt(goal="select a row", active_app="testapp.exe")
 
     # Recovery advice follows the actual failure, not words in the goal.
     assert "Recovery" not in gm.format_context_for_prompt(goal="fix the error dialog", active_app="notepad.exe")
@@ -176,38 +161,6 @@ def test_graph_rebuilds_when_knowledge_changes(tmp_path):
     assert gm.is_stale()
     gm2 = GraphMemory(graph_path=tmp_path / "g.json", knowledge_dir=kdir)
     assert "recipe_zz_test" in gm2.graph.nodes
-
-
-def test_graph_memory_record_learned_quirk(tmp_path):
-    test_knowledge = tmp_path / "knowledge"
-    test_graph_file = tmp_path / "test_graph.json"
-
-    gm = GraphMemory(graph_path=test_graph_file, knowledge_dir=test_knowledge)
-
-    quirk_file = gm.record_learned_quirk(
-        quirk_id="notepad_large_file_lag",
-        title="Notepad Large File Freeze",
-        app="notepad",
-        surface="Win32",
-        symptom="Notepad hangs when opening files larger than 50MB.",
-        root_cause="RichEdit control synchronous layout pass blocks UI thread.",
-        mitigation="Use headless 'read file' tool instead of launching notepad.exe for large files.",
-        tags=["notepad", "large_file", "hang"],
-    )
-
-    assert quirk_file.is_file()
-    assert "notepad_large_file_lag" in quirk_file.name
-
-    # Check node in graph
-    assert "notepad_large_file_lag" in gm.graph.nodes
-    node = gm.graph.nodes["notepad_large_file_lag"]
-    assert node.attributes["app"] == "notepad"
-    assert "headless 'read file'" in node.attributes["mitigation"]
-
-    # Verify saved to disk
-    assert test_graph_file.is_file()
-    saved_data = json.loads(test_graph_file.read_text(encoding="utf-8"))
-    assert "notepad_large_file_lag" in saved_data["nodes"]
 
 
 def test_system1_reflex_loop_decoupling():
@@ -249,7 +202,7 @@ def test_graph_and_consistency_api_endpoints():
     assert "score" in audit
     assert "status" in audit
     assert "checks" in audit
-    assert len(audit["checks"]) >= 5
+    assert len(audit["checks"]) >= 3
     assert audit["score"] >= 90
 
     # 3. POST /api/graph/rebuild

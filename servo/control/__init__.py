@@ -1,4 +1,4 @@
-"""Control package: Jev/Kev safety gate, adaptive settling engine, and closed-loop state machine."""
+"""Control: the Laya gate (jev_gate.py), settling, confirmation, hand-off and the closed loop."""
 
 from servo.control.jev_gate import JevGate, PreRiskResult, PostTransitionResult
 from servo.control.settling import SettlingEngine

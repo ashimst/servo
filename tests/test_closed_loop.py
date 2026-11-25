@@ -5,6 +5,10 @@ import pytest
 from servo.control.loop import ServoControlLoop
 from servo.perception.scene_index import SceneDelta, SceneElement, SceneIndex
 
+# Every step is judged by Laya (a fake here: low risk, in scope, "confirmed"); the keyword
+# floor still raises risky actions to medium/high.
+pytestmark = pytest.mark.usefixtures("laya")
+
 
 def _el(i, label, role="Button", value=None):
     x = 100 + i * 110
@@ -121,8 +125,9 @@ def test_unmatched_hint_never_clicks_an_arbitrary_element(loop, monkeypatch, sce
     assert loop.clicks == []
 
 
-def test_unverifiable_click_is_unconfirmed_and_not_repeated(loop, monkeypatch, scene):
+def test_unverifiable_click_is_unconfirmed_and_not_repeated(loop, monkeypatch, scene, laya):
     _settle_unchanged(loop, monkeypatch, scene)
+    laya.outcome = "unconfirmed"     # Laya: nothing observable either way
     result = loop.execute_subgoal(1, "Open the help page", "Help")
     # No visible change: reported as "ran, not confirmed", never clicked a second time.
     assert result.success is True
@@ -327,3 +332,84 @@ def test_wait_with_negative_duration_is_rejected(loop, monkeypatch, scene):
     result = loop.execute_subgoal(1, "pause", "", action_type="wait", duration_seconds=-1.0)
     assert result.success is False
     assert "non-negative duration_seconds" in (result.step_log.error or "")
+
+
+def test_laya_unavailable_fails_the_step_before_acting(loop, monkeypatch, scene, laya):
+    _settle_changed(loop, monkeypatch, scene)
+    laya.unavailable = "connection refused"
+    result = loop.execute_subgoal(1, "Click Submit", "Submit")
+    assert result.success is False and result.actuated is False
+    assert "No safety check possible" in result.step_log.error
+    assert loop.clicks == []
+
+
+def test_laya_failing_after_the_action_fails_verification(loop, monkeypatch, scene, laya):
+    _settle_changed(loop, monkeypatch, scene)
+    real = laya.answers
+
+    def answers(state, questions):
+        if "outcome" in questions:
+            from servo.control.jev_gate import LayaUnavailable
+            raise LayaUnavailable("timed out")
+        return real(state, questions)
+    laya.answers = answers
+    result = loop.execute_subgoal(1, "Open the help page", "Help")
+    assert result.success is False and loop.clicks == [2]
+    assert result.step_log.verification == "failed"
+
+
+def test_laya_failed_verdict_fails_the_step(loop, monkeypatch, scene, laya):
+    _settle_changed(loop, monkeypatch, scene)
+    laya.outcome = "failed"
+    result = loop.execute_subgoal(1, "Open the help page", "Help")
+    assert result.success is False and result.step_log.verification == "failed"
+
+
+# ------------------------------- attempt 2: text on screen (OCR), then the vision locator
+
+def _visual(loop, monkeypatch):
+    from PIL import Image
+    from servo.perception.viewport import WindowBounds
+    loop.mirage_sensor.viewport.bounds = WindowBounds(hwnd=1001, left=100, top=50, right=1100, bottom=850,
+                                                      client_left=100, client_top=50, client_right=1100,
+                                                      client_bottom=850)
+    monkeypatch.setattr(loop.mirage_sensor, "capture_window_image", lambda: Image.new("RGB", (1000, 800)))
+
+
+def test_uia_miss_matches_text_on_screen_first(loop, monkeypatch, scene):
+    from servo.perception import locator, ocr_sensor
+    from servo.perception.mirage_sensor import Detection
+    _visual(loop, monkeypatch)
+    _settle_changed(loop, monkeypatch, scene)
+    monkeypatch.setattr(ocr_sensor, "read_lines",
+                        lambda img: ([Detection(label="Gear icon", bbox=(10, 10, 40, 40), kind="text")], 90))
+    monkeypatch.setattr(locator, "locate", lambda *a, **k: pytest.fail("vision must not run when OCR found it"))
+    from servo.cognition.trace import TraceBus, Tracer
+    loop.tracer = Tracer("t", TraceBus())
+    result = loop.execute_subgoal(1, "Click the gear icon", "Gear icon")
+    assert result.success and result.step_log.perception_source == "ocr" and loop.clicks == [3]
+    assert "Perception miss → text on screen" in [e.title for e in loop.tracer.events]
+
+
+def test_no_text_match_asks_the_vision_locator(loop, monkeypatch, scene):
+    from servo.perception import locator, ocr_sensor
+    from servo.perception.mirage_sensor import Detection
+    _visual(loop, monkeypatch)
+    _settle_changed(loop, monkeypatch, scene)
+    monkeypatch.setattr(ocr_sensor, "read_lines",
+                        lambda img: ([Detection(label="Unrelated", bbox=(10, 10, 40, 40), kind="text")], 90))
+    asked = []
+    monkeypatch.setattr(locator, "locate", lambda img, d, timeout=None: asked.append(d) or (300, 200, 12))
+    result = loop.execute_subgoal(1, "Click the gear icon", "Gear icon")
+    assert asked == ["Gear icon"]
+    assert result.success and result.attempts_used == 2 and result.step_log.perception_source == "locator"
+    assert loop.clicks == [3]                       # the located point, added as a new element
+
+
+def test_ocr_and_vision_down_fails_without_acting(loop, monkeypatch, scene):
+    _visual(loop, monkeypatch)
+    _settle_changed(loop, monkeypatch, scene)
+    # conftest: OCR raises OcrUnavailable and the locator raises LocatorUnavailable
+    result = loop.execute_subgoal(1, "Click the gear icon", "Gear icon")
+    assert not result.success and loop.clicks == []
+    assert "Windows OCR" in result.step_log.error and "vision locator" in result.step_log.error

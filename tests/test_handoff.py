@@ -9,7 +9,7 @@ from servo.control.handoff import (
     StepExecutionReport,
     SystemHandoffCoordinator,
 )
-from servo.planner.tool_calling import MacroPlan, PlanStep
+from servo.cognition.plan import MacroPlan, PlanStep
 from servo.actuation.alias_mapping import AliasMapper
 from servo.perception.scene_index import SceneElement, SceneIndex
 
@@ -39,7 +39,7 @@ def mock_scene():
     return SceneIndex(hwnd=9999, window_title="Mock App", source="uia", elements=elements)
 
 
-def test_handoff_launch_and_wait():
+def test_handoff_launch_and_wait(laya):  # even a wait is pre-checked by Laya
     plan = MacroPlan(
         goal="launch and wait",
         steps=[
@@ -58,32 +58,18 @@ def test_handoff_launch_and_wait():
         ],
     )
 
-    started_steps = []
-    progress_steps = []
-
-    def on_step_start(step):
-        started_steps.append(step.step_index)
-
-    def on_step_progress(step, report):
-        progress_steps.append((step.step_index, report.success))
-
     def mock_launcher(app_name):
         return 9999, "Mock App"
 
     with patch("servo.perception.windows.is_window", return_value=True), \
          patch("servo.perception.windows.get_window_title", return_value="Mock App"):
-        coord = SystemHandoffCoordinator(
-            fast_mode=True,
-            on_step_start=on_step_start,
-            on_step_progress=on_step_progress,
-        )
+        coord = SystemHandoffCoordinator(fast_mode=True)
         summary = coord.execute_plan(plan, app_launcher=mock_launcher)
 
     assert summary.success is True
     assert summary.completed_steps == 2
     assert summary.active_hwnd == 9999
-    assert started_steps == [1, 2]
-    assert progress_steps == [(1, True), (2, True)]
+    assert [(r.step_index, r.success) for r in summary.step_reports] == [(1, True), (2, True)]
 
 
 def test_handoff_action_dispatch(mock_scene):
@@ -281,46 +267,6 @@ def test_handoff_cancellation_threading_event(mock_scene):
     assert summary.completed_steps == 0
     assert summary.aborted is True
     assert mock_loop.execute_subgoal.call_count == 0
-
-
-def test_handoff_callbacks_resilience(mock_scene):
-    plan = MacroPlan(
-        goal="callback test",
-        steps=[
-            PlanStep(step_index=1, tool_name="wait", arguments={"duration_seconds": 0.01}),
-        ],
-    )
-
-    events = []
-
-    def boom_progress(step, report):
-        events.append("progress")
-        raise RuntimeError("UI render failure")
-
-    mock_loop = MagicMock()
-    mock_loop.execute_subgoal.return_value = MagicMock(
-        success=True, attempts_used=1, step_log=MagicMock(latency_ms=10, error=None)
-    )
-
-    with patch("servo.perception.windows.is_window", return_value=True), \
-         patch("servo.perception.windows.get_window_title", return_value="Mock App"), \
-         patch("servo.control.handoff.ServoControlLoop", return_value=mock_loop):
-        coord = SystemHandoffCoordinator(
-            target_hwnd=9999,
-            fast_mode=True,
-            on_plan_start=lambda p: events.append("start"),
-            on_step_start=lambda s: events.append("step_start"),
-            on_step_progress=boom_progress,
-            on_plan_complete=lambda s: events.append("complete"),
-        )
-        summary = coord.execute_plan(plan)
-
-    # Callback exception must be handled gracefully without terminating execute_plan
-    assert summary.success is True
-    assert "start" in events
-    assert "step_start" in events
-    assert "progress" in events
-    assert "complete" in events
 
 
 def test_handoff_wait_fallback_when_no_window():

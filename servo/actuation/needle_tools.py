@@ -1,6 +1,5 @@
 """Cactus Needle 3 Typed Tool Surface (@cactus.tool).
 
-See Section 5.1 in SERVO_ARCHITECTURE_V1.md and SERVO_HARDENING_NOTES.md.
 Integer-indexed typed actions driving deterministic OS input dispatch.
 
 Every tool either completes or raises ``ActuationError`` / ``SandboxViolationException``.
@@ -243,82 +242,39 @@ class NeedleToolSurface:
         press_enter: bool = False,
         clear_first: bool = False,
     ) -> str:
-        """Focus the target element and enter text."""
+        """Enter text into the target element. Two methods, and the result says which ran:
+        the control's own ValuePattern when it has a writable one, else focus it with a click
+        and send keystrokes. An error in either raises; nothing types blind."""
         element, x, y = self._resolve(scene, element_id)
 
         if sys.platform != "win32":
             raise ActuationError("Text input is only supported on Windows.")
 
-        # Attempt 1: UIA ValuePattern. Works without foreground activation and without
-        # moving the physical cursor.
-        ctrl = None
-        try:
-            ctrl = find_innermost_control(self._uia_window(), x, y)
-            if ctrl is not None:
-                iface = None
-                try:
-                    iface = ctrl.iface_value
-                except Exception:
-                    iface = None  # control does not support ValuePattern
-                if iface is not None and not iface.CurrentIsReadOnly:
-                    current = iface.CurrentValue or ""
-                    iface.SetValue(text if clear_first else current + text)
-                    if press_enter:
-                        self.sandbox.ensure_target_in_foreground()
-                        ctrl.set_focus()
-                        from pywinauto.keyboard import send_keys
-                        send_keys("{ENTER}")
-                    return f"Set value of element {element_id} ('{element.label}') via UIA."
-                else:
-                    try:
-                        ctrl.set_focus()
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.info("UIA ValuePattern typing unavailable (%s); falling back to keystrokes.", e)
-
-        # Attempt 2: focus by click (or UIA focus), then synthetic keystrokes.
-        try:
-            self.click(scene, element_id, button="left")
-        except Exception as e:
-            logger.warning("Click to focus failed (%s); trying UIA focus.", e)
-            if ctrl is not None:
-                try:
-                    ctrl.set_focus()
-                except Exception:
-                    pass
-
-        try:
-            self.sandbox.ensure_target_in_foreground()
-        except Exception:
-            pass
-
         from pywinauto.keyboard import send_keys
-        try:
-            if clear_first:
-                send_keys("^a{BACKSPACE}")
-            send_keys(escape_send_keys(text), with_spaces=True, with_tabs=True, with_newlines=True)
-            if press_enter:
-                send_keys("{ENTER}")
-            return f"Typed text into element {element_id} ('{element.label}') via keystrokes."
-        except Exception as err:
-            logger.warning("Keystroke typing failed (%s); attempting clipboard paste fallback.", err)
+        ctrl = find_innermost_control(self._uia_window(), x, y)
+        iface = None
+        if ctrl is not None:
             try:
-                import pyperclip
-                pyperclip.copy(text)
-                time.sleep(0.05)
-                import ctypes
-                user32 = ctypes.windll.user32
-                user32.keybd_event(0x11, 0, 0, 0)
-                user32.keybd_event(0x56, 0, 0, 0)
-                user32.keybd_event(0x56, 0, 2, 0)
-                user32.keybd_event(0x11, 0, 2, 0)
-                if press_enter:
-                    user32.keybd_event(0x0D, 0, 0, 0)
-                    user32.keybd_event(0x0D, 0, 2, 0)
-                return f"Pasted text into element {element_id} ('{element.label}') via clipboard fallback."
-            except Exception as e2:
-                raise ActuationError(f"Failed to enter text into element {element_id}: {err}; fallback error: {e2}") from err
+                iface = ctrl.iface_value
+            except Exception:
+                iface = None  # the control has no ValuePattern: keystrokes below
+        if iface is not None and not iface.CurrentIsReadOnly:
+            current = iface.CurrentValue or ""
+            iface.SetValue(text if clear_first else current + text)
+            if press_enter:
+                self.sandbox.ensure_target_in_foreground()
+                ctrl.set_focus()
+                send_keys("{ENTER}")
+            return f"Set value of element {element_id} ('{element.label}') via UIA."
+
+        self.click(scene, element_id, button="left")
+        self.sandbox.ensure_target_in_foreground()
+        if clear_first:
+            send_keys("^a{BACKSPACE}")
+        send_keys(escape_send_keys(text), with_spaces=True, with_tabs=True, with_newlines=True)
+        if press_enter:
+            send_keys("{ENTER}")
+        return f"Typed text into element {element_id} ('{element.label}') via keystrokes."
 
     @tool_decorator
     def hotkey(self, keys: List[str]) -> str:

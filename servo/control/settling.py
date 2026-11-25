@@ -1,6 +1,5 @@
 """Adaptive Settling and Mutation Debounce Engine.
 
-See ADR-08 in SERVO_ARCHITECTURE_V1.md.
 Eliminates race conditions and animation lag by bounded polling for state changes.
 """
 
@@ -58,6 +57,8 @@ class SettlingEngine:
         while (time.perf_counter() - start_time) < timeout_sec:
             time.sleep(interval_sec)
             current_scene = sensor_fn()
+            if current_scene.sense_error == "window closed":
+                break   # the window went away: polling it again until timeout only logs errors
             delta = SceneDelta.compute_diff(before_scene, current_scene)
             if delta.has_changed:
                 break

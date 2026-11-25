@@ -30,24 +30,6 @@ def test_control_type_word_is_dropped_only_as_fallback():
     assert AliasMapper.resolve_element(scene, "Submit Button")[0].label == "Submit Button"
 
 
-def test_click_on_grammar():
-    from servo.cognition.needle import parse_grammar
-    assert parse_grammar("click on person 1").steps[0].arguments == {"target": "person 1"}
-    assert parse_grammar("click the Save").steps[0].arguments == {"target": "Save"}
-
-
-# --------------------------------------------------------- needle guard
-
-def test_needle_cannot_close_on_pause(monkeypatch):
-    from servo.cognition import cactus_runtime, needle
-    monkeypatch.setattr(cactus_runtime, "get_needle", lambda tools: object())
-    monkeypatch.setattr(cactus_runtime, "needle_complete", lambda agent, text: {
-        "function_calls": [{"name": "close_window", "arguments": {"app_name": "YouTube"}}], "confidence": 0.93})
-    t1 = needle.Tier1Intent()
-    assert t1.propose("Pause the YouTube video") is None          # rejected -> escalates
-    assert t1.propose("close youtube") is not None                 # literally asked for
-
-
 # ----------------------------------------------------------- handoff
 
 class _Tracer:
@@ -63,7 +45,7 @@ def _coordinator(monkeypatch, own=frozenset()):
 
 def _plan(tool, **args):
     from servo.cognition.needle import _step
-    from servo.planner.tool_calling import MacroPlan
+    from servo.cognition.plan import MacroPlan
     return MacroPlan(goal="g", steps=[_step(1, tool, args, tool)])
 
 

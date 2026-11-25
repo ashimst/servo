@@ -24,7 +24,20 @@ def test_transcription_uses_whistle_when_available(monkeypatch):
     assert VoiceIngestionManager().transcribe_audio(b"RIFF") == "click Save"
 
 
-def test_voice_task_requires_explicit_hwnd(monkeypatch):
-    from servo.daemon.tasks import TaskRequestError
-    with pytest.raises(TaskRequestError):
-        VoiceIngestionManager().ingest_voice_task(b"RIFF", hwnd=None)
+def test_faster_whisper_is_not_a_stand_in(monkeypatch):
+    # Even with faster-whisper importable, no Whistle means no transcription.
+    calls = []
+    fake_fw = types.SimpleNamespace(WhisperModel=lambda *a, **k: calls.append(a) or None)
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_fw)
+    monkeypatch.setitem(sys.modules, "cactus", None)
+    with pytest.raises(VoiceUnavailableError, match="Whistle"):
+        VoiceIngestionManager().transcribe_audio(b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00")
+    assert calls == []
+
+
+def test_whistle_failure_is_reported_not_covered(monkeypatch):
+    def boom(path):
+        raise RuntimeError("model crashed")
+    monkeypatch.setitem(sys.modules, "cactus", types.SimpleNamespace(transcribe=boom))
+    with pytest.raises(VoiceUnavailableError, match="model crashed"):
+        VoiceIngestionManager().transcribe_audio(b"RIFF")

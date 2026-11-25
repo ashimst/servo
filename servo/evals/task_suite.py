@@ -6,8 +6,8 @@ the browser's title, the WMI brightness), never Servo's own report. So the pass 
 measures what really happened, and "Servo said done but it wasn't" shows up as a
 LIE row.
 
-    python -m servo.evals.task_suite                # on-device tasks only (no LLM)
-    python -m servo.evals.task_suite --llm          # also tasks that need System 2
+    python -m servo.evals.task_suite                # single-step tasks (Laya + Needle, no planner)
+    python -m servo.evals.task_suite --llm          # also multi-step tasks (uses the planner)
     python -m servo.evals.task_suite --only notepad_hello youtube_search
 
 It moves the mouse, types, opens apps and browser tabs. Run it when you're not
@@ -44,6 +44,8 @@ class Task:
     needs_llm: bool = False
     setup: Optional[Callable[[Ctx], None]] = None
     note: str = ""
+    teardown: Optional[Callable[[Ctx], None]] = None   # always runs: restores what setup changed
+    group: str = "core"                                # "core" | "general" (held out, see general_suite)
 
 
 # ------------------------------------------------------------------ probes
@@ -268,14 +270,21 @@ def tasks(scratch: Path) -> List[Task]:
         Task("youtube_play", "play kanye on youtube", check_youtube_playing, needs_llm=True),
         Task("notepad_haiku", "open notepad and write a short poem about rain", check_notepad_composed("rain"),
              needs_llm=True),
-    ]
+    ] + _general(scratch)
+
+
+def _general(scratch: Path) -> List[Task]:
+    from servo.evals.general_suite import tasks as general_tasks
+    return general_tasks(Task, scratch)
 
 
 # ------------------------------------------------------------------ runner
 
 def _confirm_policy(log: List[str]) -> Callable[[Any], bool]:
     """Approve only read-only commands and ordinary medium-risk steps; refuse high risk."""
-    readonly = re.compile(r"^(?:\(?\s*Get-|netsh\s+\S+\s+show|Start-Process\s+ms-settings:|\(Get-CimInstance)", re.I)
+    # Purely read-only commands a user would approve without a second thought.
+    readonly = re.compile(r"^(?:\(?\s*Get-|netsh\s+\S+\s+show|Start-Process\s+ms-settings:|\(Get-CimInstance"
+                          r"|hostname\s*$|whoami\s*$|\$env:[A-Za-z_]+\s*$|\[System\.Environment\]::MachineName\s*$)", re.I)
 
     def confirm(req: Any) -> bool:
         call = str(req.tool_call)
@@ -297,13 +306,52 @@ def run_task(task: Task, scratch: Path) -> Dict[str, Any]:
     from servo.daemon.copilot import launch_or_focus_app
 
     ctx = Ctx(scratch=scratch)
-    if task.setup:
-        task.setup(ctx)
+    before = _window_handles()
+    try:
+        if task.setup:
+            task.setup(ctx)
+        return _run_and_check(task, ctx, router_cls=CascadeRouter, new_run_id=new_run_id, tracer_cls=Tracer,
+                              launcher=launch_or_focus_app)
+    finally:
+        if task.teardown:
+            try:
+                task.teardown(ctx)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ! teardown of {task.id} failed: {e}", flush=True)
+        if task.group == "general":
+            _close_leftovers(before)
+
+
+def _window_handles() -> set:
+    from servo.perception import windows
+    return {int(w["hwnd"]) for w in windows.list_windows()}
+
+
+def _close_leftovers(before: set) -> None:
+    """Close dialogs and Explorer windows a task opened, so one task's error box can't
+    break the next task. (Never documents: closing those could prompt to save.)"""
+    import win32con
+    import win32gui
+    from servo.perception import windows
+    for w in windows.list_windows():
+        h = int(w["hwnd"])
+        if h in before:
+            continue
+        try:
+            cls = win32gui.GetClassName(h)
+        except Exception:
+            continue
+        if cls in ("#32770", "CabinetWClass"):
+            win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+
+
+def _run_and_check(task: Task, ctx: Ctx, router_cls: Any, new_run_id: Any, tracer_cls: Any,
+                   launcher: Any) -> Dict[str, Any]:
     confirms: List[str] = []
     t0 = time.perf_counter()
     try:
-        router = CascadeRouter(tracer=Tracer(new_run_id()), app_launcher=launch_or_focus_app,
-                               confirmation_callback=_confirm_policy(confirms))
+        router = router_cls(tracer=tracer_cls(new_run_id()), app_launcher=launcher,
+                            confirmation_callback=_confirm_policy(confirms))
         ctx.outcome = router.run(task.goal)
     except Exception as e:
         return {"id": task.id, "goal": task.goal, "passed": False, "said_success": None,
@@ -327,6 +375,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--llm", action="store_true", help="also run tasks that need System 2 (uses your planner API)")
     ap.add_argument("--only", nargs="*", help="task ids to run")
+    ap.add_argument("--suite", choices=["core", "general", "all"], default="core",
+                    help="core: the tasks users asked for; general: held-out general skills")
     args = ap.parse_args(argv)
     if sys.platform != "win32":
         print("The task suite drives the Windows desktop.")
@@ -336,7 +386,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from servo.paths import servo_home
     scratch = Path(tempfile.mkdtemp(prefix="servo-suite-"))
-    chosen = [t for t in tasks(scratch) if (args.llm or not t.needs_llm) and (not args.only or t.id in args.only)]
+    suite_ok = (lambda t: True) if args.suite == "all" else (lambda t: t.group == args.suite)
+    if args.suite != "core":
+        args.llm = True
+    chosen = [t for t in tasks(scratch) if suite_ok(t) and (args.llm or not t.needs_llm)
+              and (not args.only or t.id in args.only)]
     results = []
     for t in chosen:
         print(f"→ {t.id}: {t.goal}", flush=True)

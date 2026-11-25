@@ -1,1 +1,1 @@
-"""Cognitive cascade: Tier 1 (grammar/Needle), Mirage, Kev, Playwright, System 2, and the router."""
+"""Cognition: the router, Laya routing, planner agents, System 2, Needle, memory and the trace."""

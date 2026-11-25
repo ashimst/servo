@@ -1,9 +1,4 @@
-"""Cactus Whistle (16.9 MB) Voice Ingestion Pipeline.
-
-See ADR-13 in SERVO_ARCHITECTURE_V2.md and SERVO_HARDENING_NOTES.md.
-Transcribes local audio clips on CPU using Cactus Whistle and dispatches
-voice commands into the Servo reflex arc. Completely on-device and local.
-"""
+"""Voice input for the copilot: transcribes audio on the CPU with Cactus Whistle (on-device)."""
 
 from __future__ import annotations
 
@@ -15,13 +10,11 @@ import tempfile
 import threading
 import wave
 from pathlib import Path
-from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 _whistle_lock = threading.Lock()
 _cached_whistle = None
-_cached_whisper_model = None
 
 
 def _get_whistle():
@@ -46,16 +39,6 @@ def _get_whistle():
                 except Exception:
                     _cached_whistle = None
     return _cached_whistle
-
-
-def _get_whisper_model():
-    global _cached_whisper_model
-    if _cached_whisper_model is None:
-        with _whistle_lock:
-            if _cached_whisper_model is None:
-                from faster_whisper import WhisperModel  # type: ignore
-                _cached_whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
-    return _cached_whisper_model
 
 
 class VoiceUnavailableError(RuntimeError):
@@ -136,49 +119,19 @@ class VoiceIngestionManager:
         """
         wav_path = _ensure_16khz_wav(audio_bytes_or_path)
         try:
-            # 1. Try local Cactus Whistle
             whistle = _get_whistle()
-            if whistle is not None:
-                try:
-                    res = whistle.transcribe(wav_path)
-                    return _extract_text(res)
-                except VoiceUnavailableError:
-                    raise
-                except Exception as e:
-                    logger.warning("Cactus Whistle transcription failed: %s", e)
-
-            # 2. Fall back to local on-device faster-whisper if cactus is not loaded
+            if whistle is None:
+                raise VoiceUnavailableError("Cactus Whistle is not installed (pip install cactus-compute).")
             try:
-                model = _get_whisper_model()
-                segments, _ = model.transcribe(wav_path, beam_size=1)
-                return " ".join(s.text for s in segments).strip()
-            except Exception as e:
-                logger.debug("faster-whisper transcription error: %s", e)
-
-            raise VoiceUnavailableError("Cactus Whistle is not installed (pip install servo[cactus]).")
+                return _extract_text(whistle.transcribe(wav_path))
+            except VoiceUnavailableError:
+                raise
+            except Exception as e:  # noqa: BLE001 - reported as the failure it is
+                raise VoiceUnavailableError(f"Cactus Whistle transcription failed: {e}") from e
         finally:
             try:
                 os.remove(wav_path)
             except OSError:
                 pass
-
-    def ingest_voice_task(
-        self,
-        audio_data: bytes | str | Path,
-        hwnd: Optional[int] = None,
-        mode: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Transcribe audio and run it as a goal through the same planner path as /task."""
-        from servo.daemon.tasks import run_goal, validate_target_hwnd
-
-        # Validate the target before spending time on transcription.
-        validate_target_hwnd(hwnd)
-        transcribed_goal = self.transcribe_audio(audio_data)
-        if not transcribed_goal:
-            return {"status": "empty", "transcription": "", "reply": "No speech detected."}
-        result = run_goal(goal=transcribed_goal, hwnd=hwnd, mode=mode)
-        result["transcription"] = transcribed_goal
-        return result
-
 
 voice_manager = VoiceIngestionManager()

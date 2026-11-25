@@ -12,17 +12,15 @@ so the system never flies blind or attempts blind execution of uninstalled softw
 
 from __future__ import annotations
 
-import difflib
 import glob
 import logging
 import os
 import re
 import shutil
-import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -429,18 +427,6 @@ class WindowsContextEngine:
             return True, info
 
         return False, None
-
-    def get_web_fallback(self, app_name: str) -> Optional[str]:
-        """Return web fallback URL if the app is a known service with a web app."""
-        q = app_name.strip().lower()
-        words = set(re.findall(r"\w+", q))
-        for key, data in POPULAR_APP_WEB_FALLBACKS.items():
-            if key == q or key in words:
-                return data["url"]
-            for kw in data["keywords"]:
-                if kw == q or kw in words or (len(kw) >= 4 and kw in q):
-                    return data["url"]
-        return None
 
     # ------------------------------------------------------------- Retrieval (RAG)
 

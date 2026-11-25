@@ -1,7 +1,7 @@
-"""Playwright: the browser tier against a real page, and the copilot UI end to end.
+"""Playwright drives the copilot UI end to end (Servo itself no longer uses Playwright).
 
-Runs headless with the installed Edge (or bundled Chromium); skipped when no Playwright
-browser can be launched.
+Runs headless with the installed Edge (or bundled Chromium); skipped when Playwright is
+not installed.
 """
 
 from __future__ import annotations
@@ -15,69 +15,11 @@ import pytest
 pytest.importorskip("playwright")
 
 from servo.cognition import cactus_runtime  # noqa: E402
-from servo.cognition.browser import BrowserTier, BrowserUnavailable  # noqa: E402
 from servo.cognition.router import CascadeRouter, RunOutcome  # noqa: E402
 from servo.cognition.trace import TraceBus, Tracer  # noqa: E402
 from servo.config import settings  # noqa: E402
 from servo.control.confirmation import ConfirmationRequest  # noqa: E402
 from servo.control.jev_gate import JevGate  # noqa: E402
-
-FIXTURE = (Path(__file__).parent / "fixtures" / "test_fixture.html").resolve().as_uri()
-
-
-@pytest.fixture(scope="module")
-def tier(tmp_path_factory):
-    saved = (settings.browser_headless, settings.browser_profile_dir)
-    settings.browser_headless = True
-    settings.browser_profile_dir = tmp_path_factory.mktemp("profile")
-    t = BrowserTier()
-    try:
-        t.open_url(FIXTURE)
-    except BrowserUnavailable as e:
-        pytest.skip(f"no Playwright browser: {e}")
-    yield t
-    t.close()
-    settings.browser_headless, settings.browser_profile_dir = saved
-
-
-def test_dom_locate_is_confident_for_unique_button(tier):
-    res = tier.locate("Submit Form")
-    assert res.found and res.count == 1 and res.confidence >= 0.9
-    assert "button" in res.strategy
-
-
-def test_fill_by_label_and_read_back(tier):
-    tier.open_url(FIXTURE)
-    res, _, _, value = tier.fill("User Name", "ashim")
-    assert res.found and value == "ashim"
-
-
-def test_missing_target_is_a_perception_miss(tier):
-    res = tier.locate("Launch Rocket")
-    assert not res.found and res.count == 0
-
-
-def test_router_drives_browser_with_kev_gate(tier, monkeypatch):
-    monkeypatch.setattr(cactus_runtime, "get_needle", lambda tools: None)
-    tier.open_url(FIXTURE)
-    asked = []
-
-    def approve(req: ConfirmationRequest) -> bool:
-        asked.append(req)
-        return True
-
-    router = CascadeRouter(
-        tracer=Tracer("b", TraceBus()), kev=JevGate(use_fallback=True), browser=tier,
-        confirmation_callback=approve, context="browser",
-    )
-    router._screen_summary = lambda kind=None: ""  # type: ignore[assignment]
-    out = router.run("click Submit Form")
-    assert out.success, out.reply
-    assert asked and asked[0].risk_level == "medium"          # "submit" needs your OK
-    assert "Form submitted successfully" in tier.state().snapshot
-    kinds = [e.kind for e in router.tracer.events]
-    assert "perception" in kinds and "verify" in kinds
-
 
 # ----------------------------------------------------------------- UI e2e
 
@@ -93,7 +35,7 @@ class FakeRouter:
         tr.emit("goal", text, tier="copilot")
         with tr.span("tier", "Tier 1 · 2 clauses", tier="needle") as sp:
             sp.done("ok", "All 2 clauses parsed → 2 steps", confidence=0.95)
-        tr.emit("decision", "Kev · route the request", "Heuristic: 2 action verbs", tier="kev", status="ok", confidence=0.9)
+        tr.emit("decision", "Laya · route the request", "Heuristic: 2 action verbs", tier="laya", status="ok", confidence=0.9)
         plan = tr.emit("plan", "Round 1 · 2 steps", "click Save; press enter", tier="needle",
                        subtasks=["click Save", "press enter"], round=1)
         tr.emit("progress", "click Save", "", tier="router", status="running", plan=plan.seq, index=0)
@@ -101,7 +43,7 @@ class FakeRouter:
         tr.emit("escalate", "Perception miss → Mirage", "Looking at the pixels instead.", tier="mirage", status="warn")
         tr.emit("perception", "Mirage · 14 detections", "“Save” → “Save” at (812, 64)", tier="mirage", status="ok",
                 confidence=0.93, ranked=[["Save", 1.0], ["Save as", 0.82]])
-        tr.emit("decision", "Kev pre-check · medium risk", "Medium risk keyword detected: 'Save'", tier="kev", status="warn")
+        tr.emit("decision", "Laya pre-check · medium risk", "Medium risk keyword detected: 'Save'", tier="laya", status="warn")
         ok = self.confirm(ConfirmationRequest(sub_goal="Click Save", tool_call="click(element_id=3)", element_label="Save",
                                               risk_level="medium", reason="Medium risk keyword detected: 'Save'", hwnd=0))
         tr.emit("progress", "click Save", "", tier="router", status="ok" if ok else "skipped", plan=plan.seq, index=0)

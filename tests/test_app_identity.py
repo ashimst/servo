@@ -121,7 +121,7 @@ def test_close_counts_a_hidden_window_as_closed(monkeypatch):
     from servo.cognition.needle import _step
     from servo.control import handoff
     from servo.daemon import copilot
-    from servo.planner.tool_calling import MacroPlan
+    from servo.cognition.plan import MacroPlan
     monkeypatch.setattr(copilot, "find_app_window", lambda n: 9)
     monkeypatch.setattr(handoff.windows, "is_window", lambda h: True)
     monkeypatch.setattr(handoff.windows, "get_window_title", lambda h: "WhatsApp")
@@ -152,6 +152,8 @@ def test_sensor_asks_chromium_for_the_page_once(monkeypatch):
     monkeypatch.setattr(uia_sensor, "_is_chromium_host", lambda h: True)
     monkeypatch.setattr(uia_sensor, "_request_accessibility", lambda h: asked.append(h) or True)
     monkeypatch.setattr(uia_sensor.time, "sleep", lambda s: None)
+    import servo.perception.windows as w
+    monkeypatch.setattr(w, "is_window", lambda h: True)
     uia_sensor._nudged.discard(42)
     sensor = uia_sensor.UIASensor.__new__(uia_sensor.UIASensor)
     sensor.hwnd = 42
