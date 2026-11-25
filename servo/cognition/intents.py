@@ -365,3 +365,62 @@ def read(text: str, agent: str, tracer: Any = None) -> Reading:
                     why or f"accepted (confidence {conf:.2f})", tier="needle",
                     status="ok" if calls else "warn", confidence=conf, duration_ms=ms, response=resp)
     return Reading(calls, conf, why, resp, ms)
+
+
+def read_local_planner(text: str, agent: str = "request", tracer: Any = None) -> Reading:
+    """Map a single-step request via the local OpenAI-compatible planner (Qwen3.5-4B) + accept() grounding."""
+    import json
+    import time
+
+    import httpx
+
+    from servo.config import settings
+
+    tools, system = (REQUEST_TOOLS, REQUEST_SYSTEM) if agent == "request" else (COMMAND_TOOLS, COMMAND_SYSTEM)
+    url = f"{settings.local_planner_url.rstrip('/')}/chat/completions"
+    payload = {
+        "model": settings.local_planner_model,
+        "messages": [
+            {"role": "system", "content": system + " If no single tool fits, do not call any tool."},
+            {"role": "user", "content": text},
+        ],
+        "tools": [{"type": "function", "function": t} for t in tools],
+        "tool_choice": "auto",
+        "temperature": 0.0,
+        "max_tokens": 160,
+    }
+    t0 = time.perf_counter()
+    try:
+        with httpx.Client(timeout=httpx.Timeout(10.0, connect=0.5)) as client:
+            res = client.post(url, json=payload)
+            res.raise_for_status()
+            data = res.json()
+    except Exception as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        why = f"Local planner unavailable: {e.__class__.__name__}"
+        if tracer is not None:
+            tracer.emit("warn", f"Intent {agent} fast-path skipped", why, tier="router", status="warn", duration_ms=ms)
+        return Reading([], None, why, ms=ms)
+
+    ms = int((time.perf_counter() - t0) * 1000)
+    msg = (data.get("choices") or [{}])[0].get("message") or {}
+    raw_calls: List[Dict[str, Any]] = []
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        args = fn.get("arguments") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        raw_calls.append({"name": fn.get("name"), "arguments": args if isinstance(args, dict) else {}})
+
+    resp = {"function_calls": raw_calls, "confidence": 1.0 if raw_calls else 0.0}
+    calls, why = accept(text, resp, 0.0)
+    conf = 1.0 if calls else 0.0
+    if tracer is not None:
+        shown = "; ".join(f"{c.get('name')}({c.get('arguments') or {}})" for c in raw_calls)
+        tracer.emit("model", f"Qwen intent {agent} · {shown or 'no call'}",
+                    why or "accepted (grounded)", tier="router",
+                    status="ok" if calls else "warn", confidence=conf, duration_ms=ms, response=resp)
+    return Reading(calls, conf, why, resp, ms)

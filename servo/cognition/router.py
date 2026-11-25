@@ -242,14 +242,20 @@ class CascadeRouter:
         self._skip_requested = False
 
     def _try_intent_request(self, complexity: str) -> Tuple[Optional[List[PlanStep]], float, str]:
-        """Try the tuned intent Needle when configured; return (None, 0.0, reason) to hand off to System 2."""
-        if complexity != "single" or not settings.needle_intent_weights:
+        """Try the single-step intent fast path; return (None, 0.0, reason) to hand off to System 2."""
+        if complexity != "single" or settings.intent_backend == "none":
             return None, 0.0, ""
         from servo.cognition import intents
 
-        reading = intents.read(self.goal, "request", tracer=self.tracer)
+        if settings.intent_backend == "needle":
+            if not settings.needle_intent_weights:
+                return None, 0.0, ""
+            reading = intents.read(self.goal, "request", tracer=self.tracer)
+        else:
+            reading = intents.read_local_planner(self.goal, "request", tracer=self.tracer)
+
         if not reading:
-            return None, 0.0, reading.why or "Needle left this for the planner"
+            return None, 0.0, reading.why or "No single direct tool fits; handing off to planner"
         steps: List[PlanStep] = []
         try:
             for call in reading.calls:

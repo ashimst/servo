@@ -33,6 +33,7 @@ def test_accept_rejects_missing_confidence_negation_and_ungrounded():
 
 
 def test_router_hands_off_to_system2_when_intent_needle_rejects(monkeypatch):
+    monkeypatch.setattr(settings, "intent_backend", "needle")
     monkeypatch.setattr(settings, "needle_intent_weights", "fake_tuned.cact")
     laya = MagicMock()
     laya.assess_goal.return_value = GoalAssessment(
@@ -52,3 +53,21 @@ def test_router_hands_off_to_system2_when_intent_needle_rejects(monkeypatch):
         out = router.run("turn on dark mode in vs code")
     assert out.success and out.route == "system2"
     assert system2.plan.called
+
+
+def test_read_local_planner_accepts_grounded_and_rejects_ungrounded():
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {
+        "choices": [{
+            "message": {
+                "tool_calls": [{"function": {"name": "open_settings", "arguments": '{"topic": "background"}'}}]
+            }
+        }]
+    }
+    with patch("httpx.Client.post", return_value=mock_resp):
+        rejected = intents.read_local_planner("open night light settings", "request")
+        assert not rejected and "not in the request" in rejected.why
+
+        accepted = intents.read_local_planner("change my background", "request")
+        assert accepted and accepted.calls == [{"name": "open_settings", "arguments": {"topic": "background"}}]
+

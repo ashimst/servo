@@ -73,6 +73,9 @@ class ServoConfig(BaseSettings):
     needle_confidence_threshold: float = 0.7
     # Path to needle3.cact; empty = cactus downloads Cactus-Compute/needle3.
     needle_weights: str = ""
+    # Single-step intent fast path backend before System 2 planning:
+    # 'local_planner' uses Qwen3.5-4B (:8080, 97.3% on 97-case eval); 'needle' uses tuned Needle.
+    intent_backend: Literal["local_planner", "needle", "none"] = "local_planner"
     # Servo's tuned Needle for the request and command agents (needle_model/README.md);
     # empty = the base Needle. Planner steps always use needle_weights.
     needle_intent_weights: str = ""
