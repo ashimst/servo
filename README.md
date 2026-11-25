@@ -83,7 +83,8 @@ Ask in plain language:
 * *"dia is my default browser"* (remembered, not executed)
 * *"why did that fail?"* (diagnoses the last failed run, down to the code)
 
-Laya routes each request: a single direct action goes straight to Needle, anything else to
+Laya routes each request: a single direct action goes to the intent fast path
+(`Qwen3.5-4B` or tuned Needle with strict `accept()` grounding), anything else to
 the planner agent for its area. UIA finds the target, then Windows OCR, then the vision
 model, and Laya gates every action. Each run shows a **reasoning trace**: Laya's
 probabilities, the planner agent with its prompt and reply, every Needle call and its
